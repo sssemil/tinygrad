@@ -102,13 +102,14 @@ class MTS30Firmware(MTFirmwareBoot):
       if struct.unpack('<II', ack) != (domain, 0): raise RuntimeError(f"S30 GPU reset failed for domain {domain}")
 
   @contextmanager
-  def _boot(self, image:bytes|bytearray, *, master:bool=True) -> Iterator[None]:
+  def _boot(self, image:bytes|bytearray, *, master:bool=True, reset_domains:bool=True) -> Iterator[None]:
     if self.direct or self.queue is not None: raise RuntimeError("S30 compute is already running")
     timers = (0x400008, 0x40000c)  # Sudi GPU subsystem SOC and USC timer enables
-    saved = [self.dev.smc._r32(reg) for reg in timers]
+    if reset_domains: self.dev.power_on()
+    saved = [self.dev.regs._r32(reg) for reg in timers]
     try:
-      self._reset_domains()
-      for reg in timers: self.dev.smc._w32(reg, 1)
+      if reset_domains: self._reset_domains()
+      for reg in timers: self.dev.regs._w32(reg, 1)
       self._reset()
       self.mmu.map_range(FW_DEVVA, FW_BASE, round_up(len(image), 0x1000), MT_PTE_READ_WRITE)
       self.v[:len(image)] = image
@@ -124,7 +125,7 @@ class MTS30Firmware(MTFirmwareBoot):
         self._write(0x100, 0x2000000000)  # hold META in reset before releasing its memory
         self._read(0x100)
       finally:
-        for reg,old in zip(timers, saved): self.dev.smc._w32(reg, old)
+        for reg,old in zip(timers, saved): self.dev.regs._w32(reg, old)
 
   @contextmanager
   def boot(self, timeout:float=5.0) -> Iterator[MTS30Firmware]:
@@ -140,7 +141,7 @@ class MTS30Firmware(MTFirmwareBoot):
   @contextmanager
   def boot_direct(self) -> Iterator[None]:
     # The host owns core 0 and its compute ring. META stays stopped and no firmware image is loaded.
-    with self._boot(bytes(0x8000), master=False):
+    with self._boot(bytes(0x8000), master=False, reset_domains=False):
       self._write(0x4000, 1, 4)  # compute scheduler
       self._write(0xf920, 0, 4)  # CDM MMU context zero
       self._write(0xcd8, 1, 4)
@@ -166,7 +167,7 @@ class MTS30Firmware(MTFirmwareBoot):
     while not self._read(0x130, 4) & 4:
       if time.monotonic() >= deadline:
         fault = self._read(0xe160)
-        self._reset_domains()
+        self._reset()
         raise TimeoutError(f"S30 compute timed out, MMU fault {fault:#x}")
 
   def submit(self, token:int|None, command:int, size:int, data:bytearray, timeout:float, signal:tuple[int,int]|None=None,

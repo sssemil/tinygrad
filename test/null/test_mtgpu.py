@@ -1,5 +1,5 @@
 import ctypes, struct, unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 from tinygrad.device import BufferSpec
 from tinygrad.runtime.ops_mt import MTAllocator
 from tinygrad.runtime.support.memory import MMIOInterface
@@ -67,6 +67,18 @@ class TestMTSMC(unittest.TestCase):
 
 
 class TestMTDev(unittest.TestCase):
+  def test_s30_direct_attach_without_smc(self):
+    pci = Mock()
+    pci.read_config.return_value = 0x01021ed5
+    pci.bar_info.return_value = (0, 4<<30)
+    regs = bytearray(0x301000)
+    for base in (0x200000, 0x300000): struct.pack_into('<Q', regs, base+0x20, 0x0023000406600017)
+    pci.map_bar.return_value = regs
+    with patch.object(MTSMC, "__init__", side_effect=AssertionError("opened management mailbox")):
+      dev = MTDev(pci, manage_power=False)
+      self.assertEqual(dev.bvnc, (35, 4, 1632, 23))
+      dev.close()
+
   def test_vram_reuse(self):
     dev = Mock(views={})
     dev.mt.vram_size = 0x80003000

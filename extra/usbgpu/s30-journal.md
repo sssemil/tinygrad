@@ -115,3 +115,9 @@ The board still runs its own SMC RTOS. The driver asks it to power the GPU up, r
 Giving each thread two independent outputs exposed a USC instruction encoding limit. Two of 92 Whisper kernels needed shared register 64 or higher. Added the high index bits used by the long integer instruction. All 92 Whisper, 63 Qwen and 10 MNIST trial graphs now compile with this schedule. A 73-threshold clipping kernel on the card agreed with NumPy. Tiling is a separate performance experiment.
 
 The normal direct Whisper entry point returned the reference transcript five times, with a 24.687 s warm median and 48.610 s to first transcript including 21.538 s for device and model setup, using the scalar unfused compiler. An experimental attempt to kick both cores separately timed out without either completion event. The single-core path immediately ran MNIST again. Dual-core scheduling is unresolved.
+
+## November 20, 2026 — direct attach after a Chestnut power cycle
+
+Chestnut switched downstream power off and on. The GPU then returned both core IDs over PCIe before any host management messages. With opening the SMC mailbox and sending IPC deliberately disabled, three vectors of 7, 32 and 4,097 elements matched NumPy and five MNIST calls matched the reference predictions. The unfused MNIST warm median was 525.46 ms. Disabling host management messages did not require programming nonvolatile storage.
+
+The native path now opens the register aperture directly, uses the GPU's register reset sequence and leaves the board's power-state policy alone. Reference runs retain the existing version query, P0/P12 requests and domain resets. A regression test attaches to a mock S30 with no management rings and verifies the physical core ID. This only establishes which software the host needs. The factory controller and VBIOS were present during the power-cycle test, and the experiment does not establish their role in pre-PCIe initialization.

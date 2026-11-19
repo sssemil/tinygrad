@@ -31,8 +31,8 @@ class MTFirmwareBoot:
     # The data, PDS and USC heaps can each span the 2 GiB S30 allocation pool and need 4 MiB of leaf tables.
     self.mmu = MTMMU4(ROOT_BASE, size=0x1000000 if dev.s30 else 0x400000)
 
-  def _write(self, off:int, value:int, size:int=8) -> None: self.dev.smc._write(self.dev.socif + off, value.to_bytes(size, 'little'))
-  def _read(self, off:int, size:int=8) -> int: return int.from_bytes(self.dev.smc._read(self.dev.socif + off, size), 'little')
+  def _write(self, off:int, value:int, size:int=8) -> None: self.dev.regs._write(self.dev.socif + off, value.to_bytes(size, 'little'))
+  def _read(self, off:int, size:int=8) -> int: return int.from_bytes(self.dev.regs._read(self.dev.socif + off, size), 'little')
 
   def upload_mmu(self, full:bool=False) -> None:
     if full: ranges = [(0, self.mmu.next)]

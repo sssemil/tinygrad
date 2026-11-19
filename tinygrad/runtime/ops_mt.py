@@ -7,7 +7,7 @@ from tinygrad.renderer.cstyle import CUDARenderer, CStyleLanguage
 from tinygrad.renderer.usc import MTUSCRenderer
 from tinygrad.renderer.llvmir import LLVMRenderer, base_rewrite, ldt, llvm_intrinsics
 from tinygrad.dtype import dtypes, AddrSpace
-from tinygrad.helpers import round_up, diskcache_get, diskcache_put, Target, unwrap
+from tinygrad.helpers import round_up, diskcache_get, diskcache_put, DEV, Target, unwrap
 from tinygrad.uop.ops import Ops, PatternMatcher, UOp, UPat
 from tinygrad.runtime.support.memory import TLSFAllocator
 from tinygrad.runtime.support.mt.mmu import MT_PTE_READ_WRITE
@@ -230,7 +230,7 @@ class MTDevice(Compiled):
   renderers = [MUSARenderer, MTLLVMRenderer, MTUSCRenderer]
   def __init__(self, device:str=''):
     dev_id = int(device.split(':')[1]) if ':' in device else 0
-    self.mt = MTDev.open_usb(dev_id)
+    self.mt = MTDev.open_usb(dev_id, manage_power=DEV.renderer != "USC")
     self.views:dict[int,tuple[Any,MTBufferMeta]] = {}
     super().__init__(device, MTAllocator(self), MTS30Program if self.mt.s30 else MTProgram, arch='mp_10' if self.mt.s30 else 'mp_21')
     if self.mt.s30:
