@@ -28,8 +28,8 @@ class MTFirmwareBoot:
   def __init__(self, dev:MTDev, size:int):
     self.dev = dev
     self.v = dev.pci_dev.map_bar(2, off=FW_BASE, size=size, fmt='B')
-    # Mapping the entire 2 GiB S30 allocation pool needs 4 MiB of leaf tables alone.
-    self.mmu = MTMMU4(ROOT_BASE, size=0x800000 if dev.s30 else 0x400000)
+    # The data, PDS and USC heaps can each span the 2 GiB S30 allocation pool and need 4 MiB of leaf tables.
+    self.mmu = MTMMU4(ROOT_BASE, size=0x1000000 if dev.s30 else 0x400000)
 
   def _write(self, off:int, value:int, size:int=8) -> None: self.dev.smc._write(self.dev.socif + off, value.to_bytes(size, 'little'))
   def _read(self, off:int, size:int=8) -> int: return int.from_bytes(self.dev.smc._read(self.dev.socif + off, size), 'little')

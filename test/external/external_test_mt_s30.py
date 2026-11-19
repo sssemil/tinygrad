@@ -1,6 +1,6 @@
 import os, random, struct, unittest
 from pathlib import Path
-from tinygrad import Device, Tensor, dtypes
+from tinygrad import Device, Tensor, TinyJit, dtypes
 from tinygrad.device import Buffer
 from tinygrad.helpers import DEV
 from tinygrad.runtime.support.mt.compiler import MTCompiler
@@ -99,6 +99,15 @@ class TestS30USB(unittest.TestCase):
         add = (gpu + 1).realize()
         self.assertEqual(add.to("CPU").tolist(), (cpu + 1).tolist())
         self.assertEqual((add * gpu).to("CPU").tolist(), ((cpu + 1) * cpu).tolist())
+
+  @requires_compiler
+  def test_resident_programs_after_restart(self):
+    @TinyJit
+    def run(x): return ((x+3).realize() * 7).realize()
+    for i in range(4):
+      if i == 3: Device["MT"].s30_fw.session.close()
+      values = list(range(i, i+257))
+      self.assertEqual(run(Tensor(values, device="MT")).tolist(), [(x+3)*7 for x in values])
 
   @requires_compiler
   def test_grid(self):

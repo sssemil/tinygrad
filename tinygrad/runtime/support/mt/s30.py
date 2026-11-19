@@ -173,13 +173,6 @@ class MTS30Program(Program['MTDevice']):
     if not 0 < shared <= 0xfff or max(attrs, temps) > 0x7f: raise ValueError("S30 shader register allocation exceeds dispatch fields")
     self.regions = max(8, temps, attrs)
     self.params = bytearray(4*shared)
-    pds = bytearray(96)
-    # The first PDS program loads the shader arguments into shared registers (DOUTD).
-    struct.pack_into('<QI', pds, 0, PDS_BASE+96, 0x90000000 | shared)
-    struct.pack_into('<I', pds, 16, 0xf4001000)
-    # The workgroup task writes group IDs to LM0:2. The instance task writes local IDs to AR0:1 and launches USC (DOUTU).
-    struct.pack_into('<6I', pds, 32, 0, 0, 0xb0000347, 0x80000043, 0, temps<<3)
-    struct.pack_into('<5I', pds, 64, 0xdcb40003, 0xf0001301, 0xd2800000, 0xf0001b01, 0xfc000012)
     for imm in image.metadata.immediates: struct.pack_into('<I', self.params, 4*imm.offset, imm.value)
     self.args = []
     if any(a['.kind'] not in (1, 2, 3, 5, 6, 7, 18, 19, 23) for a in k['.args']): raise NotImplementedError("Unsupported S30 kernel argument")
@@ -188,11 +181,24 @@ class MTS30Program(Program['MTDevice']):
       if space is not AddrSpace.ALU: dt = dtypes.uint64
       if param['.reg_bank'] != 3 or param['.size'] != dt.itemsize: raise NotImplementedError("Unsupported S30 kernel argument layout")
       self.args.append((4*param['.offset'], '<'+unwrap(dt.fmt)))
-    self.pds = Buffer(dev.device, len(pds)+len(self.params), initial_value=bytes(pds+self.params))
-    self.last_params:bytearray|None = self.params.copy()
+    pds = bytearray(96)
     self.code = Buffer(dev.device, len(image.text), initial_value=image.text)
+    self.pds = Buffer(dev.device, len(pds)+len(self.params), preallocate=True)
+    # The data heap fits in 32 bits of offset. Reuse each buffer's offset in its read-only instruction heap.
+    pds_off, usc_off = self.pds.meta.va & 0xffffffff, self.code.meta.va & 0xffffffff
+    # The first PDS program loads the shader arguments into shared registers (DOUTD).
+    struct.pack_into('<QI', pds, 0, PDS_BASE+pds_off+96, 0x90000000 | shared)
+    struct.pack_into('<I', pds, 16, 0xf4001000)
+    # The workgroup task writes group IDs to LM0:2. The instance task writes local IDs to AR0:1 and launches USC (DOUTU).
+    struct.pack_into('<6I', pds, 32, 0, 0, 0xb0000347, 0x80000043, usc_off, temps<<3)
+    struct.pack_into('<5I', pds, 64, 0xdcb40003, 0xf0001301, 0xd2800000, 0xf0001b01, 0xfc000012)
+    self.pds.host[:self.pds.nbytes] = pds+self.params
+    self.last_params:bytearray|None = self.params.copy()
+    with dev.s30_fw.lock:
+      dev.s30_fw.mmu.map_range(PDS_BASE+pds_off, self.pds.meta.pa, self.pds.meta.size, MT_PTE_READ_ONLY)
+      dev.s30_fw.mmu.map_range(USC_BASE+usc_off, self.code.meta.pa, self.code.meta.size, MT_PTE_READ_ONLY)
     self.shared = ceildiv(shared, 16)
-    self.dispatch = (2, 2, 16, 0, 0, 0, 0x02000000 | self.shared, 0, 0x100085 | attrs<<12, 32, 64)
+    self.dispatch = (2, pds_off | 2, pds_off+16, 0, 0, 0, 0x02000000 | self.shared, 0, 0x100085 | attrs<<12, pds_off+32, pds_off+64)
 
   def __call__(self, *args, global_size:tuple[int,int,int]=(1,1,1), local_size:tuple[int,int,int]=(1,1,1), wait:bool=False, timeout:int|None=None):
     lx,ly,lz = local_size
@@ -206,8 +212,6 @@ class MTS30Program(Program['MTDevice']):
         self.last_params = None
         self.pds.host[96:] = self.params
         self.last_params = self.params.copy()
-      fw.mmu.map_range(PDS_BASE, self.pds.meta.pa, self.pds.meta.size, MT_PTE_READ_ONLY)
-      fw.mmu.map_range(USC_BASE, self.code.meta.pa, self.code.meta.size, MT_PTE_READ_ONLY)
       if fw.queue is None: fw.session.enter_context(fw.boot())
       else: fw.upload_mmu()
       try:
