@@ -213,7 +213,7 @@ Plain `DEV=MT` on the S30 now selects USC and opens the card without management 
 
 The bridge identified itself as `custom ed4e39b7-CLEAN`. A clean checkout of the public bridge firmware at `ed4e39b7e0794e19ba193477067c48757a5cf9ef` built with Ubuntu's SDCC `4.2.0+dfsg-1` produced exactly the 9,207 bytes installed at offset 0x100 in this bridge's SPI flash. The wrapped image SHA-256 was `9520fde0bf43d499c07abd0a09b74e94d8a7cc3d610f577b7a4e218ab8a378e9`. Builds from the same source with SDCC 4.4, 4.5 and 4.6 differed. The normal SDCC link used seven objects from its packaged open-source 8051 runtime. The source-only build below replaces them all. [Bridge source and build rules at the verified commit](https://github.com/tinygrad/asm2464pd-firmware/tree/ed4e39b7e0794e19ba193477067c48757a5cf9ef/handmade)
 
-From the tinygrad checkout, use SDCC 4.2.0 with its runtime sources installed. The build script extracts the pinned bridge revision from the source repository and compiles each target object. The comparison uses the bridge's existing SPI setup and sends only the flash read opcode. It acquires tinygrad's normal S30 device lock. The comparison covers the executable image and its length, checksum and CRC wrapper.
+From the tinygrad checkout, use SDCC 4.2.0 with its runtime sources installed. The build script extracts the pinned bridge revision from the source repository and compiles each target object. The comparison uses the bridge's existing SPI setup and issues JEDEC identification and flash reads. It acquires tinygrad's normal S30 device lock. The comparison covers the executable image and its length, checksum and CRC wrapper.
 
 ```sh
 extra/usbgpu/s30/build_chestnut.sh "$BRIDGE_SRC" /usr/share/sdcc/lib/src /tmp/chestnut-from-source.bin
@@ -221,12 +221,16 @@ DEV=MT:USC CACHELEVEL=0 PYTHONPATH=".:$BRIDGE_SRC/handmade" python - /tmp/chestn
 import hashlib, sys
 from pathlib import Path
 from tinygrad import Device
-from e4_flash import flash_read
+from e4_flash import flash_jedec_id, flash_read
 built = Path(sys.argv[1]).read_bytes()
 handle = Device["MT"].mt.pci_dev.usb.usb.handle
-installed = flash_read(handle, 0x100, len(built))
-assert installed == built, "bridge image differs from source build"
-print(len(installed), hashlib.sha256(installed).hexdigest())
+jedec = flash_jedec_id(handle)
+assert jedec == bytes.fromhex("c2 28 15"), f"unexpected SPI flash {jedec.hex()}"
+flash = flash_read(handle, 0, 1 << jedec[2])
+end = 0x100 + len(built)
+assert flash[0x100:end] == built, "bridge image differs from source build"
+assert flash[end:].count(0xff) == len(flash) - end, "found additional data after the application"
+print(len(built), hashlib.sha256(built).hexdigest())
 PY
 ```
 
