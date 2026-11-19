@@ -86,16 +86,18 @@ def s30_boot_image(raw:bytes) -> bytearray:
 
 class MTS30Firmware(MTFirmwareBoot):
   context_pa:int = FW_BASE
-  def __init__(self, dev:MTDev, path:str|Path):
+  def __init__(self, dev:MTDev, path:str|Path|None=None):
     if not dev.s30: raise ValueError('Expected an MTT S30')
-    self.path = Path(path)
+    self.path = None if path is None else Path(path)
     super().__init__(dev, PACKET+0x1000)
     self.direct = False
     self.queue:MTCCB|None = None
     self.lock, self.session = threading.RLock(), ExitStack()
 
   @functools.cached_property
-  def image(self) -> bytearray: return s30_boot_image(self.path.read_bytes())
+  def image(self) -> bytearray:
+    if self.path is None: raise RuntimeError("S30 firmware boot requires an image path")
+    return s30_boot_image(self.path.read_bytes())
 
   def _reset_domains(self) -> None:
     # Sudi gen1_gpu_reset resets all five GPU domains through the SMC.

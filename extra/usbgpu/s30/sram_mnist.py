@@ -10,7 +10,6 @@ from tinygrad.nn.datasets import mnist
 from tinygrad.nn.state import load_state_dict, safe_load
 from tinygrad.renderer.usc import MTUSCRenderer
 from tinygrad.runtime.support.mt.mtdev import MTDev
-from tinygrad.runtime.support.mt.s30 import DEFAULT_S30_FIRMWARE
 from tinygrad.uop.ops import Ops
 
 def classify(weights:Path, index:int):
@@ -22,7 +21,7 @@ def classify(weights:Path, index:int):
   image, label = images[index:index+1].contiguous().realize(), labels[index].item()
   linear = model(image).argmax(-1).schedule_linear()
   mt = MTDev.open_usb(manage_power=False)
-  fw = ChestnutBoot(mt, DEFAULT_S30_FIRMWARE)
+  fw = ChestnutBoot(mt)
   start = cold_link(mt)
   renderer = MTUSCRenderer(Target("MT","USC","mp_10"))
   resident:dict[UOp, int] = {}

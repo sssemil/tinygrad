@@ -8,7 +8,7 @@ from tinygrad.renderer.usc import MTUSCRenderer
 from tinygrad.runtime.support.mt.compute import FW_DEVVA
 from tinygrad.runtime.support.mt.mmu import MTMMU4, MT_PTE_READ_ONLY, MT_PTE_READ_WRITE
 from tinygrad.runtime.support.mt.mtdev import MTDev, MT_IPC_RING_SIZE, MT_S30_SRAM_OFFSET
-from tinygrad.runtime.support.mt.s30 import DEFAULT_S30_FIRMWARE, DIRECT_CDM, PDS_BASE, USC_BASE, MTS30Firmware, s30_cdm_stream, s30_dispatch, s30_grid, s30_pds, s30_shader
+from tinygrad.runtime.support.mt.s30 import DIRECT_CDM, PDS_BASE, USC_BASE, MTS30Firmware, s30_cdm_stream, s30_dispatch, s30_grid, s30_pds, s30_shader
 from tinygrad.runtime.support.usb import HALF, SLOT
 from tinygrad.uop.ops import KernelInfo
 
@@ -87,7 +87,7 @@ def mailbox(mt:MTDev) -> bool:
              for base in (MT_S30_SRAM_OFFSET, MT_S30_SRAM_OFFSET+header+MT_IPC_RING_SIZE))
 
 def run(mt:MTDev, cold:bool):
-  fw = ChestnutBoot(mt, DEFAULT_S30_FIRMWARE)
+  fw = ChestnutBoot(mt)
   start = cold_link(mt) if cold else time.monotonic()
   out, inp = (UOp.placeholder((1,), dtypes.uint, slot=i) for i in range(2))
   shader = out[0].store(inp[0]*3+7).sink(arg=KernelInfo(name="s30_sram", opts_to_apply=()))
