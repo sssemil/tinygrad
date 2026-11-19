@@ -202,27 +202,41 @@ def s30_shader(obj:TinyELF) -> tuple[bytes, bytearray, int, int, list[tuple[int,
     args.append((4*param['.offset'], '<'+unwrap(dt.fmt)))
   return image.text, params, temps, attrs, args
 
+def s30_pds(params:int, shared:int, usc:int, temps:int) -> bytearray:
+  # DOUT encodes a 64-bit source pair, a 32-bit control word and a destination (DMA, register write, USC).
+  def dout(dest:int, pair:int, ctrl:int=0, *, end:bool=False, pred:bool=False) -> int:
+    return 0xf<<28 | pred<<27 | end<<26 | ctrl<<11 | pair<<3 | dest
+
+  pds = bytearray(96)
+  struct.pack_into('<QI', pds, 0, params, 1<<31 | 1<<28 | shared)
+  struct.pack_into('<I', pds, 16, dout(0, 0, 2, end=True))
+  # The same PDS program runs once for the workgroup and once per instance. Its input IDs arrive in T0:T1.
+  # Select source components for LM0:2 and AR0:1 and enable each corresponding write lane.
+  group_ids = 1<<31 | 3<<28 | 3<<8 | 1<<6 | 0b111
+  local_ids = 1<<31 | 1<<6 | 0b11
+  struct.pack_into('<6I', pds, 32, 0, 0, group_ids, local_ids, usc, temps<<3)
+  branch_instance = 0xd4800000 | 1<<27 | 3<<20 | 2<<17 | 3  # branch three instructions to the instance path
+  halt = 0xd2800000
+  temp_pair = 0xc0//2
+  struct.pack_into('<5I', pds, 64, branch_instance, dout(1, temp_pair, 2), halt, dout(1, temp_pair, 3), dout(2, 2, end=True, pred=True))
+  return pds
+
 class MTS30Program(Program['MTDevice']):
   def __init__(self, dev:MTDevice, obj:TinyELF, links:dict):
     self.dev, self.name, self.profile_key = dev, obj.name, obj.profile_key
     text, params, temps, attrs, self.args = s30_shader(obj)
     shared = len(params)//4
-    pds = bytearray(96)
     # Rogue USC prefetches one more instruction (up to 32 bytes), even when the shader ends at a page boundary.
     code = text + bytes(32)
     self.code = Buffer(dev.device, len(code), initial_value=code)
     # Place the arguments immediately before the ring controls so one USB transfer updates both for each launch.
     pds_start = round_up(CDM_SUBMISSION_SIZE, 32)
-    controls = round_up(pds_start + len(pds) + len(params), 256)
+    controls = round_up(pds_start + 96 + len(params), 256)
     self.param_offset = controls - round_up(len(params), 32)
     self.packet = Buffer(dev.device, controls + 2*CDM_CONTROL_SIZE + CDM_RING_SIZE, preallocate=True)
     packet_off, usc_off = self.packet.meta.va & 0xffffffff, self.code.meta.va & 0xffffffff
     pds_off = packet_off + pds_start
-    struct.pack_into('<QI', pds, 0, PDS_BASE+packet_off+self.param_offset, 0x90000000 | shared)
-    struct.pack_into('<I', pds, 16, 0xf4001000)
-    # The workgroup task writes group IDs to LM0:2. The instance task writes local IDs to AR0:1 and launches USC (DOUTU).
-    struct.pack_into('<6I', pds, 32, 0, 0, 0xb0000347, 0x80000043, usc_off, temps<<3)
-    struct.pack_into('<5I', pds, 64, 0xdcb40003, 0xf0001301, 0xd2800000, 0xf0001b01, 0xfc000012)
+    pds = s30_pds(PDS_BASE+packet_off+self.param_offset, shared, usc_off, temps)
     with dev.s30_fw.lock:
       dev.s30_fw.mmu.map_range(PDS_BASE+packet_off, self.packet.meta.pa, self.packet.meta.size, MT_PTE_READ_ONLY)
       dev.s30_fw.mmu.map_range(USC_BASE+usc_off, self.code.meta.pa, self.code.meta.size, MT_PTE_READ_ONLY)

@@ -89,3 +89,11 @@ Qwen's 623-operation rotary kernel exhausted the 32-register allocator. The scal
 Qwen2.5-0.5B-Instruct Q8_0 generated the same eight token IDs as MUSA, including EOS, from a fresh process with the compiler cache disabled and the toolkit unavailable. The first prompt-plus-generation call took 53.276 s after checkpoint loading and included diagnostic logging. This completes native shader compilation for the three test workloads on this particular checkpoint, input and context configuration. Each inference still uses the vendor compute firmware.
 
 In a separate boot, our META program read both physical GPU cores' 64-bit identification registers at offset 0x20 in the 0x02000000 and 0x02100000 META MMIO windows. It returned 0x0023000406600017 for each core through coherent VRAM, matching the independent PCIe reads. This establishes access to GPU registers from open firmware. It does not dispatch a shader.
+
+## November 20, 2026 — source-generated PDS and compute ring completion
+
+The native shader path also needs short PDS programs to load parameters, write workgroup or instance IDs and start USC. tinygrad now describes those programs in terms of branch, halt and DOUT instructions and encodes their operands when it builds a launch. The generated words matched the previous working launch for three different shared-register sizes.
+
+An independent META program assembled from source configured the hardware compute ring and issued a kick with both toolkit and vendor compute firmware paths unavailable. An empty stream raised event bit 2, advanced the first core's read pointer from zero to four, and left the MMU fault register zero. A vendor-firmware control run on the same hardware also advanced the pointer to four. This check contains no USC work. The SMC remains active for power and reset.
+
+The five-call native Whisper run returned the reference transcript each time. Warm median after the first two calls was 65.028 s, compared with 2.642 s under MUSA, using vendor compute firmware for both.
