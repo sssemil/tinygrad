@@ -2,21 +2,57 @@
 import argparse, secrets, struct, time
 from tinygrad import Context, UOp, dtypes
 from tinygrad.codegen import do_to_program
-from tinygrad.helpers import Target, ceildiv
+from tinygrad.helpers import Target, ceildiv, round_up
 from tinygrad.renderer import TinyELF
 from tinygrad.renderer.usc import MTUSCRenderer
 from tinygrad.runtime.support.mt.compute import FW_DEVVA
 from tinygrad.runtime.support.mt.mmu import MTMMU4, MT_PTE_READ_ONLY, MT_PTE_READ_WRITE
 from tinygrad.runtime.support.mt.mtdev import MTDev, MT_IPC_RING_SIZE, MT_S30_SRAM_OFFSET
-from tinygrad.runtime.support.mt.s30 import DEFAULT_S30_FIRMWARE, DIRECT_CDM, PDS_BASE, USC_BASE, MTS30Firmware, s30_cdm_stream, s30_dispatch, s30_pds, s30_shader
+from tinygrad.runtime.support.mt.s30 import DEFAULT_S30_FIRMWARE, DIRECT_CDM, PDS_BASE, USC_BASE, MTS30Firmware, s30_cdm_stream, s30_dispatch, s30_grid, s30_pds, s30_shader
 from tinygrad.runtime.support.usb import HALF, SLOT
 from tinygrad.uop.ops import KernelInfo
+
+# GPU virtual addresses for streamed input, resident activations, and the completion word visible at USB XDATA 0xb800.
+INPUT, ACTIVATIONS, RESULT = 0x7100000000, 0x7200000000, 0x7300000000
+INPUT_SIZE, ACTIVATION_SIZE = 0x28000, 0x38000
 
 class ChestnutBoot(MTS30Firmware):
   context_pa = (1<<39) | 0x240000  # upper half of the bridge SRAM on the Sudi outbound PCIe bus
   def _map_context(self, size:int):
-    self.mem = bytearray(0x20000)
-    return memoryview(self.mem)[:0x8000], MTMMU4(self.context_pa+0x10000, size=0x10000)
+    self.mem, self.code_end = bytearray(0x20000), 0
+    mmu = MTMMU4(self.context_pa+0x10000, size=0x10000)
+    # The first 160 KiB holds each kernel's inputs. Join the two free runs around the context into one activation heap.
+    base = self.context_pa-HALF
+    mmu.map_range(INPUT, base, INPUT_SIZE, MT_PTE_READ_ONLY)
+    mmu.map_range(ACTIVATIONS, base+INPUT_SIZE, HALF-INPUT_SIZE, MT_PTE_READ_WRITE)
+    mmu.map_range(ACTIVATIONS+HALF-INPUT_SIZE, self.context_pa+len(self.mem), HALF-len(self.mem), MT_PTE_READ_WRITE)
+    mmu.map(RESULT, (1<<39) | 0x822000, MT_PTE_READ_WRITE)
+    for va in (USC_BASE, PDS_BASE): mmu.map_range(va, self.context_pa+0x8000, 0x8000, MT_PTE_READ_ONLY)
+    return memoryview(self.mem)[:0x8000], mmu
+
+  def prepare(self, program:UOp, addresses:list[int]) -> tuple[bytearray, bytearray]:
+    text, params, temps, attrs, local, layout = s30_shader(TinyELF.from_program(program))
+    for (off, fmt), addr in zip(layout, addresses, strict=True): struct.pack_into(fmt, params, off, addr)
+    usc = self.code_end
+    pds = round_up(usc+len(text)+32, 64)  # include the USC prefetch guard
+    loader = s30_pds(FW_DEVVA+0x3000, len(params)//4, usc, temps, bool(local))
+    self.code_end = round_up(pds+len(loader), 64)
+    if self.code_end > 0x8000 or len(params) > 0x1000: raise MemoryError("S30 program exceeds Chestnut SRAM")
+    self.mem[0x8000+usc:0x8000+usc+len(text)] = text
+    self.mem[0x8000+pds:0x8000+pds+len(loader)] = loader
+    shared = ceildiv(len(params), 64)
+    grid = s30_grid(program.arg.global_size, program.arg.local_size, shared+ceildiv(local, 16))
+    return params, s30_cdm_stream(s30_dispatch(pds, shared, attrs)+grid)
+
+  def launch(self, data:bytes|bytearray, params:bytearray, stream:bytearray):
+    if len(data) > INPUT_SIZE: raise MemoryError("S30 input exceeds Chestnut SRAM")
+    if data: self.dev.pci_dev.usb.scsi_write(data)
+    self.mem[0x3000:0x3000+len(params)] = params
+    self.mem[DIRECT_CDM:DIRECT_CDM+len(stream)] = stream
+    self.upload_mmu()
+    self.kick_direct(0.5)
+
+  def result(self) -> int: return int.from_bytes(self.dev.pci_dev.usb.read(0xb800, 4), "little")
 
   def upload_mmu(self, full:bool=False):
     self.mem[0x10000:0x10000+self.mmu.next] = self.mmu.root[:self.mmu.next]
@@ -55,29 +91,14 @@ def run(mt:MTDev, cold:bool):
   start = cold_link(mt) if cold else time.monotonic()
   out, inp = (UOp.placeholder((1,), dtypes.uint, slot=i) for i in range(2))
   shader = out[0].store(inp[0]*3+7).sink(arg=KernelInfo(name="s30_sram", opts_to_apply=()))
-  obj = TinyELF.from_program(do_to_program(shader, MTUSCRenderer(Target("MT","USC","mp_10"))))
-  text, params, temps, attrs, local, _ = s30_shader(obj)
-  assert local == 0 and len(text)+32 <= 0x1000
-  # The bridge exposes the first completion word to USB XDATA at 0xb800.
-  output_va, input_va = 0x7100000000, 0x7200000000
-  struct.pack_into("<QQ", params, 0, output_va, input_va)
-  fw.mmu.map(output_va, (1<<39) | 0x822000, MT_PTE_READ_WRITE)
-  for va,off in ((input_va, 0x8000), (USC_BASE, 0x9000), (PDS_BASE, 0xa000)): fw.mmu.map(va, fw.context_pa+off, MT_PTE_READ_ONLY)
-  fw.mem[0x9000:0x9000+len(text)] = text
-  shared = ceildiv(len(params), 64)
-  pds = s30_pds(FW_DEVVA+0x3000, len(params)//4, 0, temps)
-  fw.mem[0xa000:0xa000+len(pds)] = pds
-  stream = s30_cdm_stream(s30_dispatch(0, shared, attrs)+(0, 0, 0, 1<<25 | 2<<11 | shared, 0))
+  renderer = MTUSCRenderer(Target("MT","USC","mp_10"))
+  params, stream = fw.prepare(do_to_program(shader, renderer), [RESULT, INPUT])
   with fw.boot_direct():
     assert all(pa & (1<<39) for pa in fw.mmu.pages.values())
-    fw.mem[0x3000:0x3000+len(params)] = params
-    fw.mem[DIRECT_CDM:DIRECT_CDM+len(stream)] = stream
     for _ in range(3):
       x = secrets.randbits(28)
-      struct.pack_into("<I", fw.mem, 0x8000, x)
-      fw.upload_mmu()
-      fw.kick_direct(0.5)
-      got = int.from_bytes(mt.pci_dev.usb.read(0xb800, 4), "little")
+      fw.launch(struct.pack("<I", x), params, stream)
+      got = fw.result()
       if got != 3*x+7: raise RuntimeError(f"S30 returned {got:#x}, expected {3*x+7:#x}")
       header = mailbox(mt)
       print(f"{1000*(time.monotonic()-start):7.2f} ms  {x:#010x} * 3 + 7 = {got:#010x}  mailbox ready {header}")

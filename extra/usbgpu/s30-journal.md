@@ -397,3 +397,19 @@ The S30 can fetch USC, PDS, command and page-table data across PCIe from Chestnu
 The guard rejected any host mapping outside BAR0, any PCIe request at or above the host's 32 GiB VRAM aperture, management IPC and access to the vendor compute image. An early test using the generic device wrapper attempted to allocate its VRAM timeline on exit. The diagnostic now opens the PCI device directly. This establishes compute independent of local DDR for the challenge. The factory boot storage remained installed throughout.
 
 From the checkout with the card idle, run `PYTHONPATH=. python extra/usbgpu/s30/sram.py --cold`.
+
+## November 20, 2026 — run the complete trained MNIST graph without local DDR
+
+All 16 leading MNIST test images classified correctly on the S30, each in a fresh process and a separate slot power cycle. Tinygrad scheduled the trained beautiful_mnist model on the host, compiled all nine kernels to USC after rail enable and dispatched each on the card. The CPU prepared the checkpoint and a single input image. The GPU performed every convolution, activation, normalization, pooling, linear and class selection operation. Input weights streamed through a 160 KiB bridge window. Intermediate tensors stayed in a separate 224 KiB GPU-visible activation region, and the GPU stored its class index directly in Chestnut's USB-readable completion word.
+
+The 16 image results arrived in 337–371 ms from rail enable. Neither management ring pair was ready. The diagnostic rejected all non-register BAR mappings, any TLP in the VRAM aperture, use of management IPC and access to the vendor compute image in these runs. Zeroing every tensor in a copy of the checkpoint changed the first prediction from 7 to 0 and failed the label check. In a separate placement experiment, compiling fresh just before rail enable produced a prediction at 70 ms. The checked command compiles after power-on. These single-image measurements include compilation, exclude loading the checkpoint on the host, and use different timing boundaries from the normal batch benchmark.
+
+Run from the tinygrad checkout with the card idle and the model environment active:
+
+```sh
+PYTHONPATH=. python extra/usbgpu/s30/sram_mnist.py ../.s30-tools/mnist-s30.safetensors --index 0
+```
+
+The factory board boot storage remained present. The SRAM run removes GPU DDR initialization from MNIST's compute and data path. It cannot establish which board code executed before the PCIe link came up.
+
+A separate launch-latency experiment read 0xff03 from the multicore routing register. After clearing the primary completion event, the primary event word read 0 and the secondary still read 4. The normal launcher continues to acknowledge each core.

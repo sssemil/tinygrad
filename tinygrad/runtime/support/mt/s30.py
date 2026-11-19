@@ -214,6 +214,11 @@ def s30_submission(command:int, region:int, region_size:int) -> bytearray:
 def s30_dispatch(pds_off:int, shared:int, attrs:int) -> tuple[int, ...]:
   return (2, pds_off | 2, pds_off+16, 0, 0, 0, 0x02000000 | shared, 0, 0x100085 | attrs<<12, pds_off+32, pds_off+64)
 
+def s30_grid(groups:tuple[int,int,int], local:tuple[int,int,int], shared:int) -> tuple[int,...]:
+  lx,ly,lz = local
+  lanes = lx*ly*lz
+  return (*(g-1 for g in groups), (lanes if lanes < 32 else 0)<<25 | 2<<11 | shared, (lx-1)<<20 | (ly-1)<<10 | (lz-1))
+
 def s30_cdm_stream(words:tuple[int,...]) -> bytearray:
   write_offset = (len(words)+1)*4 + 64  # include the CDM prefetch guard after STREAM_TERMINATE
   if write_offset >= CDM_RING_SIZE: raise ValueError("S30 compute stream exceeds its ring")
@@ -320,8 +325,6 @@ class MTS30Program(Program['MTDevice']):
     self.launch[:len(params)] = params
 
   def __call__(self, *args, global_size:tuple[int,int,int]=(1,1,1), local_size:tuple[int,int,int]=(1,1,1), wait:bool=False, timeout:int|None=None):
-    lx,ly,lz = local_size
-    lanes = lx*ly*lz
     fw = self.dev.s30_fw
     with fw.lock:
       for value,(off,fmt) in zip(args, self.args, strict=True): struct.pack_into(fmt, self.launch, off, value)
@@ -331,8 +334,7 @@ class MTS30Program(Program['MTDevice']):
         fw.session.enter_context(fw.boot_direct() if self.direct else fw.boot())
       try:
         start = time.perf_counter()
-        struct.pack_into('<5I', self.launch, self.grid_offset, *(g-1 for g in global_size),
-                         (lanes if lanes < 32 else 0)<<25 | 2<<11 | self.shared, (lx-1)<<20 | (ly-1)<<10 | (lz-1))
+        struct.pack_into('<5I', self.launch, self.grid_offset, *s30_grid(global_size, local_size, self.shared))
         wait_seconds = 5.0 if timeout is None else timeout/1000
         if self.direct:
           fw.v[self.param_offset:self.param_offset+len(self.launch)] = self.launch
