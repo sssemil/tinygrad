@@ -53,13 +53,14 @@ def assemble(ins:list[Instruction]) -> tuple[bytes, int]:
       a,b = operands
       word = 0x840c0a990110200110106c20 | _field(dst,(19,41,53,59)) | _field(a,(6,16,17,36)) | _field(b,(42,61,57,74))
       wait, signal = (29,39), 18
-    elif op in ("lsr", "and"):
+    elif op in ("lsr", "asr", "and"):
       a,b = operands
-      word = (0xa5b6200149801078 if op == "lsr" else 0xa136000041801078) | _field(dst,(8,14,19,33))
+      word = {"lsr":0xa5b6200149801078, "asr":0x9a20824025b6200149801078, "and":0xa136000041801078}[op] | _field(dst,(8,14,19,33))
       word |= _field(a,(25,36,44,47)) | _field(b,(13,17,34,29))
       wait, signal = (11,18), 10
-    elif op in ("sqrt", "recip"):
-      word = (0x80000a000200001a if op == "sqrt" else 0x80000a000000001a) | _field(dst,(7,8,16,20)) | _field(operands[0],(9,13,19,22))
+    elif op in ("sqrt", "recip", "exp2", "log2"):
+      word = {"sqrt":0x80000a000200001a, "recip":0x80000a000000001a, "exp2":0x80000a010002001a, "log2":0x80000a010000001a}[op]
+      word |= _field(dst,(7,8,16,20)) | _field(operands[0],(9,13,19,22))
       wait, signal = (10,15), 14
     elif op in ("half_to_float", "float_to_half"):
       a, = operands
@@ -70,9 +71,10 @@ def assemble(ins:list[Instruction]) -> tuple[bytes, int]:
       _, t, f = operands
       word = 0xc04008080480a68b | _field(dst,(4,16,24,33)) | _field(t,(14,21,25,27)) | _field(f,(6,12,20,19))
       wait, signal = (55,56), 41
-    elif op == "u8tof":
-      word = 0x80211818400388ca | _field(dst,(9,10,23,24)) | _field(operands[0],(18,22,21,25))
-      wait, signal = (20,29), None  # converts the low byte and waits for dfc0
+    elif op in ("u8tof", "itof", "ftoi"):
+      word = {"u8tof":0x80211818400388ca, "itof":0x80010818400388ca, "ftoi":0x80221818400388ca}[op]
+      word |= _field(dst,(9,10,23,24)) | _field(operands[0],(18,22,21,25))
+      wait, signal = (20,29), None  # conversion waits for its own dfc0
     elif op in ("iadd", "imm", "ilt", "imax", "ieq"):
       a,b = (0,imm) if op == "imm" else operands
       word = {"iadd":0x8190200010904c00, "imm":0x8190200010804c80, "ilt":0x8596240816f07d00,
@@ -112,14 +114,15 @@ class MTUSCRenderer(Renderer):
   supports_float4 = has_shared = False
   shared_max = 0
   global_max, local_max = (0x7fffffff,65535,65535), (1024,)
-  code_for_op = dict.fromkeys((Ops.ADD, Ops.SHL, Ops.SHR, Ops.MUL, Ops.SQRT, Ops.RECIP, Ops.MAX), lambda: None)
+  code_for_op = dict.fromkeys((Ops.ADD, Ops.SHL, Ops.SHR, Ops.MUL, Ops.SQRT, Ops.RECIP, Ops.EXP2, Ops.LOG2, Ops.MAX), lambda: None)
   def __init__(self, target:Target):
     if target.arch != "mp_10": raise RuntimeError("USC requires the S30")
     super().__init__(target)
   def supported_dtypes(self): return {dtypes.float, dtypes.half, dtypes.int, dtypes.uchar, dtypes.bool}
   def render(self, uops:list[UOp]) -> str:
     params = sorted((u for u in uops if u.op is Ops.PARAM), key=lambda u:u.arg.slot)
-    if any(p.addrspace != AddrSpace.GLOBAL or p.dtype not in self.supported_dtypes() for p in params):
+    if any((p.addrspace != AddrSpace.GLOBAL or p.dtype not in self.supported_dtypes()) and
+           (p.addrspace != AddrSpace.ALU or p.dtype != dtypes.int) for p in params):
       raise NotImplementedError("S30 USC requires supported global buffer arguments")
     ptrs = {p:2*i for i,p in enumerate(params)}
     ins:list[Instruction] = []
@@ -149,6 +152,7 @@ class MTUSCRenderer(Renderer):
       if u.op is Ops.SPECIAL and u.arg in ("gidx0", "gidx1", "gidx2"): r = emit("group", imm=int(u.arg[-1]))
       elif u.op is Ops.SPECIAL and u.arg == "lidx0": r = emit("lane")
       elif u.op is Ops.AFTER: r = reg(u.src[0])
+      elif u.op is Ops.PARAM and u.addrspace is AddrSpace.ALU: r = emit("imm", imm=ptrs[u])
       elif u.op is Ops.CONST or (u.op is Ops.CAST and u.src[0].op is Ops.CONST):
         val = u.val if u.op is Ops.CONST else u.src[0].val
         bits = int.from_bytes(struct.pack('<'+u.dtype.fmt, val), 'little') if u.dtype in (dtypes.half, dtypes.float) else int(val) & 0xffffffff
@@ -156,6 +160,9 @@ class MTUSCRenderer(Renderer):
       elif u.op is Ops.CAST and u.dtype == dtypes.float and u.src[0].dtype == dtypes.uchar: r = emit("u8tof",reg(u.src[0]))
       elif u.op is Ops.CAST and u.dtype == dtypes.int and u.src[0].dtype == dtypes.bool: r = reg(u.src[0])
       elif u.op is Ops.CAST and u.dtype == dtypes.int and u.src[0].dtype == dtypes.uchar: r = emit("and", reg(u.src[0]), literal(255))
+      elif u.op is Ops.BITCAST and u.src[0].dtype.itemsize == u.dtype.itemsize: r = reg(u.src[0])
+      elif u.op is Ops.CAST and (u.src[0].dtype, u.dtype) in ((dtypes.float,dtypes.int),(dtypes.int,dtypes.float)):
+        r = emit("itof" if u.dtype == dtypes.float else "ftoi", reg(u.src[0]))
       elif u.op is Ops.CAST and (u.src[0].dtype, u.dtype) in ((dtypes.half,dtypes.float),(dtypes.float,dtypes.half)):
         r = emit("float_to_half" if u.dtype == dtypes.half else "half_to_float", reg(u.src[0]))
       elif u.op in (Ops.CMPEQ, Ops.CMPLT) and u.src[0].dtype in (dtypes.int, dtypes.float, dtypes.bool):
@@ -172,9 +179,13 @@ class MTUSCRenderer(Renderer):
         if u.dtype == dtypes.half: a,b = emit("half_to_float", a), emit("half_to_float", b)
         r = emit(("i" if u.dtype == dtypes.int else "f")+u.op.name.lower(), a, b)
         if u.dtype == dtypes.half: r = emit("float_to_half", r)
-      elif u.op in (Ops.RECIP, Ops.SQRT): r = emit(u.op.name.lower(), reg(u.src[0]))
+      elif u.op in (Ops.RECIP, Ops.SQRT, Ops.LOG2, Ops.EXP2) and u.dtype in (dtypes.half, dtypes.float):
+        a = reg(u.src[0])
+        if u.dtype == dtypes.half: a = emit("half_to_float", a)
+        r = emit(u.op.name.lower(), a)
+        if u.dtype == dtypes.half: r = emit("float_to_half", r)
       elif u.op is Ops.SHL and u.src[1].vmin == u.src[1].vmax: r = emit("imul", reg(u.src[0]), literal(1<<(int(u.src[1].vmin)%32)))
-      elif u.op is Ops.SHR and u.src[0].vmin >= 0: r = emit("lsr", *(reg(x) for x in u.src))
+      elif u.op is Ops.SHR: r = emit("lsr" if u.src[0].vmin >= 0 else "asr", *(reg(x) for x in u.src))
       elif u.op in (Ops.TRUNCDIV, Ops.TRUNCMOD) and u.src[0].vmin >= 0 and u.src[1].vmin == u.src[1].vmax and u.src[1].vmin > 0:
         from tinygrad.codegen.decomp.op import magicgu
         n,d = reg(u.src[0]), int(u.src[1].vmin)
@@ -223,7 +234,7 @@ class MTUSCRenderer(Renderer):
         if u.op is Ops.LOAD and u.dtype == dtypes.bool: regs[u] = emit("and", regs[u], literal(1))
         if u.op is Ops.STORE: emit("st"+suffix, offsets[offset], reg(u.src[1]), imm=ptrs[buf])
       elif u.op not in (Ops.PARAM, Ops.BUFFER, Ops.CONST, Ops.CAST, Ops.INDEX, Ops.SPECIAL, Ops.CMPEQ, Ops.CMPLT, Ops.WHERE,
-                        Ops.AND, Ops.OR, Ops.TRUNCDIV, Ops.TRUNCMOD, *self.code_for_op, Ops.STACK, Ops.AFTER, Ops.SINK):
+                        Ops.AND, Ops.OR, Ops.BITCAST, Ops.TRUNCDIV, Ops.TRUNCMOD, *self.code_for_op, Ops.STACK, Ops.AFTER, Ops.SINK):
         raise NotImplementedError(f"S30 USC cannot lower {u.op}")
     code, temps = assemble(ins)
     # Shared registers hold pointer pairs followed by the shader's literal words.

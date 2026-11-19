@@ -181,7 +181,7 @@ def s30_cdm_packet(words:tuple[int,...], regions:int, addr:int, controls:int=0x2
 def s30_shader(obj:TinyELF) -> tuple[bytes, bytearray, int, int, list[tuple[int,str]]]:
   if obj.target.renderer == "USC":
     ntemps, nconst = struct.unpack_from('<II', obj.lib)
-    native_args = [(8*i, '<Q') for i in range(len(obj.signature))]
+    native_args = [(8*i, '<i' if space is AddrSpace.ALU else '<Q') for i,(_,space,_,_) in enumerate(obj.signature)]
     off = 8+4*nconst
     return obj.lib[off:], bytearray(8*len(native_args))+obj.lib[8:off], ceildiv(ntemps, 2), 1, native_args
   image = MTKernelImage.from_elf(obj.lib)
