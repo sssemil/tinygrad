@@ -88,7 +88,7 @@ class MTS30Firmware(MTFirmwareBoot):
     if not dev.s30: raise ValueError('Expected an MTT S30')
     self.path = Path(path)
     super().__init__(dev, PACKET+0x1000)
-    self.mmu.map_range(FW_DEVVA, FW_BASE, PACKET+0x1000, MT_PTE_READ_WRITE)
+    self.direct = False
     self.queue:MTCCB|None = None
     self.lock, self.session = threading.RLock(), ExitStack()
 
@@ -103,13 +103,14 @@ class MTS30Firmware(MTFirmwareBoot):
 
   @contextmanager
   def _boot(self, image:bytes|bytearray, *, master:bool=True) -> Iterator[None]:
-    if self.queue is not None: raise RuntimeError("S30 firmware is already running")
+    if self.direct or self.queue is not None: raise RuntimeError("S30 compute is already running")
     timers = (0x400008, 0x40000c)  # Sudi GPU subsystem SOC and USC timer enables
     saved = [self.dev.smc._r32(reg) for reg in timers]
     try:
       self._reset_domains()
       for reg in timers: self.dev.smc._w32(reg, 1)
       self._reset()
+      self.mmu.map_range(FW_DEVVA, FW_BASE, round_up(len(image), 0x1000), MT_PTE_READ_WRITE)
       self.v[:len(image)] = image
       self.upload_mmu(full=True)
       self._setup_mmu()
@@ -135,6 +136,38 @@ class MTS30Firmware(MTFirmwareBoot):
         with self.lock:
           queue, self.queue = self.queue, None
           if queue is not None and queue.wr_idx != queue.response_rd: self._reset_domains()
+
+  @contextmanager
+  def boot_direct(self) -> Iterator[None]:
+    # The host owns core 0 and its compute ring. META stays stopped and no firmware image is loaded.
+    with self._boot(bytes(0x8000), master=False):
+      self._write(0x4000, 1, 4)  # compute scheduler
+      self._write(0xf920, 0, 4)  # CDM MMU context zero
+      self._write(0xcd8, 1, 4)
+      for reg in (0x638, 0x658, 0x6e8, 0x6f8): self._write(reg, PDS_BASE)
+      for reg in (0x4008, 0x4010, 0xf268, 0x4028): self._write(reg, USC_BASE)
+      self._write(0x4f0, CDM_RING_SIZE)
+      self._write(0x598, FW_DEVVA+0x7000)  # context state
+      self._write(0x5b8, 0, 4)
+      self._write(0x4d0, 1, 4)
+      self._write(0x498, FW_DEVVA+0x6000)  # compute state
+      self._write(0x68, 1)
+      self._write(0x24c0, 1, 4)
+      self.direct = True
+      try: yield
+      finally: self.direct = False
+
+  def kick_direct(self, control:int, timeout:float) -> None:
+    self._write(0x138, 4, 4)  # clear the previous CDM completion
+    self._write(0x4f8, control)
+    self._write(0x4e8, control+2*CDM_CONTROL_SIZE)
+    self._write(0x478, 1, 4)
+    deadline = time.monotonic()+timeout
+    while not self._read(0x130, 4) & 4:
+      if time.monotonic() >= deadline:
+        fault = self._read(0xe160)
+        self._reset_domains()
+        raise TimeoutError(f"S30 compute timed out, MMU fault {fault:#x}")
 
   def submit(self, token:int|None, command:int, size:int, data:bytearray, timeout:float, signal:tuple[int,int]|None=None,
              resident:Buffer|None=None, offset:int=0) -> MTResponse:
@@ -163,19 +196,23 @@ def s30_submission(command:int, region:int, region_size:int) -> bytearray:
   struct.pack_into('<I4xQI', packet, 72, region, 96, region_size)
   return packet
 
-def s30_cdm_packet(words:tuple[int,...], regions:int, addr:int, controls:int=0x200) -> bytearray:
+def s30_cdm_stream(words:tuple[int,...]) -> bytearray:
   write_offset = (len(words)+1)*4 + 64  # include the CDM prefetch guard after STREAM_TERMINATE
   if write_offset >= CDM_RING_SIZE: raise ValueError("S30 compute stream exceeds its ring")
+  stream = bytearray(2*CDM_CONTROL_SIZE+write_offset)
+  for core in range(2): struct.pack_into('<Q', stream, core*CDM_CONTROL_SIZE, write_offset)
+  struct.pack_into(f'<{len(words)+1}I', stream, 2*CDM_CONTROL_SIZE, *words, 0x80000000)
+  return stream
+
+def s30_cdm_packet(words:tuple[int,...], regions:int, addr:int, controls:int=0x200) -> bytearray:
   packet = s30_submission(mtfw.MTFW_SUBMISSION_CMD_GPU_CDM, mtfw.MTFW_SUB_REGION_CDM, 16+CDM_KICK_SIZE)
   ring = controls + 2*CDM_CONTROL_SIZE
-  packet.extend(bytes(ring+write_offset-len(packet)))
+  packet.extend(bytes(controls-len(packet))+s30_cdm_stream(words))
   struct.pack_into('<II', packet, 96+8, 16, 1)
   kick, scratch = 96+16, FW_DEVVA+PACKET
   struct.pack_into('<I', packet, kick+8, CDM_KICK_SIZE)
   struct.pack_into('<II', packet, kick+0xc0, regions, regions)
   struct.pack_into('<5Q', packet, kick+0x118, scratch+0xc00, addr+ring, addr+controls, CDM_RING_SIZE, scratch+0xe00)
-  for core in range(2): struct.pack_into('<Q', packet, controls+core*CDM_CONTROL_SIZE, write_offset)
-  struct.pack_into(f'<{len(words)+1}I', packet, ring, *words, 0x80000000)
   return packet
 
 def s30_shader(obj:TinyELF) -> tuple[bytes, bytearray, int, int, list[tuple[int,str]]]:
@@ -224,16 +261,18 @@ def s30_pds(params:int, shared:int, usc:int, temps:int) -> bytearray:
 class MTS30Program(Program['MTDevice']):
   def __init__(self, dev:MTDevice, obj:TinyELF, links:dict):
     self.dev, self.name, self.profile_key = dev, obj.name, obj.profile_key
+    self.direct = obj.target.renderer == "USC"
     text, params, temps, attrs, self.args = s30_shader(obj)
     shared = len(params)//4
     # Rogue USC prefetches one more instruction (up to 32 bytes), even when the shader ends at a page boundary.
     code = text + bytes(32)
     self.code = Buffer(dev.device, len(code), initial_value=code)
     # Place the arguments immediately before the ring controls so one USB transfer updates both for each launch.
-    pds_start = round_up(CDM_SUBMISSION_SIZE, 32)
+    pds_start = 0 if self.direct else round_up(CDM_SUBMISSION_SIZE, 32)
     controls = round_up(pds_start + 96 + len(params), 256)
     self.param_offset = controls - round_up(len(params), 32)
     self.packet = Buffer(dev.device, controls + 2*CDM_CONTROL_SIZE + CDM_RING_SIZE, preallocate=True)
+    self.control = self.packet.meta.va + controls
     packet_off, usc_off = self.packet.meta.va & 0xffffffff, self.code.meta.va & 0xffffffff
     pds_off = packet_off + pds_start
     pds = s30_pds(PDS_BASE+packet_off+self.param_offset, shared, usc_off, temps)
@@ -242,7 +281,8 @@ class MTS30Program(Program['MTDevice']):
       dev.s30_fw.mmu.map_range(USC_BASE+usc_off, self.code.meta.pa, self.code.meta.size, MT_PTE_READ_ONLY)
     self.shared = ceildiv(shared, 16)
     dispatch = (2, pds_off | 2, pds_off+16, 0, 0, 0, 0x02000000 | self.shared, 0, 0x100085 | attrs<<12, pds_off+32, pds_off+64)
-    packet = s30_cdm_packet(dispatch + (0,)*5, max(8, temps, attrs), self.packet.meta.va, controls)
+    words = dispatch + (0,)*5
+    packet = bytearray(controls)+s30_cdm_stream(words) if self.direct else s30_cdm_packet(words, max(8, temps, attrs), self.packet.meta.va, controls)
     packet[pds_start:pds_start+len(pds)] = pds
     packet[self.param_offset:self.param_offset+len(params)] = params
     self.packet.host[:len(packet)] = packet
@@ -255,15 +295,22 @@ class MTS30Program(Program['MTDevice']):
     fw = self.dev.s30_fw
     with fw.lock:
       for value,(off,fmt) in zip(args, self.args, strict=True): struct.pack_into(fmt, self.launch, off, value)
-      if fw.queue is None: fw.session.enter_context(fw.boot())
-      else: fw.upload_mmu()
+      if (fw.direct if self.direct else fw.queue is not None): fw.upload_mmu()
+      else:
+        fw.session.close()
+        fw.session.enter_context(fw.boot_direct() if self.direct else fw.boot())
       try:
         start = time.perf_counter()
         struct.pack_into('<5I', self.launch, -20, *(g-1 for g in global_size),
                          (lanes if lanes < 32 else 0)<<25 | 2<<11 | self.shared, (lx-1)<<20 | (ly-1)<<10 | (lz-1))
-        resp = fw.submit(None, mtfw.MTFW_SUBMISSION_CMD_GPU_CDM, CDM_SUBMISSION_SIZE, self.launch, 5.0 if timeout is None else timeout/1000,
-                         resident=self.packet, offset=self.param_offset)
-        if resp.value: raise RuntimeError(f"S30 kernel {self.name} failed with firmware status {resp.value:#x}")
+        wait_seconds = 5.0 if timeout is None else timeout/1000
+        if self.direct:
+          self.packet.host[self.param_offset:self.param_offset+len(self.launch)] = self.launch
+          fw.kick_direct(self.control, wait_seconds)
+        else:
+          resp = fw.submit(None, mtfw.MTFW_SUBMISSION_CMD_GPU_CDM, CDM_SUBMISSION_SIZE, self.launch, wait_seconds,
+                           resident=self.packet, offset=self.param_offset)
+          if resp.value: raise RuntimeError(f"S30 kernel {self.name} failed with firmware status {resp.value:#x}")
         return time.perf_counter()-start if wait else None
       except BaseException:
         fw.session.close()

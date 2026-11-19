@@ -91,23 +91,23 @@ class TestS30USB(unittest.TestCase):
     resident = Tensor(original, device="CPU", dtype=dtypes.int32).to("MT").realize()
     self.assertEqual(resident.to("CPU").tolist(), original)
 
-  @requires_firmware
   def test_native_vector_add(self):
     import numpy as np
     from unittest.mock import patch
     from tinygrad.runtime.support.mt.compiler import MTLLVMCompiler
     rng = np.random.default_rng(30)
     with Context(DEV="MT:USC", CACHELEVEL=0), patch.object(MTCompiler, "compile_raw", side_effect=AssertionError("called mcc")), \
-         patch.object(MTLLVMCompiler, "compile", side_effect=AssertionError("called MTGPU clang")):
+         patch.object(MTLLVMCompiler, "compile", side_effect=AssertionError("called MTGPU clang")), \
+         patch.object(Device["MT"].s30_fw, "boot", side_effect=AssertionError("loaded vendor compute firmware")):
       self.assertEqual(Device["MT"].renderer.target.renderer, "USC")
       for n in (1, 32, 256, 257, 4099):
         for dt in (np.int32, np.float32):
           with self.subTest(n=n, dtype=dt):
             a,b = (rng.integers(-(1<<31), 1<<31, n, dtype=dt) if dt == np.int32 else rng.normal(size=n).astype(dt) for _ in range(2))
             np.testing.assert_array_equal((Tensor(a, device="MT")+Tensor(b, device="MT")).numpy(), a+b)
-      self.assertGreater(Device["MT"].s30_fw.queue.seq, 0)
+      self.assertTrue(Device["MT"].s30_fw.direct)
+      self.assertIsNone(Device["MT"].s30_fw.queue)
 
-  @requires_firmware
   def test_native_projection(self):
     import numpy as np
     rng = np.random.default_rng(30)
@@ -119,7 +119,6 @@ class TestS30USB(unittest.TestCase):
       np.testing.assert_array_equal(out.numpy(), np.maximum(x@w.T, 0))
       np.testing.assert_array_equal((inputs.int() * inputs.int()).numpy(), x.astype(np.int32)**2)
 
-  @requires_firmware
   def test_native_half_and_mask(self):
     import numpy as np
     rng = np.random.default_rng(30)
@@ -131,7 +130,6 @@ class TestS30USB(unittest.TestCase):
       np.testing.assert_array_equal(x.pad(((2,3),), value=2.).numpy(), np.pad(a, (2,3), constant_values=2.))
       np.testing.assert_array_equal(Tensor.full((37,37), -float("inf"), device="MT").triu(1).numpy(), np.triu(np.full((37,37), -np.inf), 1))
 
-  @requires_firmware
   def test_native_symbolic_math(self):
     import numpy as np
     data = np.arange(-32, 32, dtype=np.int32)
@@ -140,7 +138,6 @@ class TestS30USB(unittest.TestCase):
       run = TinyJit(lambda x,v: ((x+Tensor(v, device=x.device))>>2).float().exp2().log2().realize())
       for n in (-11,3,17,-2): np.testing.assert_allclose(run(x, offset.bind(n)).numpy(), (data+n)>>2, atol=1e-5)
 
-  @requires_firmware
   def test_native_variable_divisor(self):
     import numpy as np
     data = np.arange(4097, dtype=np.int32)
@@ -152,7 +149,6 @@ class TestS30USB(unittest.TestCase):
         return ((n//d)*1024 + n%d).realize()
       for d in (1,2,3,17,127,448): np.testing.assert_array_equal(run(x, divisor.bind(d)).numpy(), data//d*1024+data%d)
 
-  @requires_firmware
   def test_native_integer_lanes(self):
     import numpy as np
     rng = np.random.default_rng(30)
