@@ -110,8 +110,7 @@ class MTS30Firmware(MTFirmwareBoot):
       for reg in timers: self.dev.smc._w32(reg, 1)
       self._reset()
       self.v[:len(image)] = image
-      self.mmu.dirty_pages.update(range(0, self.mmu.next, 0x1000))
-      self.upload_mmu()
+      self.upload_mmu(full=True)
       self._setup_mmu()
       time.sleep(3e-6)
       self._write(0x100, 0)

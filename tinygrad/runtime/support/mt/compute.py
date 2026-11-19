@@ -2,7 +2,7 @@ from __future__ import annotations
 import os, struct, time
 from tinygrad.runtime.autogen import mtfw
 from tinygrad.runtime.support.mt.mtdev import MTDev
-from tinygrad.runtime.support.mt.mmu import MTMMU4
+from tinygrad.runtime.support.mt.mmu import MTMMU4, MT_PAGE_SIZE
 
 FW_BASE, ROOT_BASE, INIT_SIZE, FW_DEVVA = 0x20000000, 0x30000000, 0x2000000, 0xe1c0000000
 FWIF_OFF, META_BASE = 0xc0000, 0x90000000
@@ -34,11 +34,13 @@ class MTFirmwareBoot:
   def _write(self, off:int, value:int, size:int=8) -> None: self.dev.smc._write(self.dev.socif + off, value.to_bytes(size, 'little'))
   def _read(self, off:int, size:int=8) -> int: return int.from_bytes(self.dev.smc._read(self.dev.socif + off, size), 'little')
 
-  def upload_mmu(self) -> None:
-    for off in sorted(self.mmu.dirty_pages):
-      rv = self.dev.pci_dev.map_bar(2, off=ROOT_BASE+off, size=0x1000, fmt='B')
-      rv[:] = self.mmu.root[off:off+0x1000]
-    self.mmu.dirty_pages.clear()
+  def upload_mmu(self, full:bool=False) -> None:
+    if full: ranges = [(0, self.mmu.next)]
+    elif self.dev.s30: ranges = sorted(self.mmu.dirty_ranges.values())
+    else: ranges = [(p, p+MT_PAGE_SIZE) for p in sorted(self.mmu.dirty_ranges)]
+    for start,end in ranges:
+      self.dev.pci_dev.map_bar(2, off=ROOT_BASE+start, size=end-start, fmt='B')[:] = self.mmu.root[start:end]
+    self.mmu.dirty_ranges.clear()
 
   def _reset(self) -> None:
     self._write(0xa100, 0, 4)
