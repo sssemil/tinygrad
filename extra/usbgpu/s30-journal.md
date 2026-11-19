@@ -8,9 +8,9 @@ Measured on the same Chestnut S30 with compiler caching disabled. The cold colum
 
 | Workload | Native cold | MUSA cold | Native warm | MUSA warm |
 | --- | ---: | ---: | ---: | ---: |
-| MNIST, batch of 16 | 0.850 s | 3.583 s | 27.44 ms | 14.09 ms |
-| Whisper tiny.en, test.wav | 11.131 s | 50.641 s | 5.162 s | 2.608 s |
-| Qwen2.5-0.5B Q8_0 | 16.869 s | 172.371 s | 5.031 s | 4.818 s |
+| MNIST, batch of 16 | 0.850 s | 3.745 s | 27.44 ms | 14.02 ms |
+| Whisper tiny.en, test.wav | 11.131 s | 50.630 s | 5.162 s | 2.605 s |
+| Qwen2.5-0.5B Q8_0 | 16.869 s | 172.335 s | 5.031 s | 4.815 s |
 
 The benchmark checked all five outputs against the recorded reference for each model on each backend. The native column uses the offline, isolated benchmark. It checked every loaded USC program against compiler output generated in the same process. The check covered 10 distinct binaries for MNIST, 88 for Whisper and 77 for Qwen. The benchmark also checked that compute startup received only zero-filled context memory, with META master boot disabled. It blocked vendor firmware boot and management mailbox construction. The card powered up with its factory firmware still installed. The host did not upload proprietary code during these model runs. The board-management mailbox was unused.
 
@@ -424,10 +424,16 @@ extra/usbgpu/s30/bench_isolated.sh sram-mnist ../.s30-tools/mnist-s30.safetensor
 
 A 896-row, 4,864-element FP16 weight projection took 1.897 ms with eight rows and eight reduction lanes per workgroup, and 1.611 ms with 64 rows and two reduction lanes. All outputs matched NumPy. The compiler applies the latter shape to single row reductions at least twice as long as the output row count when that count is divisible by 64. For fixed matrix products with a long reduction, four output columns and two unrolled reduction terms also reuse the input across more outputs. A broader heuristic exhausted the register file on Qwen. The accepted rule requires three matrix axes and a single reduction.
 
-Warm Qwen took 5.020 s in the tuning process and 5.031 s in the offline sandbox, down from 5.144 s immediately before the change. All five calls returned the reference tokens. Whisper measured 5.162 s and batch-16 MNIST 27.44 ms in the same isolated suite. The comparison table uses this native run and the previous MUSA run on this card. All 165 archived inference graphs and 118 MNIST training graphs compiled, and all 17 applicable native hardware tests passed.
+Warm Qwen took 5.020 s in the tuning process and 5.031 s in the offline sandbox, down from 5.144 s immediately before the change. All five calls returned the reference tokens. Whisper measured 5.162 s and batch-16 MNIST 27.44 ms in the same isolated suite. A subsequent fresh MUSA run on this card supplies the comparison column at the top. All 165 archived inference graphs and 118 MNIST training graphs compiled, and all 17 applicable native hardware tests passed.
 
 ## November 20, 2026 — separate the early rail and lane-enable intervals
 
 Across six slot cycles, the bridge held the S30 rail on for 1.2 s with the downstream lane disabled. Alternating trials kept the bridge PERST control asserted or released it at the beginning of that interval. LTSSM stayed at zero in both cases. The endpoint answered at 1.247 s and the management rings became ready at 1.926–1.936 s from rail enable. On this setup, releasing the PERST control alone with the lane disabled did not advance the observed mailbox transition. This identifies the lane-enable interval for an independent board trace. It does not determine the electrical state of the card's reset pin or tell us which code ran while PCIe was inaccessible.
 
 The bridge-SRAM commands construct the direct compute context without a firmware path. The optional reference boot requires an explicitly supplied image.
+
+## November 20, 2026 — compare complete SRAM scores and rerun the proprietary baseline
+
+A separate early-slot run kept all ten pre-argmax scores in Chestnut SRAM and used a freshly compiled GPU copy kernel to return each score through the same completion word. For the first 16 images, each in a separate slot cycle, the largest absolute difference across all 160 logits versus an independent FP32 CPU process was 0.00000620. All 16 classifications matched. The normal SRAM diagnostic also runs argmax on the GPU.
+
+Fresh MUSA processes with compiler caching disabled passed all 15 reference checks across the three workloads. The table at the top uses these measurements. For a possible launch-latency improvement, three trials comparing 200 four-byte reads of the compute ID returned a median of 80.46–80.47 µs with bulk input and 81.93–82.41 µs with a control transfer. Both returned the same ID. The runtime retains bulk reads.
