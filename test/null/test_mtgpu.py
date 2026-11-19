@@ -1,20 +1,25 @@
 import ctypes, struct, unittest
+from unittest.mock import Mock
+from tinygrad.device import BufferSpec
+from tinygrad.runtime.ops_mt import MTAllocator
 from tinygrad.runtime.support.memory import MMIOInterface
 from tinygrad.runtime.support.mt.mtdev import MTSMC, MTDev, MT_IPC_EVENT_GET_FW_VERSION, MT_IPC_EVENT_SET_POWER_STATE, _Ring, _ipc_header
 
 
-def make_mmio():
+def make_mmio(s30=False):
   buf = (ctypes.c_ubyte * 0x84000)()
-  for ctrl, data in ((0x30000, 0x30018), (0x30218, 0x30230)):
-    struct.pack_into('<IIIIII', buf, ctrl, 0, 0, 0, 0x200, data, 0x7f)
+  if s30:
+    for ctrl in (0x6f000, 0x6f214): struct.pack_into('<5I', buf, ctrl, 0, 0, 0x200, ctrl + 0x14, 0x7f)
+  else:
+    for ctrl in (0x30000, 0x30218): struct.pack_into('<6I', buf, ctrl, 0, 0, 0, 0x200, ctrl + 0x18, 0x7f)
   mmio = MMIOInterface(ctypes.addressof(buf), len(buf))
   mmio.owner = buf  # keep the backing allocation alive for the lifetime of the view
   return mmio
 
 
 class MockSMC(MTSMC):
-  def __init__(self, mmio):
-    super().__init__(mmio)
+  def __init__(self, s30=False):
+    super().__init__(make_mmio(s30), s30)
     self.requests = []
     self.response_error = 0
 
@@ -31,24 +36,26 @@ class MockSMC(MTSMC):
 
 class TestMTSMC(unittest.TestCase):
   def test_version_and_pstate(self):
-    smc = MockSMC(make_mmio())
+    smc = MockSMC()
     self.assertEqual(smc.rtos_version(), [('rtos', 20107), ('vbios', 10606)])
     smc.set_pstate(0)
     self.assertEqual([x[:3] for x in smc.requests], [(MT_IPC_EVENT_GET_FW_VERSION, 0, 0), (MT_IPC_EVENT_SET_POWER_STATE, 0, 1)])
     self.assertEqual(smc.requests[1][3], struct.pack('<III', 0, 0, 0))
 
   def test_ring_wrap(self):
-    smc = MockSMC(make_mmio())
-    for ring in (smc.tx, smc.rx):
-      smc._w32(ring.ctrl, 0x1f8 * 2)
-      smc._w32(ring.ctrl + 4, 0x1f8 * 2)
-    self.assertEqual(smc.rtos_version(), [('rtos', 20107), ('vbios', 10606)])
-    self.assertEqual(smc._r32(smc.tx.ctrl), (108 * 2) | 1)
-    self.assertEqual(smc._r32(smc.tx.ctrl + 4), (108 * 2) | 1)
-    self.assertEqual(smc._r32(smc.rx.ctrl), (24 * 2) | 1)
+    for s30 in (False, True):
+      with self.subTest(s30=s30):
+        smc = MockSMC(s30)
+        for ring in (smc.tx, smc.rx):
+          smc._w32(ring.ctrl, 0x1f8 * 2)
+          smc._w32(ring.ctrl + 4, 0x1f8 * 2)
+        self.assertEqual(smc.rtos_version(), [('rtos', 20107), ('vbios', 10606)])
+        self.assertEqual(smc._r32(smc.tx.ctrl), (108 * 2) | 1)
+        self.assertEqual(smc._r32(smc.tx.ctrl + 4), (108 * 2) | 1)
+        self.assertEqual(smc._r32(smc.rx.ctrl), (24 * 2) | 1)
 
   def test_ipc_error(self):
-    smc = MockSMC(make_mmio())
+    smc = MockSMC()
     smc.response_error = 1
     with self.assertRaisesRegex(RuntimeError, 'failed with error 1'): smc.set_pstate(0)
 
@@ -60,6 +67,18 @@ class TestMTSMC(unittest.TestCase):
 
 
 class TestMTDev(unittest.TestCase):
+  def test_vram_reuse(self):
+    dev = Mock(views={})
+    dev.mt.vram_size = 0x80003000
+    alloc, spec = MTAllocator(dev), BufferSpec(nolru=True)
+    a, b = alloc.alloc(0x2000, spec), alloc.alloc(0x1000, spec)
+    alloc.free(a, 0x2000, spec)
+    alloc.free(b, 0x1000, spec)
+    dev.map_buffer.side_effect = MemoryError
+    with self.assertRaises(MemoryError): alloc.alloc(0x3000, spec)
+    dev.map_buffer.side_effect = None
+    self.assertEqual(alloc.alloc(0x3000, spec).meta.pa, 0x80000000)
+
   def test_bvnc(self):
     dev = MTDev.__new__(MTDev)
     dev.core_ids = [0x0023000406600017]

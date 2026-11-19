@@ -1,5 +1,6 @@
 import struct, unittest
 from tinygrad.runtime.autogen import mtfw
+from tinygrad.runtime.support.mt.s30 import s30_boot_image
 from tinygrad.runtime.support.mt.firmware import MTFirmwareImage, MTFW_VERSION_SIZE
 
 
@@ -19,6 +20,11 @@ class TestMTFirmwareImage(unittest.TestCase):
     self.assertEqual(len(fw.code), 64)
     self.assertEqual([(v.name, v.min_version, v.max_version, v.abi_enum) for v in fw.versions],
                      [('F-GEN', 0, 1, 0), ('S-UQ', 0, 0x66, 0x66), ('S-CDM', 0, 0x68, 0x68)])
+
+  def test_s30_rejects_other_gen1_images(self):
+    other = image(version(1, 0, 1, 0, 'F-GEN'))
+    MTFirmwareImage.from_bytes(other)
+    with self.assertRaisesRegex(ValueError, 'mtfw-gen1.bin'): s30_boot_image(other)
 
   def test_missing_generation(self):
     with self.assertRaisesRegex(ValueError, 'generation 1'): MTFirmwareImage.from_bytes(image(version(2, 0, 0x66, 0x18, 'S-UQ')))

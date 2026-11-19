@@ -35,10 +35,10 @@ class MTCCB:
     self.seq += 1
     self.wr_idx = (self.wr_idx + 1) & 0xff
     self.mem[self.queue_off+0x4000:self.queue_off+0x4004] = struct.pack('<I', self.wr_idx)
-    self.dev.smc._write(0xc00b00, struct.pack('<I', self.ccb_type))
+    self.dev.smc._write(self.dev.socif + 0xb00, struct.pack('<I', self.ccb_type))
 
   def submit(self, submission_addr:int, submission_size:int, root_pa:int, generation:int=1, command:int=104,
-             token:int|None=None, private:int|None=None, queue_id:int=0) -> None:
+             token:int|None=None, private:int|None=None, queue_id:int=0, signal:tuple[int,int]|None=None) -> None:
     if token is None: token = 0x103 + self.seq
     if private is None: private = 0x4d544e4f50
     ci = mtfw.MTFW_CCB_ITEM()
@@ -48,6 +48,11 @@ class MTCCB:
     sp = ci.ccbItemPara.submissionPara
     sp.pageTableRootAddr, sp.pageTableGeneration = root_pa, generation
     sp.submissionQueueId, sp.submissionAddr, sp.submissionSize = queue_id, submission_addr, submission_size
+    if signal is not None:
+      addr, value = signal
+      if addr & 7: raise ValueError("MT queue semaphore must be 8-byte aligned")
+      sp.finishQSemValidMask = 1
+      sp.finishQSem[0].addr, sp.finishQSem[0].value = addr | 1, value  # META address, binary finish semaphore
     sp.qSempOutofOrder = 1
     self._publish(ci)
 

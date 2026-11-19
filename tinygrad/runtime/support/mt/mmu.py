@@ -22,7 +22,6 @@ class MTMMU4:
   def map(self, va:int, pa:int, flags:int=MT_PTE_READ_ONLY) -> None:
     if va % MT_PAGE_SIZE or pa % MT_PAGE_SIZE: raise ValueError("MT MMU mappings must be 4 KiB aligned")
     if flags & 1 != 1: raise ValueError("MT MMU mapping must be present")
-    self.pages[va] = pa
     pci, pdi, pti = (va >> 30) & 0x3ff, (va >> 21) & 0x1ff, (va >> 12) & 0x1ff
     if pci not in self.pd:
       self.pd[pci] = self._alloc()
@@ -36,6 +35,7 @@ class MTMMU4:
     off = self.pt[pci,pdi] - self.root_pa + pti * 8
     self.root[off:off+8] = ((pa & 0xfffffffff000) | flags).to_bytes(8, 'little')
     self.dirty_pages.add(off & ~0xfff)
+    self.pages[va] = pa
 
   def map_range(self, va:int, pa:int, size:int, flags:int=MT_PTE_READ_ONLY) -> None:
     if size % MT_PAGE_SIZE: raise ValueError("MT MMU range size must be 4 KiB aligned")

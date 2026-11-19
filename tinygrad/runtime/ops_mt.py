@@ -6,10 +6,13 @@ from tinygrad.renderer import Compiler, TinyELF
 from tinygrad.renderer.cstyle import CUDARenderer, CStyleLanguage
 from tinygrad.dtype import dtypes, AddrSpace
 from tinygrad.helpers import round_up, diskcache_get, diskcache_put
+from tinygrad.runtime.support.memory import TLSFAllocator
+from tinygrad.runtime.support.mt.mmu import MT_PTE_READ_WRITE
 from tinygrad.runtime.support.mt.mtdev import MTDev
 from tinygrad.runtime.support.mt.launch import MTLaunch, parse_mt_bundle, compress_mt_bundle, decompress_mt_bundle
 from tinygrad.runtime.support.mt.compiler import MTCompiler
 from tinygrad.runtime.support.mt.elf import MTKernelImage
+from tinygrad.runtime.support.mt.s30 import DEFAULT_S30_FIRMWARE, MTS30Firmware, MTS30Program
 
 MUSA_SOURCES:dict[str,str] = {}
 
@@ -48,10 +51,11 @@ def generate_mt_launch(source:str, name:str, args:list[str], global_size:tuple[i
 
 
 class MUSACompiler(Compiler):
-  def __init__(self):
-    super().__init__('mt')
-    self.mt = MTCompiler()
+  def __init__(self, arch:str="mp_21"):
+    super().__init__('mt' if arch == 'mp_21' else f'mt_{arch}')
+    self.mt = MTCompiler(arch=arch)
   def compile(self, src:str) -> bytes:
+    if self.mt.arch == "mp_10": return self.mt.compile_raw(src)
     if os.environ.get('MT_GENERATE','1') == '0': lib = self.mt.compile_raw(src)
     else:
       match = re.search(r'extern "C" __global__ void\s+(\w+)\s*\(([^)]*)\)',src)
@@ -72,7 +76,8 @@ class MUSARenderer(CUDARenderer):
   kernel_typedef = 'extern "C" __global__ void'
   def __init__(self, target):
     CStyleLanguage.__init__(self, target)
-    self.compiler, self.tensor_cores = MUSACompiler(), []
+    self.compiler, self.tensor_cores = MUSACompiler("mp_10" if target.arch == "sudi" else target.arch or "mp_21"), []
+    if self.compiler.mt.arch == "mp_10": self.has_shared, self.shared_max = False, 0
   def render_kernel(self, function_name, kernel, bufs, uops, prefix=None):
     return super().render_kernel(function_name, kernel, bufs, uops, ['#include <musa.h>'] + (prefix or []))
   def supported_dtypes(self): return set(dtypes.all) - {dtypes.double}
@@ -86,21 +91,19 @@ class MTBufferMeta:
 class MTAllocator(Allocator['MTDevice']):
   def __init__(self, dev):
     super().__init__(dev)
-    self.next_va, self.next_pa = 0x8001000000, 0x80000000
-    self.dev.views = {}
-    self.free_blocks:list[tuple[int,int,int]] = []
+    self.vram = TLSFAllocator(max(0, dev.mt.vram_size - 0x80000000), base=0x80000000, block_size=0x1000)
 
   def _alloc(self, size:int, options:BufferSpec) -> BufferStorage:
     size = round_up(size, 0x1000)
-    if self.free_blocks and self.free_blocks[-1][2] == size:
-      va, pa, size = self.free_blocks.pop()
-    else:
-      va, pa = self.next_va, self.next_pa
-      self.next_va += size
-      self.next_pa += size
-    view = self.dev.mt.pci_dev.map_bar(2, off=pa, size=size, fmt='B')
+    pa = self.vram.alloc(size)
+    va = 0x8001000000 + (pa - self.vram.base)
+    try:
+      view = self.dev.mt.pci_dev.map_bar(2, off=pa, size=size, fmt='B')
+      self.dev.map_buffer(va, pa, size)
+    except Exception:
+      self.vram.free(pa)
+      raise
     meta = MTBufferMeta(va, pa, size)
-    self.dev.map_buffer(va, pa, size)
     self.dev.views[va] = (view, meta)
     return BufferStorage(va, meta, view)
 
@@ -108,7 +111,7 @@ class MTAllocator(Allocator['MTDevice']):
     self.dev.synchronize()
     meta = storage.meta
     self.dev.views.pop(meta.va, None)
-    self.free_blocks.append((meta.va, meta.pa, meta.size))
+    self.vram.free(meta.pa)
 
   def _copyin(self, dest:int, src:memoryview):
     view, meta = self.dev._view(dest)
@@ -175,6 +178,11 @@ class MTDevice(Compiled):
   def __init__(self, device:str=''):
     dev_id = int(device.split(':')[1]) if ':' in device else 0
     self.mt = MTDev.open_usb(dev_id)
+    self.views:dict[int,tuple[Any,MTBufferMeta]] = {}
+    super().__init__(device, MTAllocator(self), MTS30Program if self.mt.s30 else MTProgram, arch='mp_10' if self.mt.s30 else 'mp_21')
+    if self.mt.s30:
+      self.s30_fw = MTS30Firmware(self.mt, os.getenv('MT_FIRMWARE', DEFAULT_S30_FIRMWARE))
+      return
     bundle = os.environ.get('MT_LAUNCH_BUNDLE', '/tmp/mt-research/argfresh')
     packet = os.environ.get('MT_LAUNCH_PACKET', '/tmp/mt-research/real-submission-direct.bin')
     self.launch = None if os.environ.get('MT_GENERATE','1') != '0' else MTLaunch(self.mt, bundle, packet)
@@ -184,8 +192,6 @@ class MTDevice(Compiled):
     self.buffer_maps:list[tuple[int,int,int]] = []
     self.current_launch:MTLaunch|None = None
     self.started = False
-    self.views:dict[int,tuple[Any,MTBufferMeta]] = {}
-    super().__init__(device, MTAllocator(self), MTProgram, arch='mp_21')
 
   @property
   def has_copy_queue(self) -> bool: return False
@@ -216,6 +222,9 @@ class MTDevice(Compiled):
     return self.launch_cache[key]
 
   def map_buffer(self, va:int, pa:int, size:int):
+    if self.mt.s30:
+      with self.s30_fw.lock: self.s30_fw.mmu.map_range(va, pa, size, MT_PTE_READ_WRITE)
+      return
     self.buffer_maps.append((va,pa,size))
     for launch in self.launches: launch.map_buffer(va,pa,size)
 
@@ -231,5 +240,7 @@ class MTDevice(Compiled):
     raise RuntimeError(f'Unknown MT buffer address {va:#x}')
 
   def finalize(self):
-    super().finalize()
-    self.mt.close()
+    try:
+      super().finalize()
+      if self.mt.s30: self.s30_fw.session.close()
+    finally: self.mt.close()

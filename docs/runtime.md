@@ -14,6 +14,17 @@ tinygrad supports various runtimes, enabling your code to scale across a wide ra
 | [WEBGPU](https://github.com/tinygrad/tinygrad/tree/master/tinygrad/runtime/ops_webgpu.py) | Runs on GPU using the Dawn WebGPU engine (used in Google Chrome) | - | Dawn library installed and discoverable. Binaries: [pydawn v0.3.0](https://github.com/wpmed92/pydawn/releases/tag/v0.3.0) |
 
 
+## MTT S30 on USB Chestnut
+
+Select `DEV=MT` for a two-core S30 on a Chestnut USB bridge. The runtime uses MUSA 4.3.0 to compile for `mp_10` and loads `mtfw-gen1.bin` from the `mtgpu-s30` 3.1.0-6 package. Point `MUSA_PATH` at the toolkit root containing `bin/mcc`. Set `MT_FIRMWARE` if the firmware is outside `/lib/firmware/mthreads`.
+
+Run the MNIST training and evaluation demo from the checkout.
+
+```sh
+DEV=MT MUSA_PATH=/path/to/musa MT_FIRMWARE=/path/to/mtfw-gen1.bin \
+  PYTHONPATH=. TARGET_EVAL_ACC_PCT=96 python3 examples/beautiful_mnist.py
+```
+
 ## Interoperability
 
 tinygrad provides interoperability with OpenCL and PyTorch, allowing efficient tensor data sharing between frameworks through the `Tensor.from_blob` API. This enables zero-copy operations by working directly with external memory pointers.

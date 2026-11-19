@@ -147,13 +147,13 @@ class CustomASM24Controller:
     assert len(data) % 4 == 0, f"pcie_mem_write requires 4-byte aligned size, got {len(data)}"
     for off in range(0, len(data), STREAM):
       chunk = data[off:off+STREAM]
-      self._f0_out(0x60, 0x0F, address + off, len(chunk) // 4, mode=1)
+      self._f0_out(0x40 if address + off < 1 << 32 else 0x60, 0x0F, address + off, len(chunk) // 4, mode=1)
       self.usb.bulk_write(chunk)
 
   def pcie_mem_read(self, address:int, nbytes:int) -> memoryview:
     """Streaming PCIe memory read via 0xF0 mode 2 + bulk IN. Returns little-endian bytes."""
     assert nbytes % 4 == 0, f"pcie_mem_read requires 4-byte aligned size, got {nbytes}"
-    self._f0_out(0x20, 0x0F, address, nbytes // 4, mode=2)
+    self._f0_out(0x00 if address < 1 << 32 else 0x20, 0x0F, address, nbytes // 4, mode=2)
     return self.usb.bulk_read(nbytes, timeout=30000)
 
   def read(self, base_addr:int, length:int) -> bytes:

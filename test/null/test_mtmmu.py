@@ -35,5 +35,6 @@ class TestMTMMU4(unittest.TestCase):
     with self.assertRaises(ValueError): m.map(0, 0, 0)
     m.map(0, 0)
     with self.assertRaises(MemoryError): m.map(1 << 30, 0)
+    self.assertNotIn(1 << 30, m.pages)
 
 if __name__ == '__main__': unittest.main()

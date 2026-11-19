@@ -3,6 +3,7 @@ from tinygrad.runtime.autogen import mtfw
 from tinygrad.runtime.support.mt.ccb import MTCCB, MTResponse
 
 class _Dev:
+  socif = 0xc00000
   def __init__(self): self.smc = self
   def _write(self, off, data): self.doorbell = (off, data)
 

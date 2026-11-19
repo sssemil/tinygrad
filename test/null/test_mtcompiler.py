@@ -1,7 +1,7 @@
-import pathlib, unittest
-from tinygrad.runtime.support.mt.compiler import MTCompiler, DEFAULT_MUSA_PATH
+import unittest
+from tinygrad.runtime.support.mt.compiler import MTCompiler
 
-@unittest.skipUnless(pathlib.Path(DEFAULT_MUSA_PATH, 'bin/mcc').exists(), 'MUSA toolchain is not installed')
+@unittest.skipUnless((MTCompiler().bin/'mcc').is_file(), 'MUSA toolchain is not installed')
 class TestMTCompiler(unittest.TestCase):
   def test_compile_and_metadata(self):
     image = MTCompiler().compile('#include <musa.h>\nextern "C" __global__ void mt_compute(int *out) { out[0] = 43; }\n')

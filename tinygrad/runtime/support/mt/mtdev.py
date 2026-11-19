@@ -8,12 +8,14 @@ from tinygrad.runtime.support.usb import USB3
 MT_VENDOR_ID = 0x1ed5
 MT_USB_GPU_BUS = 2
 MT_SYS_BAR, MT_DDR_BAR = 0, 2
-MT_SRAM_OFFSET = 0x30000
+MT_S30_ID = 0x0102
+MT_SRAM_OFFSET, MT_S30_SRAM_OFFSET = 0x30000, 0x6f000
 MT_DISTRIBUTOR_OFFSET = 0x83000
 MT_SOCIF_OFFSET, MT_CORE_STRIDE, MT_CORE_COUNT = 0xc00000, 0x100000, 8
+MT_S30_SOCIF_OFFSET = 0x200000
 MT_CORE_ID = 0x20
 
-MT_IPC_TX_RING, MT_IPC_RX_RING = MT_SRAM_OFFSET, MT_SRAM_OFFSET + 0x218
+MT_IPC_RING_SIZE = 0x200
 MT_IPC_IRQ = 2
 MT_IPC_NODE_SMC, MT_IPC_NODE_PCIE = 0, 2
 MT_IPC_EVENT_GET_FW_VERSION = 11
@@ -28,12 +30,12 @@ def _ipc_header(event_id:int, data_size:int, msg_id:int=0, msg_type:int=0, event
 
 
 class _Ring:
-  def __init__(self, smc:MTSMC, ctrl:int):
+  def __init__(self, smc:MTSMC, ctrl:int, header_size:int=0x18):
     self.smc, self.ctrl = smc, ctrl
-    self.size = smc._r32(ctrl + 0x0c)
-    self.data = smc._r32(ctrl + 0x10)
+    self.size = smc._r32(ctrl + header_size - 12)
+    self.data = smc._r32(ctrl + header_size - 8)
     if self.size == 0 or self.size & 3: raise RuntimeError(f"Invalid MT IPC ring size {self.size:#x} at {ctrl:#x}")
-    if (self.data & 0xfff) != ((ctrl + 0x18) & 0xfff): raise RuntimeError(f"Invalid MT IPC ring data pointer {self.data:#x}")
+    if (self.data & 0xfff) != ((ctrl + header_size) & 0xfff): raise RuntimeError(f"Invalid MT IPC ring data pointer {self.data:#x}")
 
   def _data_len(self) -> int:
     rd, wr = self.smc._r32(self.ctrl), self.smc._r32(self.ctrl + 4)
@@ -70,9 +72,13 @@ class _Ring:
 
 
 class MTSMC:
-  def __init__(self, mmio:MMIOInterface):
+  def __init__(self, mmio:MMIOInterface, s30:bool=False):
     self.mmio = mmio
-    self.tx, self.rx = _Ring(self, MT_IPC_TX_RING), _Ring(self, MT_IPC_RX_RING)
+    base, header = (MT_S30_SRAM_OFFSET, 0x14) if s30 else (MT_SRAM_OFFSET, 0x18)
+    self.tx = _Ring(self, base, header)
+    self.rx = _Ring(self, base + header + MT_IPC_RING_SIZE, header)
+    if s30 and any(r.size != MT_IPC_RING_SIZE or r.data != r.ctrl + header for r in (self.tx, self.rx)):
+      raise RuntimeError("Invalid S30 IPC ring")
     self.msg_id = 0
 
   def _read(self, offset:int, nbytes:int) -> bytes:
@@ -128,19 +134,29 @@ class MTSMC:
 class MTDev:
   def __init__(self, pci_dev:PCIDevice):
     self.pci_dev, self.devfmt = pci_dev, pci_dev.pcibus
+    identity = pci_dev.read_config(0, 4)
+    if identity & 0xffff != MT_VENDOR_ID: raise RuntimeError(f"Expected Moore Threads GPU, got PCI ID {identity:#010x}")
+    device_id = identity >> 16
+    self.s30 = device_id == MT_S30_ID
+    self.socif = MT_S30_SOCIF_OFFSET if self.s30 else MT_SOCIF_OFFSET
+    if device_id >> 8 == 0x01 and not self.s30: raise RuntimeError(f"Unsupported Sudi device {device_id:04x}")
     self.mmio = pci_dev.map_bar(MT_SYS_BAR, fmt='B')
     self.vram_size = pci_dev.bar_info(MT_DDR_BAR)[1]
-    self.smc = MTSMC(self.mmio)
+    self.smc = MTSMC(self.mmio, self.s30)
     self.fw_versions = self.smc.rtos_version()
     if DEBUG >= 1: print(f"mt {self.devfmt}: firmware {self.fw_versions}")
     self.smc.set_pstate(MT_PSTATE_P0)
-    self.core_ids = self._read_core_ids()
-    if not any(self.core_ids): raise RuntimeError("MT GPU cores did not power on")
-    if DEBUG >= 1: print(f"mt {self.devfmt}: {len(self.core_ids)} cores, BVNC {self.bvnc}, VRAM {self.vram_size >> 30} GiB")
+    try:
+      self.core_ids = self._read_core_ids()
+      if not any(self.core_ids): raise RuntimeError("MT GPU cores did not power on")
+    except Exception:
+      self.close()
+      raise
+    if DEBUG >= 1: print(f"mt {self.devfmt}: {len(self.core_ids)} cores, BVNC {self.bvnc}, BAR2 aperture {self.vram_size >> 20} MiB")
 
   def _read_core_ids(self) -> list[int]:
-    return [struct.unpack('<Q', self.smc._read(MT_SOCIF_OFFSET + core * MT_CORE_STRIDE + MT_CORE_ID, 8))[0]
-            for core in range(MT_CORE_COUNT)]
+    return [struct.unpack('<Q', self.smc._read(self.socif + core * MT_CORE_STRIDE + MT_CORE_ID, 8))[0]
+            for core in range(2 if self.s30 else MT_CORE_COUNT)]
 
   @property
   def bvnc(self) -> tuple[int, int, int, int]:
@@ -154,7 +170,7 @@ class MTDev:
     devices = filter_visible_devices(USB3.list_devices(0xADD1, 0x0001) + USB3.list_devices(0x3801, 0x0001), "MT")
     if dev_id >= len(devices): raise RuntimeError(f"MT:{dev_id} does not exist ({pluralize('device', len(devices))} available)")
     dev, pcibus = devices[dev_id]
-    return cls(USBPCIDevice("MT", dev, pcibus, gpu_bus=MT_USB_GPU_BUS))
+    return cls(USBPCIDevice("MT", dev, pcibus, gpu_bus=MT_USB_GPU_BUS, vram_bars={(MT_S30_ID << 16) | MT_VENDOR_ID: MT_DDR_BAR}))
 
   @classmethod
   def open_pci(cls, dev_id=0) -> MTDev:
