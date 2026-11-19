@@ -200,3 +200,7 @@ Tinygrad now lowers local buffer loads, stores and barriers for the native rende
 The unmodified beautiful_mnist training example executed three batch-size-two Adam updates with the native renderer, disabled compiler cache and nonexistent vendor paths. The final reported loss was 1.74. A CPU run captured 118 training kernels that also compiled with the native renderer. Full training convergence was not measured.
 
 A separate clock diagnostic requested P0 via the management controller solely for comparison. The same native 128×1,536×384 projection took 14.76 ms beforehand and 14.83 ms in P0. The driver restored the board's idle policy. Native model runs continue to use direct attach.
+
+## November 20, 2026 — source-built device diagnostics
+
+The low-level store test now assembles its USC program and builds its PDS launch code on each run. Both store values reached the expected offsets, including a dispatch near the end of the ring. All 24 hardware tests passed on the MUSA reference. The optional META boot and CDM diagnostics also ran with management mailbox construction disabled. Fresh assembly returned all five challenge responses, including wraparound, and the open CDM program consumed four bytes. Model inference reaches the compute queues directly and does not invoke these diagnostics.

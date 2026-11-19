@@ -2,11 +2,11 @@ import os, random, struct, unittest
 from pathlib import Path
 from tinygrad import Context, Device, Tensor, TinyJit, Variable, dtypes
 from tinygrad.device import Buffer
-from tinygrad.helpers import DEV
+from tinygrad.helpers import DEV, ceildiv
 from tinygrad.runtime.support.mt.compiler import MTCompiler
 from tinygrad.runtime.support.mt.compute import FW_DEVVA, META_BASE
 from tinygrad.runtime.support.mt.mmu import MT_PTE_READ_WRITE
-from tinygrad.runtime.support.mt.s30 import DEFAULT_S30_FIRMWARE, PDS_BASE, USC_BASE
+from tinygrad.runtime.support.mt.s30 import DEFAULT_S30_FIRMWARE, PDS_BASE, USC_BASE, s30_pds
 
 has_firmware = Path(os.getenv("MT_FIRMWARE", DEFAULT_S30_FIRMWARE)).is_file()
 requires_firmware = unittest.skipUnless(has_firmware, "requires mtgpu-s30 3.1.0-6 mtfw-gen1.bin")
@@ -48,20 +48,18 @@ class TestS30USB(unittest.TestCase):
 
   @requires_firmware
   def test_compute_store(self):
+    from tinygrad.renderer.usc import assemble
     fw = Device["MT"].s30_fw
     expected = bytearray(b'\xa5' * 64)
     out = Buffer("MT", len(expected), initial_value=expected)
-    # USC: st [sh14:15], sh18; wait; end.
-    usc = Buffer("MT", 12, initial_value=bytes.fromhex("4e2ac341400040c01c070080"))
+    # Store the value in shared register 18 at the pointer in 14:15. Shared register 0 supplies a zero byte offset.
+    code, temps = assemble([("imm", (), 0), ("imm", (), 18), ("st", (0,1), 14)])
+    usc = Buffer("MT", len(code)+32, initial_value=code+bytes(32))
     fw.mmu.map(USC_BASE, usc.meta.pa, MT_PTE_READ_WRITE)
-    data = bytearray(64+19*4)
-    struct.pack_into('<QI', data, 0, PDS_BASE+64, 0x90000013)  # DMA 19 shared registers
-    struct.pack_into('<I', data, 16, 0xf4001000)  # DOUTD
-    struct.pack_into('<Q', data, 32, 0x1000000000)
-    struct.pack_into('<I', data, 48, 0xf4000002)  # DOUTU
+    data = s30_pds(PDS_BASE+96, 19, 0, ceildiv(temps, 2)) + bytes(19*4)
     pds = Buffer("MT", len(data), initial_value=data)
     fw.mmu.map(PDS_BASE, pds.meta.pa, MT_PTE_READ_WRITE)
-    stream = (2, 2, 16, 0, 0, 0, 0x02000002, 0, 0x101003, 32, 48, 0, 0, 0, 0x02000002, 0)
+    stream = (2, 2, 16, 0, 0, 0, 0x02000002, 0, 0x101085, 32, 64, 0, 0, 0, 0x02000002, 0)
     with fw.boot():
       for i in range(3):
         resp = fw.cdm(i+1, ())
@@ -69,7 +67,7 @@ class TestS30USB(unittest.TestCase):
         self.assertEqual(bytes(out.as_memoryview()), expected)
       # Repeat the shared-register load so the second shader store executes near the end of the 2 KiB ring.
       for i,(off,value,commands) in enumerate(((16, 43, stream), (40, 0x89abcdef, stream[:8]*59 + stream))):
-        pds.host[64+14*4:] = struct.pack('<Q8xI', out.meta.va+off, value)
+        pds.host[96+14*4:] = struct.pack('<Q8xI', out.meta.va+off, value)
         resp = fw.cdm(i+4, commands)
         self.assertEqual((resp.value, resp.token), (0, i+4))
         struct.pack_into('<I', expected, off, value)

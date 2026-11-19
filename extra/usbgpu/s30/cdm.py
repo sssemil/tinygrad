@@ -20,7 +20,7 @@ if __name__ == "__main__":
   fw = Device["MT"].s30_fw
   fw.mmu = MTMMU4(ROOT_BASE)
   fw.mmu.map_range(FW_DEVVA, FW_BASE, len(image), MT_PTE_READ_WRITE)
-  with fw._boot(image, master=False):
+  with fw._boot(image, master=False, reset_domains=False):
     MetaPort(fw).start()
     fw.v[0x1000:0x1004] = struct.pack('<I', 1)
     deadline = time.monotonic()+1

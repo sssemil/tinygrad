@@ -52,7 +52,7 @@ if __name__ == "__main__":
   fw.mmu = MTMMU4(ROOT_BASE)
   fw.mmu.map_range(FW_DEVVA, FW_BASE, 0x2000, MT_PTE_READ_WRITE)
   if not 0 < len(code) <= 0x1000: raise ValueError("META program must fit in the boot page")
-  with fw._boot(code.ljust(0x2000, b'\0'), master=False):
+  with fw._boot(code.ljust(0x2000, b'\0'), master=False, reset_domains=False):
     port = MetaPort(fw)
     port.start()
     for challenge in (*random.sample(range(1<<32), 4), 0xffffffff):
