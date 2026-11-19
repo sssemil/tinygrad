@@ -85,6 +85,7 @@ def s30_boot_image(raw:bytes) -> bytearray:
   return mem
 
 class MTS30Firmware(MTFirmwareBoot):
+  context_pa:int = FW_BASE
   def __init__(self, dev:MTDev, path:str|Path):
     if not dev.s30: raise ValueError('Expected an MTT S30')
     self.path = Path(path)
@@ -112,7 +113,7 @@ class MTS30Firmware(MTFirmwareBoot):
       if reset_domains: self._reset_domains()
       for reg in timers: self.dev.regs._w32(reg, 1)
       self._reset()
-      self.mmu.map_range(FW_DEVVA, FW_BASE, round_up(len(image), 0x1000), MT_PTE_READ_WRITE)
+      self.mmu.map_range(FW_DEVVA, self.context_pa, round_up(len(image), 0x1000), MT_PTE_READ_WRITE)
       self.v[:len(image)] = image
       self.upload_mmu(full=True)
       self._setup_mmu()
@@ -210,6 +211,9 @@ def s30_submission(command:int, region:int, region_size:int) -> bytearray:
   struct.pack_into('<I4xQI', packet, 72, region, 96, region_size)
   return packet
 
+def s30_dispatch(pds_off:int, shared:int, attrs:int) -> tuple[int, ...]:
+  return (2, pds_off | 2, pds_off+16, 0, 0, 0, 0x02000000 | shared, 0, 0x100085 | attrs<<12, pds_off+32, pds_off+64)
+
 def s30_cdm_stream(words:tuple[int,...]) -> bytearray:
   write_offset = (len(words)+1)*4 + 64  # include the CDM prefetch guard after STREAM_TERMINATE
   if write_offset >= CDM_RING_SIZE: raise ValueError("S30 compute stream exceeds its ring")
@@ -301,7 +305,7 @@ class MTS30Program(Program['MTDevice']):
       dev.s30_fw.mmu.map_range(PDS_BASE+packet_off, self.packet.meta.pa, self.packet.meta.size, MT_PTE_READ_ONLY)
       dev.s30_fw.mmu.map_range(USC_BASE+usc_off, self.code.meta.pa, self.code.meta.size, MT_PTE_READ_ONLY)
     self.shared = ceildiv(shared, 16)
-    dispatch = (2, pds_off | 2, pds_off+16, 0, 0, 0, 0x02000000 | self.shared, 0, 0x100085 | attrs<<12, pds_off+32, pds_off+64)
+    dispatch = s30_dispatch(pds_off, self.shared, attrs)
     words = dispatch + (0,)*5
     self.shared += ceildiv(local_words, 16)
     self.grid_offset = param_size+2*CDM_CONTROL_SIZE+4*len(dispatch)

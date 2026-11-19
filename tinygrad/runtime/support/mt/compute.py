@@ -27,9 +27,11 @@ class MTFirmwareLayout:
 class MTFirmwareBoot:
   def __init__(self, dev:MTDev, size:int):
     self.dev = dev
-    self.v = dev.pci_dev.map_bar(2, off=FW_BASE, size=size, fmt='B')
+    self.v, self.mmu = self._map_context(size)
+
+  def _map_context(self, size:int):
     # The data, PDS and USC heaps can each span the 2 GiB S30 allocation pool and need 4 MiB of leaf tables.
-    self.mmu = MTMMU4(ROOT_BASE, size=0x1000000 if dev.s30 else 0x400000)
+    return self.dev.pci_dev.map_bar(2, off=FW_BASE, size=size, fmt='B'), MTMMU4(ROOT_BASE, size=0x1000000 if self.dev.s30 else 0x400000)
 
   def _write(self, off:int, value:int, size:int=8) -> None: self.dev.regs._write(self.dev.socif + off, value.to_bytes(size, 'little'))
   def _read(self, off:int, size:int=8) -> int: return int.from_bytes(self.dev.regs._read(self.dev.socif + off, size), 'little')
@@ -67,7 +69,7 @@ class MTFirmwareBoot:
   def _setup_mmu(self, core_offset:int=0) -> None:
     self._write(core_offset+0xe140, 0, 4)
     self._read(core_offset+0xe140, 4)
-    self._write(core_offset+0xe148, ROOT_BASE >> 12, 4)
+    self._write(core_offset+0xe148, self.mmu.root_pa >> 12, 4)
     for off,value in [(0xe350,0),(0xe358,0xfff80800),(0xe360,0),(0xe368,0xfff80000)]: self._write(core_offset+off, value)
     self._write(core_offset+0xe328, 0x0202020202020202)
     self._write(core_offset+0xe320, 0x78ff2)
