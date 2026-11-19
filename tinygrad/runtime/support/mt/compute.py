@@ -64,13 +64,13 @@ class MTFirmwareBoot:
     self._write(0xbf8, 1, 4)
     self._write(0xb50, 0)
 
-  def _setup_mmu(self) -> None:
-    self._write(0xe140, 0, 4)
-    self._read(0xe140, 4)
-    self._write(0xe148, ROOT_BASE >> 12, 4)
-    for off,value in [(0xe350,0),(0xe358,0xfff80800),(0xe360,0),(0xe368,0xfff80000)]: self._write(off, value)
-    self._write(0xe328, 0x0202020202020202)
-    self._write(0xe320, 0x78ff2)
+  def _setup_mmu(self, core_offset:int=0) -> None:
+    self._write(core_offset+0xe140, 0, 4)
+    self._read(core_offset+0xe140, 4)
+    self._write(core_offset+0xe148, ROOT_BASE >> 12, 4)
+    for off,value in [(0xe350,0),(0xe358,0xfff80800),(0xe360,0),(0xe368,0xfff80000)]: self._write(core_offset+off, value)
+    self._write(core_offset+0xe328, 0x0202020202020202)
+    self._write(core_offset+0xe320, 0x78ff2)
 
   def _wait_started(self, fwif:int, timeout:float) -> None:
     deadline = time.monotonic() + timeout

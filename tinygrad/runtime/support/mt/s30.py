@@ -13,7 +13,7 @@ from tinygrad.runtime.support.mt.ccb import MTCCB, MTResponse
 from tinygrad.runtime.support.mt.compute import MTFirmwareBoot, FW_BASE, FW_DEVVA, META_BASE, ROOT_BASE
 from tinygrad.runtime.support.mt.elf import MTKernelImage
 from tinygrad.runtime.support.mt.mmu import MT_PTE_READ_ONLY, MT_PTE_READ_WRITE
-from tinygrad.runtime.support.mt.mtdev import MTDev
+from tinygrad.runtime.support.mt.mtdev import MT_CORE_STRIDE, MTDev
 if TYPE_CHECKING: from tinygrad.runtime.ops_mt import MTDevice
 
 # mtgpu-s30 3.1.0-6, mtfw-gen1.bin. The FWIF layout and META segments belong to this image.
@@ -140,35 +140,42 @@ class MTS30Firmware(MTFirmwareBoot):
 
   @contextmanager
   def boot_direct(self) -> Iterator[None]:
-    # The host owns core 0 and its compute ring. META stays stopped and no firmware image is loaded.
+    # Enable both compute cores and route the workgroups across them. META stays stopped.
     with self._boot(bytes(0x8000), master=False, reset_domains=False):
-      self._write(0x4000, 1, 4)  # compute scheduler
-      self._write(0xf920, 0, 4)  # CDM MMU context zero
-      self._write(0xcd8, 1, 4)
-      for reg in (0x638, 0x658, 0x6e8, 0x6f8): self._write(reg, PDS_BASE)
-      for reg in (0x4008, 0x4010, 0xf268, 0x4028): self._write(reg, USC_BASE)
-      self._write(0x4f0, CDM_RING_SIZE)
-      self._write(0x598, FW_DEVVA+0x7000)  # context state
-      self._write(0x5b8, 0, 4)
-      self._write(0x4d0, 1, 4)
-      self._write(0x498, FW_DEVVA+0x6000)  # compute state
-      self._write(0x68, 1)
-      self._write(0x24c0, 1, 4)
-      self.direct = True
-      try: yield
-      finally: self.direct = False
+      route = self._read(0x24e0, 4)
+      self._write(MT_CORE_STRIDE+0xa100, 0, 4)
+      self._write(0x24e0, (route & ~0xff) | 3, 4)
+      try:
+        self._setup_mmu(MT_CORE_STRIDE)
+        for core in (0, MT_CORE_STRIDE):
+          self._write(core+0x4000, 1, 4)  # compute scheduler
+          self._write(core+0xf920, 0, 4)  # CDM MMU context zero
+          self._write(core+0xcd8, 1, 4)
+          for reg in (0x638, 0x658, 0x6e8, 0x6f8): self._write(core+reg, PDS_BASE)
+          for reg in (0x4008, 0x4010, 0xf268, 0x4028): self._write(core+reg, USC_BASE)
+          self._write(core+0x4f0, CDM_RING_SIZE)
+          self._write(core+0x598, FW_DEVVA+0x7000)  # context state
+          self._write(core+0x5b8, 0, 4)
+          self._write(core+0x4d0, 1, 4)
+          self._write(core+0x498, FW_DEVVA+0x6000)  # compute state
+          self._write(core+0x68, 3)
+          self._write(core+0x24c0, 3, 4)
+        self.direct = True
+        yield
+      finally:
+        self.direct = False
+        self._write(0x24e0, route, 4)
 
   def kick_direct(self, control:int, timeout:float) -> None:
-    self._write(0x138, 4, 4)  # clear the previous CDM completion
-    self._write(0x4f8, control)
-    self._write(0x4e8, control+2*CDM_CONTROL_SIZE)
-    self._write(0x478, 1, 4)
+    for reg,value,size in ((0x138, 4, 4), (0x4f8, control, 8), (0x4e8, control+2*CDM_CONTROL_SIZE, 8), (0x478, 1, 4)):
+      for core in (MT_CORE_STRIDE, 0): self._write(core+reg, value, size)
     deadline = time.monotonic()+timeout
-    while not self._read(0x130, 4) & 4:
-      if time.monotonic() >= deadline:
-        fault = self._read(0xe160)
-        self._reset()
-        raise TimeoutError(f"S30 compute timed out, MMU fault {fault:#x}")
+    for core in (0, MT_CORE_STRIDE):
+      while not self._read(core+0x130, 4) & 4:
+        if time.monotonic() >= deadline:
+          fault = self._read(core+0xe160)
+          self._reset()
+          raise TimeoutError(f"S30 compute timed out on core {core//MT_CORE_STRIDE}, MMU fault {fault:#x}")
 
   def submit(self, token:int|None, command:int, size:int, data:bytearray, timeout:float, signal:tuple[int,int]|None=None,
              resident:Buffer|None=None, offset:int=0) -> MTResponse:
