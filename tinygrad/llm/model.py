@@ -794,6 +794,7 @@ class Transformer:
     self._cached_tokens: list[int] = []
     self._position_count: int|None = None
     # we specialize the JIT for prefill and rollout
+    self.full_chunk_size, self.full_prefill_jit = 0, TinyJit(self.forward)
     self.prefill_jit = TinyJit(self.forward)
     self.rollout_jit = TinyJit(self.forward)
 
@@ -815,7 +816,9 @@ class Transformer:
     if self._position_count is None: self._position_count = len(start_pos)
     assert len(start_pos) == self._position_count, "position count is fixed for this model"
     positions = tuple(UOp.variable(f"start_pos_{b}", 0, self.max_context-1).bind(p) if isinstance(p, int) else p for b, p in enumerate(start_pos))
-    return (self.prefill_jit if resolve(tokens.shape[1] != 1) else self.rollout_jit)(tokens.contiguous(), temperature, *positions)
+    jit = self.prefill_jit if resolve(tokens.shape[1] != 1) else self.rollout_jit
+    if isinstance(n:=tokens.shape[1], int) and n > 1 and n == self.full_chunk_size: jit = self.full_prefill_jit
+    return jit(tokens.contiguous(), temperature, *positions)
 
   @staticmethod
   def from_gguf(gguf:Tensor|str|pathlib.Path, max_context:int|None=None,
@@ -1059,6 +1062,11 @@ class Transformer:
 
   def generate(self, tokens:list[int], chunk_size:int=32, temperature:float=0.0):
     if self.has_recurrent_block and not amd_custom_kernels_supported(self.token_embd.weight.device): chunk_size = 1
+    # Fixed full chunks let the S30 compiler tile both matrix axes without per-row bounds checks.
+    if is_s30(self.token_embd.weight.device) and chunk_size != self.full_chunk_size:
+      self.full_chunk_size = chunk_size
+      self.full_prefill_jit.reset()
+      self.prefill_jit.reset()  # the symbolic tail's upper bound changes with the chunk size
     v_start_pos = UOp.variable("start_pos", 0, self.max_context-1)
     v_toks = UOp.variable("toks", 1, chunk_size)
     # TODO: use UOp.variable for temperature once float variables are supported
@@ -1071,7 +1079,7 @@ class Transformer:
     while len(tokens) < self.max_context:
       n_toks = min(chunk_size, len(tokens) - start_pos)
       if self.config.ple: self.blk[self.config.ple.layer].ple.write_rows(tokens, start_pos, n_toks, chunk_size)
-      sp, nt = v_start_pos.bind(start_pos), v_toks.bind(n_toks)
+      sp, nt = v_start_pos.bind(start_pos), n_toks if n_toks == self.full_chunk_size else v_toks.bind(n_toks)
       out = self(t[:, sp:sp+nt] if start_pos < prompt_len or out is None else out, (sp,), temp).realize()
       start_pos += n_toks
       # chunked prefill: keep processing until all prompt tokens are consumed
