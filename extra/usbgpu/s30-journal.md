@@ -8,11 +8,11 @@ Measured on the same Chestnut S30 with compiler caching disabled. The cold colum
 
 | Workload | Native cold | MUSA cold | Native warm | MUSA warm |
 | --- | ---: | ---: | ---: | ---: |
-| MNIST, batch of 16 | 0.932 s | 3.506 s | 35.63 ms | 13.82 ms |
-| Whisper tiny.en, test.wav | 30.525 s | 50.836 s | 6.300 s | 2.595 s |
-| Qwen2.5-0.5B Q8_0 | 159.952 s | 171.460 s | 14.433 s | 9.622 s |
+| MNIST, batch of 16 | 0.754 s | 3.506 s | 32.52 ms | 13.82 ms |
+| Whisper tiny.en, test.wav | 30.814 s | 50.836 s | 6.517 s | 2.595 s |
+| Qwen2.5-0.5B Q8_0 | 157.466 s | 171.460 s | 12.135 s | 9.622 s |
 
-All five native outputs per model matched the reference. The native measurements ran offline in a fresh filesystem namespace (details below). Separate hardware runs disabled vendor compilation, vendor firmware boot and management mailbox construction. The card powered up with its factory firmware still installed. The host did not upload proprietary code during these model runs. The board-management mailbox was unused.
+All five native outputs per model matched the reference. These native measurements disabled vendor compilation, vendor firmware boot and management mailbox construction. All three models have also run offline in fresh filesystem namespaces (details below). The card powered up with its factory firmware still installed. The host did not upload proprietary code during these model runs. The board-management mailbox was unused.
 
 ## November 20, 2026 — proprietary reference
 
@@ -178,3 +178,9 @@ Direct initialization now sets the ring address and queue-control address once p
 ## November 20, 2026 — native guarded stores
 
 The renderer emits conditional-start and conditional-end instructions around a store. Address and value calculations run before the lane mask changes. A hardware test wrote a mix of active and inactive lanes into a buffer with sentinel elements on both ends. All-inactive, all-active and mixed masks matched the expected whole buffer across three workgroups. This allows padded symbolic matrix dimensions to discard stores from the last partial tile.
+
+## November 20, 2026 — tile both matrix dimensions
+
+The native scheduler now groups independent output rows and columns into small register tiles. A symbolic row dimension is rounded up to an even number and guarded stores protect the last row. A NumPy comparison checked every output of both Qwen feed-forward projections for 1, 4, 17 and 32 input rows. With 32 rows, two-by-two tiles reduced one projection from 87 ms to 50 ms and the other from 96 ms to 48 ms. One-row inputs to the symbolic kernel were slower. Qwen's normal one-token decode uses a separate matrix-vector graph.
+
+With the resident ring and the new scheduler, all fifteen model outputs matched MUSA. Warm medians were 32.52 ms for MNIST, 6.517 s for Whisper and 12.135 s for Qwen. Whisper regressed from 6.300 s, while MNIST and Qwen improved. The native and vendor Whisper runs both used the example's normal 30-second encoder context for the short fixture with context alignment 64. The model's silence handling preserves that context. The two slowest Qwen prompt projections and Whisper's encoder projections remain candidates for better memory access scheduling.

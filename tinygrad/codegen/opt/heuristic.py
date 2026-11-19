@@ -52,6 +52,17 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
     red = k.reduceop
     dot = red.src[0] if red is not None and red.arg[0] is Ops.ADD and red.src[0].op is Ops.MUL else None
     spatial = dot is not None and sum(1 < k.full_shape[i] <= 5 for i in k.upcastable_dims(reduce=True)) >= 2
+    tiled = False
+    if dot is not None and red is not None and red.dtype == dtypes.float and len(red.src) == 2:
+      lhs, rhs = (x.ranges.keys() for x in dot.src)
+      dims = [r for r in k.rngs if r.axis_type is AxisType.GLOBAL and (r.src[0].op is Ops.CONST or r.src[0].is_variable) and r.vmax+1 >= 16]
+      rows, cols = [r for r in dims if r in lhs-rhs], [r for r in dims if r in rhs-lhs]
+      if len(rows) == len(cols) == 1 and red.src[1] in lhs&rhs:
+        for r,n in ((rows[0], 2 if rows[0].src[0].is_variable else 4), (cols[0], 2)):
+          if r.src[0].is_variable: r = k.apply_opt(Opt(OptOps.PADTO, k.rngs.index(r), n))
+          if r.src[0].divides(n) is not None:
+            k.apply_opt(Opt(OptOps.SPLIT, k.rngs.index(r), (n, AxisType.UPCAST)))
+            tiled = True
     if spatial and (a:=next((i for i in reversed(k.upcastable_dims()) if k.full_shape[i]%4 == 0), None)) is not None:
       k.apply_opt(Opt(OptOps.SPLIT, a, (4, AxisType.UPCAST)))
     globals_ = [k.rngs[a] for a in k.axes_of(AxisType.GLOBAL, AxisType.WEAK, reduce=False)]
@@ -63,7 +74,7 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
         k.apply_opt(Opt(OptOps.SPLIT, k.rngs.index(r), (size, AxisType.LOCAL)))
         width //= size
         if not spatial or width == 1 or len(k.axes_of(AxisType.LOCAL)) == 3: break
-    if not spatial and dot is not None:
+    if not spatial and not tiled and dot is not None:
       lhs, rhs = (x.ranges for x in dot.src)
       if (a:=next((i for i in k.upcastable_dims() if k.full_shape[i]%2 == 0 and (k.rngs[i] in lhs) != (k.rngs[i] in rhs)), None)) is not None:
         k.apply_opt(Opt(OptOps.SPLIT, a, (2, AxisType.UPCAST)))
