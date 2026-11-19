@@ -143,7 +143,10 @@ class MTS30Firmware(MTFirmwareBoot):
     # Enable both compute cores and route the workgroups across them. META stays stopped.
     with self._boot(bytes(0x8000), master=False, reset_domains=False):
       route = self._read(0x24e0, 4)
-      self._write(MT_CORE_STRIDE+0xa100, 0, 4)
+      self._reset(MT_CORE_STRIDE)
+      self._write(MT_CORE_STRIDE+0xbf8, 0, 4)
+      self._write(MT_CORE_STRIDE+0x100, 0)
+      self._read(MT_CORE_STRIDE+0x100)
       self._write(0x24e0, (route & ~0xff) | 3, 4)
       try:
         self._setup_mmu(MT_CORE_STRIDE)
@@ -174,7 +177,7 @@ class MTS30Firmware(MTFirmwareBoot):
       while not self._read(core+0x130, 4) & 4:
         if time.monotonic() >= deadline:
           fault = self._read(core+0xe160)
-          self._reset()
+          for offset in (MT_CORE_STRIDE, 0): self._reset(offset)
           raise TimeoutError(f"S30 compute timed out on core {core//MT_CORE_STRIDE}, MMU fault {fault:#x}")
 
   def submit(self, token:int|None, command:int, size:int, data:bytearray, timeout:float, signal:tuple[int,int]|None=None,

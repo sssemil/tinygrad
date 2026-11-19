@@ -42,27 +42,27 @@ class MTFirmwareBoot:
       self.dev.pci_dev.map_bar(2, off=ROOT_BASE+start, size=end-start, fmt='B')[:] = self.mmu.root[start:end]
     self.mmu.dirty_ranges.clear()
 
-  def _reset(self) -> None:
-    self._write(0xa100, 0, 4)
-    self._read(0xa100, 4)
+  def _reset(self, core_offset:int=0) -> None:
+    self._write(core_offset+0xa100, 0, 4)
+    self._read(core_offset+0xa100, 4)
     for value in [0x1249249249249249,0x36db6db6db6db6db,0x7fffffffffffffff]:
-      self._write(0x630, value)
-      self._read(0x630)
+      self._write(core_offset+0x630, value)
+      self._read(core_offset+0x630)
     for off in [0x650,0x640]:
-      self._write(off, 0xffffffff, 4)
-      self._read(off, 4)
+      self._write(core_offset+off, 0xffffffff, 4)
+      self._read(core_offset+off, 4)
     for value in [0x386000000800,0x3860000088f2,0x20000080f2,0x2000000000]:
-      self._write(0x100, value)
-      self._read(0x100)
+      self._write(core_offset+0x100, value)
+      self._read(core_offset+0x100)
     for off in [0x640,0x650]:
-      self._write(off, 0, 4)
-      self._read(off, 4)
+      self._write(core_offset+off, 0, 4)
+      self._read(core_offset+off, 4)
     for value in [0x36db6db6db6db6db,0x1249249249249249,0]:
-      self._write(0x630, value)
-      self._read(0x630)
-    self._read(0x100)
-    self._write(0xbf8, 1, 4)
-    self._write(0xb50, 0)
+      self._write(core_offset+0x630, value)
+      self._read(core_offset+0x630)
+    self._read(core_offset+0x100)
+    self._write(core_offset+0xbf8, 1, 4)
+    self._write(core_offset+0xb50, 0)
 
   def _setup_mmu(self, core_offset:int=0) -> None:
     self._write(core_offset+0xe140, 0, 4)

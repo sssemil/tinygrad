@@ -152,3 +152,7 @@ Native kernels can also use all three local coordinates. AR0 supplies X, while A
 ## November 20, 2026 — read shader constants directly in arithmetic
 
 USC integer multiply-add and floating-point arithmetic can take one operand directly from a shared register. This removes the temporary register and move used to copy a constant first. For dot products, placing two outputs with one common operand in the same thread allows that operand to be loaded once. Multi-axis reductions also benefited from wave groups of up to 64. The latest table above records the combined change with both GPU cores active. All 165 captured graphs compiled from source and the direct hardware suite passed 11 applicable tests.
+
+## November 20, 2026 — recover both compute cores after a timeout
+
+An experimental workgroup barrier stalled the secondary core. A fresh process running known-good MNIST then timed out with no MMU fault. Applying the existing register reset sequence to the secondary core as well as the primary restored the card without a management message or Chestnut power cycle. The same MNIST checkpoint then passed five times (171.66 ms warm), and all eleven applicable direct hardware tests passed. Both direct initialization and timeout recovery now reset the second core.
