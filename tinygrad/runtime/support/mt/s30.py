@@ -32,6 +32,7 @@ WATCHDOG = UTIL + 0x4c0
 ITEM = round_up(WATCHDOG + 16, 0x1000)
 PACKET = ITEM + 0x1000
 CDM_CONTROL_SIZE, CDM_RING_SIZE, CDM_KICK_SIZE = 128, 0x800, 0x158
+DIRECT_CDM = 0x4000  # shared ring controls in the direct context, below the compute state at 0x6000
 CDM_SUBMISSION_SIZE = 96+16+CDM_KICK_SIZE
 PDS_BASE, USC_BASE = 0xda00000000, 0xe000000000
 
@@ -156,7 +157,9 @@ class MTS30Firmware(MTFirmwareBoot):
           self._write(core+0xcd8, 1, 4)
           for reg in (0x638, 0x658, 0x6e8, 0x6f8): self._write(core+reg, PDS_BASE)
           for reg in (0x4008, 0x4010, 0xf268, 0x4028): self._write(core+reg, USC_BASE)
+          self._write(core+0x4e8, FW_DEVVA+DIRECT_CDM+2*CDM_CONTROL_SIZE)
           self._write(core+0x4f0, CDM_RING_SIZE)
+          self._write(core+0x4f8, FW_DEVVA+DIRECT_CDM)
           self._write(core+0x598, FW_DEVVA+0x7000)  # context state
           self._write(core+0x5b8, 0, 4)
           self._write(core+0x4d0, 1, 4)
@@ -169,9 +172,9 @@ class MTS30Firmware(MTFirmwareBoot):
         self.direct = False
         self._write(0x24e0, route, 4)
 
-  def kick_direct(self, control:int, timeout:float) -> None:
-    for reg,value,size in ((0x138, 4, 4), (0x4f8, control, 8), (0x4e8, control+2*CDM_CONTROL_SIZE, 8), (0x478, 1, 4)):
-      for core in (MT_CORE_STRIDE, 0): self._write(core+reg, value, size)
+  def kick_direct(self, timeout:float) -> None:
+    for reg,value in ((0x138, 4), (0x478, 1)):
+      for core in (MT_CORE_STRIDE, 0): self._write(core+reg, value, 4)
     deadline = time.monotonic()+timeout
     for core in (0, MT_CORE_STRIDE):
       while not self._read(core+0x130, 4) & 4:
@@ -278,27 +281,34 @@ class MTS30Program(Program['MTDevice']):
     # Rogue USC prefetches one more instruction (up to 32 bytes), even when the shader ends at a page boundary.
     code = text + bytes(32)
     self.code = Buffer(dev.device, len(code), initial_value=code)
-    # Place the arguments immediately before the ring controls so one USB transfer updates both for each launch.
+    # One transfer updates the parameters immediately before the ring controls and the dispatch stream.
     pds_start = 0 if self.direct else round_up(CDM_SUBMISSION_SIZE, 32)
-    controls = round_up(pds_start + 96 + len(params), 256)
-    self.param_offset = controls - round_up(len(params), 32)
-    self.packet = Buffer(dev.device, controls + 2*CDM_CONTROL_SIZE + CDM_RING_SIZE, preallocate=True)
-    self.control = self.packet.meta.va + controls
+    param_size = round_up(len(params), 32)
+    controls = DIRECT_CDM if self.direct else round_up(pds_start + 96 + len(params), 256)
+    if param_size > controls: raise ValueError("S30 parameters exceed the direct ring allocation")
+    self.param_offset = controls - param_size
+    packet_size = 96 if self.direct else controls + 2*CDM_CONTROL_SIZE + CDM_RING_SIZE
+    self.packet = Buffer(dev.device, packet_size, preallocate=True)
     packet_off, usc_off = self.packet.meta.va & 0xffffffff, self.code.meta.va & 0xffffffff
     pds_off = packet_off + pds_start
-    pds = s30_pds(PDS_BASE+packet_off+self.param_offset, shared, usc_off, temps)
+    params_base = FW_DEVVA if self.direct else PDS_BASE+packet_off
+    pds = s30_pds(params_base+self.param_offset, shared, usc_off, temps)
     with dev.s30_fw.lock:
       dev.s30_fw.mmu.map_range(PDS_BASE+packet_off, self.packet.meta.pa, self.packet.meta.size, MT_PTE_READ_ONLY)
       dev.s30_fw.mmu.map_range(USC_BASE+usc_off, self.code.meta.pa, self.code.meta.size, MT_PTE_READ_ONLY)
     self.shared = ceildiv(shared, 16)
     dispatch = (2, pds_off | 2, pds_off+16, 0, 0, 0, 0x02000000 | self.shared, 0, 0x100085 | attrs<<12, pds_off+32, pds_off+64)
     words = dispatch + (0,)*5
-    packet = bytearray(controls)+s30_cdm_stream(words) if self.direct else s30_cdm_packet(words, max(8, temps, attrs), self.packet.meta.va, controls)
-    packet[pds_start:pds_start+len(pds)] = pds
-    packet[self.param_offset:self.param_offset+len(params)] = params
-    self.packet.host[:len(packet)] = packet
-    # Every launch resets both queue controls and updates the five grid words at the end of the stream.
-    self.launch = packet[self.param_offset:controls+2*CDM_CONTROL_SIZE+4*(len(dispatch)+5)]
+    self.grid_offset = param_size+2*CDM_CONTROL_SIZE+4*len(dispatch)
+    if self.direct:
+      self.packet.host[:len(pds)] = pds
+      self.launch = bytearray(param_size)+s30_cdm_stream(words)
+    else:
+      packet = s30_cdm_packet(words, max(8, temps, attrs), self.packet.meta.va, controls)
+      packet[pds_start:pds_start+len(pds)] = pds
+      self.packet.host[:len(packet)] = packet
+      self.launch = packet[self.param_offset:self.param_offset+self.grid_offset+20]
+    self.launch[:len(params)] = params
 
   def __call__(self, *args, global_size:tuple[int,int,int]=(1,1,1), local_size:tuple[int,int,int]=(1,1,1), wait:bool=False, timeout:int|None=None):
     lx,ly,lz = local_size
@@ -312,12 +322,12 @@ class MTS30Program(Program['MTDevice']):
         fw.session.enter_context(fw.boot_direct() if self.direct else fw.boot())
       try:
         start = time.perf_counter()
-        struct.pack_into('<5I', self.launch, -20, *(g-1 for g in global_size),
+        struct.pack_into('<5I', self.launch, self.grid_offset, *(g-1 for g in global_size),
                          (lanes if lanes < 32 else 0)<<25 | 2<<11 | self.shared, (lx-1)<<20 | (ly-1)<<10 | (lz-1))
         wait_seconds = 5.0 if timeout is None else timeout/1000
         if self.direct:
-          self.packet.host[self.param_offset:self.param_offset+len(self.launch)] = self.launch
-          fw.kick_direct(self.control, wait_seconds)
+          fw.v[self.param_offset:self.param_offset+len(self.launch)] = self.launch
+          fw.kick_direct(wait_seconds)
         else:
           resp = fw.submit(None, mtfw.MTFW_SUBMISSION_CMD_GPU_CDM, CDM_SUBMISSION_SIZE, self.launch, wait_seconds,
                            resident=self.packet, offset=self.param_offset)
