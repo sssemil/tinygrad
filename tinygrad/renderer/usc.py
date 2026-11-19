@@ -1,5 +1,5 @@
 import struct
-from collections import defaultdict
+from collections import Counter, defaultdict
 from tinygrad.dtype import AddrSpace, DType, dtypes
 from tinygrad.helpers import Target
 from tinygrad.renderer import Compiler, Renderer
@@ -18,6 +18,20 @@ def assemble(ins:list[Instruction]) -> tuple[bytes, int]:
   loops = [(src[0], i) for i,(op,src,_) in enumerate(ins) if op == "back"]
   for i,(_,src,_) in enumerate(ins):
     for v in src: last[v] = max(last.get(v, i), i, *(end for start,end in loops if v <= start <= i <= end))
+  # Overlap two independent reads. Keep the first address live until the second DMA waits for both data fences.
+  first:set[int] = set()
+  second:set[int] = set()
+  pending:int|None = None
+  for i,(op,src,_) in enumerate(ins):
+    if pending is not None and (pending in src or op not in ("ld", "ld8", "ld16", "imm", "imul", "imad", "iadd", "lsr", "lsl", "asr",
+                                                             "and", "or", "xor", "group", "lane")): pending = None
+    if op in ("ld", "ld8", "ld16"):
+      if pending is not None and last.get(pending, pending) > i:
+        first.add(pending)
+        second.add(i)
+        for v in ins[pending][1]: last[v] = max(last[v], i)
+        pending = None
+      else: pending = i
   expires:dict[int,list[int]] = defaultdict(list)
   for v,i in last.items(): expires[i].append(v)
   regs:dict[int,int] = {}
@@ -49,9 +63,10 @@ def assemble(ins:list[Instruction]) -> tuple[bytes, int]:
     elif op in ("mov", "range", "assign"):
       dest, a = operands if op == "assign" else (dst, operands[0])
       word, wait, signal = 0xc00b80ca | _field(dest,(9,10,23,24,47,56)) | _field(a,(18,22,21,25,39,50)), (20,29), 11
-    elif op == "imul":
-      a,b = operands
-      word = 0x840c0a990110200110106c20 | _field(dst,(19,41,53,59,70,46)) | _field(a,(6,16,17,36,48,27)) | _field(b,(42,61,57,74,69,22))
+    elif op in ("imul", "imad"):
+      a,b = operands[:2]
+      word = 0x840c0a990110200110106c20 if op == "imul" else 0x840c0a990110200910904c00 | _field(operands[2],(15,38,37,40,47,54))
+      word |= _field(dst,(19,41,53,59,70,46)) | _field(a,(6,16,17,36,48,27)) | _field(b,(42,61,57,74,69,22))
       wait, signal = (29,39), 18
     elif op in ("lsr", "asr", "lsl", "and", "or", "xor"):
       a,b = operands
@@ -85,6 +100,11 @@ def assemble(ins:list[Instruction]) -> tuple[bytes, int]:
       src_bits = (15,38,37,40,47,54)
       word |= _field(a,(6,16,17,36,48,27)) | _field(b,src_bits+(66,76) if op == "imm" else src_bits)
       wait, signal = (29,39), 18
+    elif op == "fma":
+      a,b,c = operands
+      word = 0x8040080804808609 | _field(dst,(4,16,24,33,42,45)) | _field(a,(6,12,20,19,29,28))
+      word |= _field(b,(22,32,38,40,50,58)) | _field(c,(14,21,25,27,37,39))
+      wait, signal = (55,56), 41
     elif op in ("fadd", "fmul", "fmax", "feq", "fgt"):
       a,b = operands
       word = {"fadd":0x804008080480a60b, "fmul":0x804008080480868d,
@@ -96,6 +116,8 @@ def assemble(ins:list[Instruction]) -> tuple[bytes, int]:
       addr = _field(imm,(45,17,22,30,36)) | _field(operands[0],(20,14,26,27,34,40))  # [shared pointer pair + byte offset in rN]
       if op.startswith("ld"): word, signal = 0xc00004000001858e | addr | _field(dst,(29,35,37,41,47,53)), None
       else: word, signal = 0xc000008000012a4e | addr | _field(operands[1],(25,23,28,32,38,44)), 15
+      if i in first: word ^= 1<<42  # set dfc0 and continue
+      if i in second: word ^= 1<<15 | 1<<21 | 1<<46  # set dfc1 and wait for dfc0 and dfc1
       if op.endswith("16"): word ^= 0x0004000000010000
       if op.endswith("8"): word ^= 0x0010000000010000
       wait = (18,19)
@@ -107,7 +129,7 @@ def assemble(ins:list[Instruction]) -> tuple[bytes, int]:
       word = (word & ~(1<<63)) | 0x840c0a99<<64  # scalar 32-bit integer pipeline
     elif op in ("and", "lsr") and word >= 1<<64:
       word = (word & ~(1<<63)) | 0x9a008240<<64
-    # Alternate write fences. Each load sets and waits on its data fence (dfc0) within the instruction.
+    # Alternate ALU write fences. Single loads wait on their own data fence.
     if fence is not None: word |= 1<<wait[fence]
     fence = None if signal is None else int(fence == 0)
     if fence == 1 and signal is not None: word |= 1<<signal
@@ -131,6 +153,16 @@ class MTUSCRenderer(Renderer):
   def supported_dtypes(self):
     return {dtypes.float, dtypes.half, dtypes.int, dtypes.uint, dtypes.short, dtypes.ushort, dtypes.char, dtypes.uchar, dtypes.bool}
   def render(self, uops:list[UOp]) -> str:
+    uses = Counter(x for u in uops for x in u.src)
+    fused:dict[UOp,tuple[UOp,UOp]] = {}
+    muls:set[UOp] = set()
+    for u in uops:
+      if u.op in (Ops.RANGE, Ops.END): muls.clear()
+      if u.op is Ops.MUL and uses[u] == 1 and u.dtype in (dtypes.float, dtypes.int, dtypes.uint): muls.add(u)
+      if u.op is Ops.ADD:
+        if u.src[0] in muls: fused[u] = (u.src[0],u.src[1])
+        elif u.src[1] in muls: fused[u] = (u.src[1],u.src[0])
+    products = {a for a,_ in fused.values()}
     has_loop = any(u.op is Ops.RANGE for u in uops)
     supported = self.supported_dtypes()
     params = sorted((u for u in uops if u.op is Ops.PARAM), key=lambda u:u.arg.slot)
@@ -224,6 +256,9 @@ class MTUSCRenderer(Renderer):
       elif u.op is Ops.WHERE:
         cond, t, f = (reg(x) for x in u.src)
         r = select(cond, t, f)
+      elif u in fused:
+        mul, acc = fused[u]
+        r = emit("fma" if u.dtype == dtypes.float else "imad", *(reg(x) for x in (*mul.src,acc)))
       elif u.op in (Ops.ADD, Ops.MUL, Ops.MAX) and u.dtype != dtypes.bool:
         a,b = (reg(x) for x in u.src)
         if u.dtype == dtypes.half: a,b = emit("half_to_float", a), emit("half_to_float", b)
@@ -282,7 +317,7 @@ class MTUSCRenderer(Renderer):
         if u.op is Ops.LOAD and u.dtype == dtypes.bool: regs[u] = emit("and", regs[u], literal(1))
         if u.op is Ops.STORE: emit("st"+suffix, offsets[offset], reg(u.src[1]), imm=ptrs[buf])
       # Respect the scheduler's placement of invariant address arithmetic before nested reductions.
-      elif has_loop and u.op in (Ops.SPECIAL, Ops.TRUNCDIV, Ops.TRUNCMOD, *self.code_for_op): reg(u)
+      elif has_loop and u not in products and u.op in (Ops.SPECIAL, Ops.TRUNCDIV, Ops.TRUNCMOD, *self.code_for_op): reg(u)
       elif u.op not in (Ops.PARAM, Ops.BUFFER, Ops.CONST, Ops.CAST, Ops.INDEX, Ops.SPECIAL, Ops.CMPEQ, Ops.CMPLT, Ops.WHERE,
                         Ops.AND, Ops.OR, Ops.XOR, Ops.BITCAST, Ops.TRUNCDIV, Ops.TRUNCMOD, *self.code_for_op, Ops.STACK, Ops.AFTER, Ops.SINK):
         raise NotImplementedError(f"S30 USC cannot lower {u.op}")
