@@ -1,0 +1,200 @@
+import struct
+from collections import defaultdict
+from tinygrad.dtype import AddrSpace, dtypes
+from tinygrad.helpers import Target
+from tinygrad.renderer import Compiler, Renderer
+from tinygrad.uop.ops import Ops, UOp
+
+def _field(value:int, bits:tuple[int, ...]) -> int:
+  if not 0 <= value < 1<<len(bits): raise NotImplementedError(f"S30 USC operand {value} exceeds {len(bits)} bits")
+  return sum(((value >> i) & 1) << bit for i,bit in enumerate(bits))
+
+# One scalar instruction per entry. Sources refer to previous instruction indices, imm selects a shared register.
+Instruction = tuple[str, tuple[int, ...], int]
+
+def assemble(ins:list[Instruction]) -> tuple[bytes, int]:
+  # An operand defined before a loop and read in its body must survive the back edge.
+  last:dict[int,int] = {}
+  loops = [(src[0], i) for i,(op,src,_) in enumerate(ins) if op == "back"]
+  for i,(_,src,_) in enumerate(ins):
+    for v in src: last[v] = max(last.get(v, i), i, *(end for start,end in loops if v <= start <= i <= end))
+  expires:dict[int,list[int]] = defaultdict(list)
+  for v,i in last.items(): expires[i].append(v)
+  regs:dict[int,int] = {}
+  labels:dict[int,int] = {}
+  free, peak = set(range(16)), 0
+  code = bytearray()
+  fence:int|None = None
+  for i,(op,src,imm) in enumerate(ins):
+    operands = tuple(regs[v] for v in src)
+    for v in expires[i]: free.add(regs.pop(v))
+    if op not in ("st", "st8", "assign", "back"):
+      if not free: raise NotImplementedError("S30 USC needs more than 16 live temporaries")
+      dst = min(free)
+      peak = max(peak, dst+1)
+      if i in last:
+        free.remove(dst)
+        regs[i] = dst
+    if op == "slot": continue
+    if op == "back":
+      delta = (labels[src[0]]-len(code))//4
+      disp = _field(delta & 0x3fffffff,(16,14,13,15,17,18,28,39,41,44,43,40,38,37,36,35,30,29,26,19,21,24,23,22,20,27,25,32,34,33))
+      code.extend((0x8000800000000c1c | disp).to_bytes(8, 'little'))  # wait wfc0 and wfc1, branch if any P0
+      fence = None
+      continue
+
+    # The USC scatters register-number bits across instruction words. Each base word selects scalar 32-bit operands.
+    if op == "group": word, wait, signal = 0xc00b804a | _field(imm,(18,22)) | _field(dst,(9,10,23,24)), (20,29), 11  # mov rD, lmN
+    elif op == "lane": word, wait, signal = 0x804008000482880f | _field(dst,(4,16,24,33)), (55,56), 41  # mov rD, ar0
+    elif op in ("mov", "range", "assign"):
+      dest, a = operands if op == "assign" else (dst, operands[0])
+      word, wait, signal = 0xc00b80ca | _field(dest,(9,10,23,24)) | _field(a,(18,22,21,25)), (20,29), 11
+    elif op == "imul":
+      a,b = operands
+      word = 0x840c0a990110200110106c20 | _field(dst,(19,41,53,59)) | _field(a,(6,16,17,36)) | _field(b,(42,61,57,74))
+      wait, signal = (29,39), 18
+    elif op in ("lsr", "and"):
+      a,b = operands
+      word = (0xa5b6200149801078 if op == "lsr" else 0xa136000041801078) | _field(dst,(8,14,19,33))
+      word |= _field(a,(25,36,44,47)) | _field(b,(13,17,34,29))
+      wait, signal = (11,18), 10
+    elif op in ("sqrt", "recip"):
+      word = (0x80000a000200001a if op == "sqrt" else 0x80000a000000001a) | _field(dst,(7,8,16,20)) | _field(operands[0],(9,13,19,22))
+      wait, signal = (10,15), 14
+    elif op == "u8tof":
+      word = 0x80211818400388ca | _field(dst,(9,10,23,24)) | _field(operands[0],(18,22,21,25))
+      wait, signal = (20,29), None  # converts the low byte and waits for dfc0
+    elif op in ("iadd", "imm", "ilt", "imax", "ieq"):
+      a,b = (0,imm) if op == "imm" else operands
+      word = {"iadd":0x8190200010904c00, "imm":0x8190200010804c80, "ilt":0x8596240816f07d00,
+              "imax":0x9592200a10b06d00, "ieq":0x8196240816f07d00}[op] | _field(dst,(19,41,53,59))
+      word |= _field(a,(6,16,17,36)) | _field(b,(15,38,37,40,47,54))
+      wait, signal = (29,39), 18
+    elif op in ("fadd", "fmul", "fmax", "feq"):
+      a,b = operands
+      word = {"fadd":0x804008080480a60b, "fmul":0x804008080480868d,
+              "fmax":0x804318080482a60b, "feq":0xa04108080482a60b}[op] | _field(dst,(4,16,24,33)) | _field(a,(6,12,20,19))
+      word |= _field(b, (14,21,25,27) if op != "fmul" else (22,32,38,40))
+      wait, signal = (55,56), 41
+    elif op in ("ld", "ld8", "st", "st8"):
+      addr = _field(imm,(45,17,22,30,36)) | _field(operands[0],(20,14,26,27))  # [shared pointer pair + byte offset in rN]
+      if op.startswith("ld"): word, signal = 0xc00004000001858e | addr | _field(dst,(29,35,37,41)), None
+      else: word, signal = 0xc000008000012a4e | addr | _field(operands[1],(25,23,28,32)), 15
+      if op.endswith("8"): word ^= 0x0010000000010000
+      wait = (18,19)
+    else: raise ValueError(op)
+
+    # Alternate write fences. Each load sets and waits on its data fence (dfc0) within the instruction.
+    if fence is not None: word |= 1<<wait[fence]
+    fence = None if signal is None else int(fence == 0)
+    if fence == 1 and signal is not None: word |= 1<<signal
+    code.extend(word.to_bytes(4*((word.bit_length()+31)//32), 'little'))
+    if op == "range": labels[i] = len(code)
+  code.extend(struct.pack('<I', 0x8000031c | (0 if fence is None else 0x400<<fence)))  # wait and end
+  return bytes(code), peak
+
+class USCCompiler(Compiler):
+  def compile(self, src:str) -> bytes: return bytes.fromhex(src)
+
+class MTUSCRenderer(Renderer):
+  compiler = USCCompiler()
+  supports_float4 = has_shared = False
+  shared_max = 0
+  global_max, local_max = (0x7fffffff,65535,65535), (1024,)
+  code_for_op = dict.fromkeys((Ops.ADD, Ops.SHL, Ops.SHR, Ops.MUL, Ops.SQRT, Ops.RECIP, Ops.MAX), lambda: None)
+  def __init__(self, target:Target):
+    if target.arch != "mp_10": raise RuntimeError("USC requires the S30")
+    super().__init__(target)
+  def supported_dtypes(self): return {dtypes.float, dtypes.int, dtypes.uchar}
+  def render(self, uops:list[UOp]) -> str:
+    params = sorted((u for u in uops if u.op is Ops.PARAM), key=lambda u:u.arg.slot)
+    if any(p.addrspace != AddrSpace.GLOBAL or p.dtype not in self.supported_dtypes() for p in params):
+      raise NotImplementedError("S30 USC requires supported global buffer arguments")
+    ptrs = {p:2*i for i,p in enumerate(params)}
+    ins:list[Instruction] = []
+    constants:list[int] = []
+    regs:dict[UOp,int] = {}
+    offsets:dict[tuple[UOp,int],int] = {}
+    def emit(op:str, *src:int, imm:int=0) -> int:
+      ins.append((op, src, imm))
+      return len(ins)-1
+    def literal(bits:int) -> int:
+      if bits not in constants: constants.append(bits)
+      return emit("imm", imm=2*len(params)+constants.index(bits))
+    slots:dict[tuple[UOp,int],int] = {}
+    def scale(src:int, n:int) -> int:
+      if n <= 0: raise NotImplementedError("S30 USC needs a positive integer scale")
+      acc = src
+      for bit in bin(n)[3:]:
+        acc = emit("iadd", acc, acc)
+        if bit == '1': acc = emit("iadd", acc, src)
+      return acc
+    def reg(u:UOp) -> int:
+      if u in regs: return regs[u]
+      if u._shape != () or u.dtype not in (dtypes.int, dtypes.float, dtypes.uchar, dtypes.bool):
+        raise NotImplementedError(f"S30 USC scalar {u.op} {u.dtype}")
+      if u.op is Ops.SPECIAL and u.arg in ("gidx0", "gidx1", "gidx2"): r = emit("group", imm=int(u.arg[-1]))
+      elif u.op is Ops.SPECIAL and u.arg == "lidx0": r = emit("lane")
+      elif u.op is Ops.AFTER: r = reg(u.src[0])
+      elif u.op is Ops.CONST or (u.op is Ops.CAST and u.src[0].op is Ops.CONST):
+        val = u.val if u.op is Ops.CONST else u.src[0].val
+        bits = struct.unpack('<I', struct.pack('<f', val))[0] if u.dtype == dtypes.float else int(val) & 0xffffffff
+        r = literal(bits)
+      elif u.op is Ops.CAST and u.dtype == dtypes.float and u.src[0].dtype == dtypes.uchar: r = emit("u8tof",reg(u.src[0]))
+      elif u.op is Ops.CAST and u.dtype == dtypes.int and u.src[0].dtype == dtypes.bool: r = reg(u.src[0])
+      elif u.op is Ops.CAST and u.dtype == dtypes.int and u.src[0].dtype == dtypes.uchar: r = emit("and", reg(u.src[0]), literal(255))
+      elif u.op is Ops.CMPEQ and u.src[0].dtype in (dtypes.int, dtypes.float):
+        a,b = (reg(x) for x in u.src)
+        r = emit("ilt", literal(0), emit("feq", a, b)) if u.src[0].dtype == dtypes.float else emit("ieq", a, b)
+      elif u.op in (Ops.ADD, Ops.MUL, Ops.MAX) and u.dtype in (dtypes.int, dtypes.float):
+        r = emit(("f" if u.dtype == dtypes.float else "i")+u.op.name.lower(), *(reg(x) for x in u.src))
+      elif u.op in (Ops.RECIP, Ops.SQRT): r = emit(u.op.name.lower(), reg(u.src[0]))
+      elif u.op is Ops.SHL and u.src[1].vmin == u.src[1].vmax: r = emit("imul", reg(u.src[0]), literal(1<<(int(u.src[1].vmin)%32)))
+      elif u.op is Ops.SHR and u.src[0].vmin >= 0: r = emit("lsr", *(reg(x) for x in u.src))
+      elif u.op in (Ops.TRUNCDIV, Ops.TRUNCMOD) and u.src[0].vmin >= 0 and u.src[1].vmin == u.src[1].vmax and u.src[1].vmin > 0:
+        from tinygrad.codegen.decomp.op import magicgu
+        n,d = reg(u.src[0]), int(u.src[1].vmin)
+        m,shift = magicgu(int(u.src[0].vmax), d)
+        if m*u.src[0].vmax >= 1<<32: raise NotImplementedError("S30 USC division needs a wide product")
+        q = emit("lsr", emit("imul", n, literal(m)), literal(shift))
+        r = q if u.op is Ops.TRUNCDIV else emit("iadd", n, emit("imul", q, literal(-d & 0xffffffff)))
+      else: raise NotImplementedError(f"S30 USC cannot lower {u.op} {u.dtype}")
+      regs[u] = r
+      return r
+
+    for u in uops:
+      if u.op is Ops.RANGE:
+        if u.src[0].vmin < 1 or u.src[0].vmax >= 1<<31: raise NotImplementedError("S30 USC requires a positive loop bound")
+        regs[u] = emit("range", literal(0))
+      elif u.op is Ops.END:
+        idx = u.src[1]
+        counter = regs[idx]
+        advance = emit("iadd", counter, literal(1))
+        emit("assign", counter, advance)
+        pred = emit("ilt", counter, reg(idx.src[0]))
+        emit("back", counter, pred)
+      elif u.op in (Ops.LOAD, Ops.STORE):
+        idx = u.src[0]
+        if (len(u.src) != (1 if u.op is Ops.LOAD else 2) or idx.op is not Ops.INDEX or len(idx.src) != 2 or
+            idx._shape != () or idx.dtype != idx.src[0].dtype):
+          raise NotImplementedError("S30 USC requires an unconditional scalar buffer access")
+        index = idx.src[1]
+        buf = idx.src[0].without_after
+        if buf.op is Ops.BUFFER and buf.addrspace == AddrSpace.REG and index.vmin == index.vmax:
+          key = (buf, int(index.vmin))
+          if key not in slots: slots[key] = emit("slot")
+          if u.op is Ops.STORE: emit("assign", slots[key], reg(u.src[1]))
+          else: regs[u] = emit("mov", slots[key])
+          continue
+        if buf not in ptrs: raise NotImplementedError("S30 USC needs a global buffer or a fixed register index")
+        offset = (index, buf.dtype.itemsize)
+        if offset not in offsets: offsets[offset] = scale(reg(index), buf.dtype.itemsize)
+        suffix = "8" if buf.dtype.itemsize == 1 else ""
+        if u.op is Ops.LOAD: regs[u] = emit("ld"+suffix, offsets[offset], imm=ptrs[buf])
+        else: emit("st"+suffix, offsets[offset], reg(u.src[1]), imm=ptrs[buf])
+      elif u.op not in (Ops.PARAM, Ops.BUFFER, Ops.CONST, Ops.CAST, Ops.INDEX, Ops.SPECIAL, Ops.CMPEQ, Ops.TRUNCDIV, Ops.TRUNCMOD,
+                        *self.code_for_op, Ops.STACK, Ops.AFTER, Ops.SINK):
+        raise NotImplementedError(f"S30 USC cannot lower {u.op}")
+    code, temps = assemble(ins)
+    # Shared registers hold pointer pairs followed by the shader's literal words.
+    return (struct.pack(f'<II{len(constants)}I', temps, len(constants), *constants) + code).hex()

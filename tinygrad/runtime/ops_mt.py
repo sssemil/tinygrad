@@ -4,6 +4,7 @@ from typing import Any
 from tinygrad.device import Compiled, Program, Allocator, BufferStorage, BufferSpec, Buffer
 from tinygrad.renderer import Compiler, TinyELF
 from tinygrad.renderer.cstyle import CUDARenderer, CStyleLanguage
+from tinygrad.renderer.usc import MTUSCRenderer
 from tinygrad.renderer.llvmir import LLVMRenderer, base_rewrite, ldt, llvm_intrinsics
 from tinygrad.dtype import dtypes, AddrSpace
 from tinygrad.helpers import round_up, diskcache_get, diskcache_put, Target, unwrap
@@ -226,7 +227,7 @@ class MTProgram(Program['MTDevice']):
     return result.run_time / 25_000_000 if wait else None
 
 class MTDevice(Compiled):
-  renderers = [MUSARenderer, MTLLVMRenderer]
+  renderers = [MUSARenderer, MTLLVMRenderer, MTUSCRenderer]
   def __init__(self, device:str=''):
     dev_id = int(device.split(':')[1]) if ':' in device else 0
     self.mt = MTDev.open_usb(dev_id)

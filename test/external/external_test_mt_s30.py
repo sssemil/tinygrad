@@ -11,7 +11,7 @@ from tinygrad.runtime.support.mt.s30 import DEFAULT_S30_FIRMWARE, PDS_BASE, USC_
 has_firmware = Path(os.getenv("MT_FIRMWARE", DEFAULT_S30_FIRMWARE)).is_file()
 requires_firmware = unittest.skipUnless(has_firmware, "requires mtgpu-s30 3.1.0-6 mtfw-gen1.bin")
 compiler_bin = 'clang-14' if DEV.renderer == "LLVM" else 'mcc'
-requires_compiler = unittest.skipUnless(has_firmware and (MTCompiler().bin/compiler_bin).is_file(),
+requires_compiler = unittest.skipUnless(has_firmware and DEV.renderer != "USC" and (MTCompiler().bin/compiler_bin).is_file(),
                                         f"requires S30 firmware and the renderer using {compiler_bin}")
 
 
@@ -90,6 +90,36 @@ class TestS30USB(unittest.TestCase):
     original = [13, 21, 34, 55]
     resident = Tensor(original, device="CPU", dtype=dtypes.int32).to("MT").realize()
     self.assertEqual(resident.to("CPU").tolist(), original)
+
+  @requires_firmware
+  def test_native_vector_add(self):
+    import numpy as np
+    from unittest.mock import patch
+    from tinygrad.runtime.support.mt.compiler import MTLLVMCompiler
+    rng = np.random.default_rng(30)
+    with Context(DEV="MT:USC", CACHELEVEL=0), patch.object(MTCompiler, "compile_raw", side_effect=AssertionError("called mcc")), \
+         patch.object(MTLLVMCompiler, "compile", side_effect=AssertionError("called MTGPU clang")):
+      self.assertEqual(Device["MT"].renderer.target.renderer, "USC")
+      for n in (1, 32, 256, 257, 4099):
+        for dt in (np.int32, np.float32):
+          with self.subTest(n=n, dtype=dt):
+            a,b = (rng.integers(-(1<<31), 1<<31, n, dtype=dt) if dt == np.int32 else rng.normal(size=n).astype(dt) for _ in range(2))
+            np.testing.assert_array_equal((Tensor(a, device="MT")+Tensor(b, device="MT")).numpy(), a+b)
+      self.assertGreater(Device["MT"].s30_fw.queue.seq, 0)
+      x = Tensor([1., 2.], device="MT")
+      with self.assertRaisesRegex(NotImplementedError, "S30 USC"): x.sin().realize()
+
+  @requires_firmware
+  def test_native_projection(self):
+    import numpy as np
+    rng = np.random.default_rng(30)
+    x = rng.integers(0, 256, (3, 48), dtype=np.uint8)
+    w = rng.integers(-4, 5, (11, 48)).astype(np.float32)
+    with Context(DEV="MT:USC", CACHELEVEL=0):
+      inputs, weights = Tensor(x, device="MT"), Tensor(w, device="MT")
+      out = (inputs.float().unsqueeze(1)*weights).sum(-1).relu()
+      np.testing.assert_array_equal(out.numpy(), np.maximum(x@w.T, 0))
+      np.testing.assert_array_equal((inputs.int() * inputs.int()).numpy(), x.astype(np.int32)**2)
 
   @requires_compiler
   def test_tensor_compute(self):

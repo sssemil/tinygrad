@@ -47,6 +47,16 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
   # make a copy so it does not mutate the input
   k = k.copy()
 
+  # Keep the scalar S30 renderer within its register file while packing independent outputs into one wave.
+  if k.ren.target.renderer == "USC":
+    for r in [k.rngs[a] for a in k.axes_of(AxisType.GLOBAL, AxisType.WEAK, reduce=False)][::-1]:
+      if r.src[0].op is not Ops.CONST: continue
+      size = next((n for n in range(32, 1, -1) if r.src[0].val%n == 0), 1)
+      if size > 1:
+        k.apply_opt(Opt(OptOps.SPLIT, k.rngs.index(r), (size, AxisType.LOCAL)))
+        break
+    return k
+
   # upcast float4 images, this must be early so we don't accidentally add locals before the upcast
   if IMAGE:
     for buf_index,buf in enumerate(k.bufs):

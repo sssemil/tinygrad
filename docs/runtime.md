@@ -20,6 +20,13 @@ Select `DEV=MT` for a two-core S30 on a Chestnut USB bridge. The runtime uses MU
 
 With `DEV=MT:LLVM`, tinygrad emits LLVM IR directly. Its compiler is the MTGPU-enabled `bin/clang-14` under `MUSA_PATH`. The compiler can also load helper routines from `mtgpu/bitcode/`. Both renderers upload the resulting shader to VRAM and submit commands to the S30 firmware over USB. Once kernels are cached, `ASSERT_COMPILE=1` runs them with the compiler offline and reports a cache miss if a new kernel is needed.
 
+`DEV=MT:USC` selects tinygrad's experimental native S30 shader compiler. It encodes USC instructions directly and supports the trained MNIST inference graph. Unsupported kernels raise an error. The S30 still boots the vendor compute firmware. For a cold compiler run and a warm latency measurement, run the following from the checkout with the trained checkpoint.
+
+```sh
+DEV=MT:USC CACHELEVEL=0 MUSA_PATH=/nonexistent PYTHONPATH=. \
+  python extra/usbgpu/bench_s30.py mnist /path/to/mnist-s30.safetensors
+```
+
 Run the MNIST training and evaluation demo from the checkout.
 
 ```sh
