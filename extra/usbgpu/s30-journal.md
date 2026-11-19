@@ -8,11 +8,11 @@ Measured on the same Chestnut S30 with compiler caching disabled. The cold colum
 
 | Workload | Native cold | MUSA cold | Native warm | MUSA warm |
 | --- | ---: | ---: | ---: | ---: |
-| MNIST, batch of 16 | 0.772 s | 3.506 s | 35.21 ms | 13.82 ms |
-| Whisper tiny.en, test.wav | 30.457 s | 50.836 s | 6.419 s | 2.595 s |
-| Qwen2.5-0.5B Q8_0 | 162.740 s | 171.460 s | 17.283 s | 9.622 s |
+| MNIST, batch of 16 | 0.932 s | 3.506 s | 35.63 ms | 13.82 ms |
+| Whisper tiny.en, test.wav | 30.525 s | 50.836 s | 6.300 s | 2.595 s |
+| Qwen2.5-0.5B Q8_0 | 159.952 s | 171.460 s | 14.433 s | 9.622 s |
 
-All five native outputs per model matched the reference. The native measurements blocked the two vendor compiler entry points, vendor compute-firmware boot and construction of the management mailbox. They use the paired-load renderer, direct shared arithmetic operands, two-core dispatch and two-output tiling. The card powered up with its factory firmware still installed. The host did not supply proprietary code or communicate with that firmware during these model runs.
+All five native outputs per model matched the reference. The native measurements ran offline in a fresh filesystem namespace (details below). Separate hardware runs disabled vendor compilation, vendor firmware boot and management mailbox construction. The card powered up with its factory firmware still installed. The host did not upload proprietary code during these model runs. The board-management mailbox was unused.
 
 ## November 20, 2026 — proprietary reference
 
@@ -162,3 +162,11 @@ An experimental workgroup barrier stalled the secondary core. A fresh process ru
 The native scheduler grouped adjacent filter outputs across up to three workgroup axes and assigned four outputs per lane when the shape allowed. Five fresh-cache passes on the trained MNIST model returned the same 16 classes as MUSA. Median warm batch latency fell from 171.51 ms to 35.21 ms. Independent tile trials ranged from 33.45 to 35.92 ms. Cold time to the first batch was 0.772 s. All 165 captured kernels from the three models still compiled from source. The direct S30 hardware suite passed its eleven applicable checks.
 
 A separate Qwen timing attributed 4.22 s and 2.33 s of a 14.59 s generation to two prompt-processing matrix multiplications. This profile was the second generation in its process. It is separate from the five-call benchmark above.
+
+## November 20, 2026 — FP16 inputs to FP32 arithmetic and isolated end-to-end runs
+
+The USC floating-point unit can widen an individual operand from the low 16 bits of a register. The renderer now encodes that operand format on add, multiply and fused multiply-add instructions when a widening conversion feeds them. Accumulation stays in FP32. An explicit FP16 result still rounds at the same point. Mixed-precision projections passed full-output checks against NumPy. All 165 captured kernels compiled from source.
+
+Each model ran in its own fresh, network-isolated Linux mount namespace. We mounted a Git source export with the renderer change, the open-source host interpreter and packages, the input checkpoint or audio, and the cached dataset, tokenizer and model downloads. The previous tinygrad database, firmware download directory, workspace toolkit, system firmware directory, /usr/local and host /tmp were inaccessible. The only physical USB device passed through was the Chestnut. The device lock shared its inode with the host. Compiler caching was disabled. The host had no system-installed Moore Threads compiler or libraries. These restrictions apply to host software. They cannot inspect or substitute for firmware resident on the card.
+
+All fifteen outputs matched MUSA. The medians of the three warm calls were 35.63 ms for MNIST, 6.300 s for Whisper and 14.433 s for Qwen. The previous Qwen median was 17.283 s. A separate hardware run passed all twelve applicable checks and the CPU-side MT suite passed all 25 tests.

@@ -11,6 +11,7 @@ def _field(value:int, bits:tuple[int, ...]) -> int:
 
 # Sources are instruction indices. A complemented index selects a shared register directly on these arithmetic operands.
 shared_bits:dict[str,tuple[int|None,...]] = {"iadd":(28,20), "imul":(28,None), "imad":(28,None,20), "fmul":(15,43), "fma":(15,43,35)}
+half_bits = {"fmul":(9,10), "fadd":(9,26), "fma":(9,10,26)}
 Instruction = tuple[str, tuple[int, ...], int]
 
 def assemble(ins:list[Instruction]) -> tuple[bytes, int]:
@@ -42,7 +43,7 @@ def assemble(ins:list[Instruction]) -> tuple[bytes, int]:
   code = bytearray()
   fence:int|None = None
   for i,(op,src,imm) in enumerate(ins):
-    if op == "imm" and i not in last: continue
+    if op in ("imm", "half_to_float") and i not in last: continue
     operands = tuple(regs[v] if v >= 0 else ~v for v in src)
     for v in expires[i]: free.add(regs.pop(v))
     if op not in ("st", "st8", "st16", "assign", "back"):
@@ -126,6 +127,7 @@ def assemble(ins:list[Instruction]) -> tuple[bytes, int]:
       wait = (18,19)
     else: raise ValueError(op)
 
+    if op in half_bits: word ^= imm
     for v,bit in zip(src, shared_bits.get(op, ())):
       if v < 0 and bit is not None: word ^= 1<<bit
 
@@ -181,6 +183,10 @@ class MTUSCRenderer(Renderer):
     regs:dict[UOp,int] = {}
     offsets:dict[tuple[UOp,int],int] = {}
     def emit(op:str, *src:int, imm:int=0) -> int:
+      for i,half_bit in enumerate(half_bits.get(op, ())):
+        if ins[src[i]][0] == "half_to_float":
+          src = (*src[:i], ins[src[i]][1][0], *src[i+1:])
+          imm |= 1<<half_bit
       if op in shared_bits:
         if op in ("imul", "imad") and ins[src[1]][0] == "imm": src = (src[1],src[0],*src[2:])
         for i,(v,bit) in enumerate(zip(src, shared_bits[op])):

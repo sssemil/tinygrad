@@ -141,6 +141,17 @@ class TestS30USB(unittest.TestCase):
       np.testing.assert_array_equal(out.numpy(), np.maximum(x@w.T, 0))
       np.testing.assert_array_equal((inputs.int() * inputs.int()).numpy(), x.astype(np.int32)**2)
 
+  def test_native_mixed_precision(self):
+    import numpy as np
+    rng = np.random.default_rng(30)
+    a,b,c = (rng.normal(size=257).astype(np.float16) for _ in range(3))
+    with Context(DEV="MT:USC", CACHELEVEL=0):
+      x,y,z = (Tensor(v, device="MT").float() for v in (a,b,c))
+      af,bf,cf = (v.astype(np.float32) for v in (a,b,c))
+      np.testing.assert_array_equal((x*y+z).numpy(), af*bf+cf)
+      np.testing.assert_array_equal((x*y+0.25).numpy(), af*bf+0.25)
+      np.testing.assert_array_equal((x*2.+z).numpy(), af*2.+cf)
+
   def test_native_half_and_mask(self):
     import numpy as np
     rng = np.random.default_rng(30)
