@@ -177,6 +177,34 @@ class TestS30USB(unittest.TestCase):
         expected[active+2] = active+91
         np.testing.assert_array_equal(dest.custom_kernel(flags, fxn=kernel)[0].numpy(), expected)
 
+  def test_native_load_pressure(self):
+    from tinygrad.dtype import AddrSpace
+    from tinygrad.renderer import TinyELF
+    from tinygrad.renderer.usc import assemble, Instruction
+    from tinygrad.runtime.support.mt.s30 import MTS30Program
+    # Load all inputs before the first add. The original instruction order needs more than 64 registers.
+    count = 80
+    ins:list[Instruction] = []
+    for i in range(count): ins.extend([("imm", (), 4+i), ("ld", (2*i,), 2)])
+    acc = 1
+    for i in range(1, count):
+      ins.append(("fadd", (acc, 2*i+1), 0))
+      acc = len(ins)-1
+    ins.append(("st", (0, acc), 0))
+    code, temps = assemble(ins)
+    self.assertLessEqual(temps, 8)
+    lib = struct.pack(f"<HHI{count}I", temps, 0, count, *range(0, 4*count, 4)) + code
+    with Context(DEV="MT:USC", CACHELEVEL=0):
+      dev = Device["MT"]
+      sig = ((None, AddrSpace.GLOBAL, dtypes.float, ()),)*2
+      prg = MTS30Program(dev, TinyELF(lib, "sum_inputs", dev.renderer.target, sig), {})
+      rng = random.Random(30)
+      vals = rng.sample(range(-1000, 1000), count)
+      src = Buffer("MT", 4*count, initial_value=struct.pack(f"<{count}f", *vals))
+      dst = Buffer("MT", 4, initial_value=bytes(4))
+      prg(dst.meta.va, src.meta.va, wait=True)
+      self.assertEqual(struct.unpack("<f", dst.as_memoryview())[0], sum(vals))
+
   def test_native_projection(self):
     import numpy as np
     rng = np.random.default_rng(30)

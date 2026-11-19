@@ -14,7 +14,24 @@ shared_bits:dict[str,tuple[int|None,...]] = {"iadd":(28,20), "imul":(28,None), "
 half_bits = {"fmul":(9,10), "fadd":(9,26), "fma":(9,10,26)}
 Instruction = tuple[str, tuple[int, ...], int]
 
-def assemble(ins:list[Instruction]) -> tuple[bytes, int]:
+def _delay_loads(ins:list[Instruction]) -> list[Instruction]:
+  # Move input loads and their address calculations toward first use inside straight-line floating point arithmetic.
+  boundary = len(ins)
+  position = [boundary]*len(ins)
+  for i in reversed(range(len(ins))):
+    op, src, _ = ins[i]
+    if op in ("ld", "ld8", "ld16", "imm", "group", "lane", "imul", "imad", "iadd", "lsl", "lsr", "asr", "and", "or", "xor", "half_to_float", "mov"):
+      position[i] = min(position[i], boundary)
+    else:
+      position[i] = i
+      if op not in ("fadd", "fmul", "fma"): boundary = i
+    for v in src:
+      if v >= 0: position[v] = min(position[v], position[i])
+  order = sorted(range(len(ins)), key=position.__getitem__)
+  remap = {v:i for i,v in enumerate(order)}
+  return [(op, tuple(remap[v] if v >= 0 else v for v in src), imm) for op,src,imm in (ins[i] for i in order)]
+
+def assemble(ins:list[Instruction], *, retry:bool=True) -> tuple[bytes, int]:
   # An operand defined before a loop and read in its body must survive the back edge.
   last:dict[int,int] = {}
   loops = [(src[0], i) for i,(op,src,_) in enumerate(ins) if op == "back"]
@@ -47,7 +64,9 @@ def assemble(ins:list[Instruction]) -> tuple[bytes, int]:
     operands = tuple(regs[v] if v >= 0 else ~v for v in src)
     for v in expires[i]: free.add(regs.pop(v))
     if op not in ("st", "st8", "st16", "assign", "back", "cndst", "cndend", "lmst", "barrier"):
-      if not free: raise NotImplementedError("S30 USC needs more than 64 live temporaries")
+      if not free:
+        if retry: return assemble(_delay_loads(ins), retry=False)
+        raise NotImplementedError("S30 USC needs more than 64 live temporaries")
       dst = min(free)
       peak = max(peak, dst+1)
       if i in last:
