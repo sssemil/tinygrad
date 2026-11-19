@@ -61,3 +61,6 @@ if __name__ == "__main__":
       while (reply:=struct.unpack("<I", fw.v[0x1004:0x1008])[0]) != (challenge+1) & 0xffffffff:
         if time.monotonic() >= deadline: raise TimeoutError(f"META mailbox {challenge=:08x} {reply=:08x}")
       print(f"{challenge:08x} -> {reply:08x}")
+    ids = list(struct.unpack("<2Q", fw.v[0x1008:0x1018]))
+    if ids != fw.dev.core_ids: raise RuntimeError(f"META core IDs {ids!r} differ from the PCIe register reads {fw.dev.core_ids!r}")
+    print("GPU core IDs", *(hex(i) for i in ids))
