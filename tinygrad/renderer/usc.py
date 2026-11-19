@@ -31,7 +31,27 @@ def _delay_loads(ins:list[Instruction]) -> list[Instruction]:
   remap = {v:i for i,v in enumerate(order)}
   return [(op, tuple(remap[v] if v >= 0 else v for v in src), imm) for op,src,imm in (ins[i] for i in order)]
 
-def assemble(ins:list[Instruction], *, retry:bool=True) -> tuple[bytes, int]:
+def _rematerialize_ids(ins:list[Instruction]) -> list[Instruction]:
+  # Group and lane IDs stay in hardware for the whole dispatch. Read them again at use instead of holding a temporary.
+  out:list[Instruction] = []
+  remap:dict[int,int] = {}
+  for i,(op,src,imm) in enumerate(ins):
+    if op in ("group", "lane"): continue
+    args = []
+    for v in src:
+      if v >= 0 and ins[v][0] in ("group", "lane"):
+        args.append(len(out))
+        out.append(ins[v])
+      else: args.append(remap[v] if v >= 0 else v)
+    remap[i] = len(out)
+    out.append((op, tuple(args), imm))
+  return out
+
+def assemble(ins:list[Instruction]) -> tuple[bytes, int]:
+  if (ret:=_assemble(ins) or _assemble(_delay_loads(ins)) or _assemble(_rematerialize_ids(ins))) is not None: return ret
+  raise NotImplementedError("S30 USC needs more than 64 live temporaries")
+
+def _assemble(ins:list[Instruction]) -> tuple[bytes, int]|None:
   # An operand defined before a loop and read in its body must survive the back edge.
   last:dict[int,int] = {}
   loops = [(src[0], i) for i,(op,src,_) in enumerate(ins) if op == "back"]
@@ -64,9 +84,7 @@ def assemble(ins:list[Instruction], *, retry:bool=True) -> tuple[bytes, int]:
     operands = tuple(regs[v] if v >= 0 else ~v for v in src)
     for v in expires[i]: free.add(regs.pop(v))
     if op not in ("st", "st8", "st16", "assign", "back", "cndst", "cndend", "lmst", "barrier"):
-      if not free:
-        if retry: return assemble(_delay_loads(ins), retry=False)
-        raise NotImplementedError("S30 USC needs more than 64 live temporaries")
+      if not free: return None
       dst = min(free)
       peak = max(peak, dst+1)
       if i in last:

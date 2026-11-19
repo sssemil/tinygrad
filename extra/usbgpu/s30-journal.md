@@ -379,3 +379,7 @@ PYTHONPATH=. python extra/usbgpu/s30/trace_power.py --hold 0.5
 ```
 
 This run read 13 mA with slot power off, 203 mA with the rail enabled, 192 mA with the bridge PERST control released and 729 mA after normal link training. LTSSM stayed at 0 until training completed at 0x78. The next isolated process built all 10 MNIST shaders from source and classified all 16 digits correctly on five calls. In simulated interrupted and power-fault runs, the command restored normal power after an interruption and turned it off following a reported power fault. Capturing the downstream board's own boot transactions still requires a probe or an independently accessible trace.
+
+## November 20, 2026 — regenerate hardware IDs under register pressure
+
+Joining Q, K and V as an ordinary tensor expression produced a 702-instruction shader for which delaying loads alone still exhausted the register file. The compiler can now retry by reading group and lane IDs directly from hardware again at each use. This brought that kernel within 64 registers. A regression case keeps both IDs alive across 63 independent input values and now assembles. On the physical card, the previously failing graph generated the exact reference tokens on all five calls with vendor code unavailable. The experimental QKV expression took about 5.13 s warm and adds no demonstrated model-level gain over the normal projections. The model continues to use its existing Q, K and V parameters.

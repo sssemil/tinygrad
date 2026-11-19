@@ -3,6 +3,22 @@ from tinygrad.runtime.support.mt.compiler import MTCompiler, MTLLVMCompiler
 from tinygrad.runtime.support.mt.elf import MTKernelImage
 
 class TestMTCompiler(unittest.TestCase):
+  def test_usc_rematerialize_ids(self):
+    from tinygrad.renderer.usc import assemble, Instruction
+    # The store keeps both hardware IDs live across 63 loads. The max pins those loads before the sum.
+    ins:list[Instruction] = [("group", (), 0), ("lane", (), 0), ("st", (0,1), 0)]
+    loads = []
+    for i in range(63):
+      ins.extend([("imm", (), 4+i), ("ld", (len(ins),), 2)])
+      loads.append(len(ins)-1)
+    acc = len(ins)
+    ins.append(("fmax", (loads[0], loads[0]), 0))
+    for v in loads[1:]:
+      ins.append(("fadd", (acc,v), 0))
+      acc = len(ins)-1
+    ins.extend([("st", (0,acc), 0), ("st", (1,acc), 0)])
+    self.assertLessEqual(assemble(ins)[1], 64)
+
   def test_default_renderer(self):
     from tinygrad.device import select_renderer
     from tinygrad.helpers import Target
