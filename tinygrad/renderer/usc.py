@@ -46,7 +46,7 @@ def assemble(ins:list[Instruction]) -> tuple[bytes, int]:
     if op in ("imm", "half_to_float") and i not in last: continue
     operands = tuple(regs[v] if v >= 0 else ~v for v in src)
     for v in expires[i]: free.add(regs.pop(v))
-    if op not in ("st", "st8", "st16", "assign", "back"):
+    if op not in ("st", "st8", "st16", "assign", "back", "cndst", "cndend"):
       if not free: raise NotImplementedError("S30 USC needs more than 64 live temporaries")
       dst = min(free)
       peak = max(peak, dst+1)
@@ -63,6 +63,7 @@ def assemble(ins:list[Instruction]) -> tuple[bytes, int]:
 
     # The USC scatters register-number bits across instruction words. Each base word selects scalar 32-bit operands.
     if op == "group": word, wait, signal = 0xc00b804a | _field(imm,(18,22)) | _field(dst,(9,10,23,24,47,56)), (20,29), 11  # mov rD, lmN
+    elif op in ("cndst", "cndend"): word, wait, signal = 0x8001105e if op == "cndst" else 0x8000109e, (9,11), 8
     elif op == "lane": word, wait, signal = 0x804008000482880f | imm<<14 | _field(dst,(4,16,24,33,42,45)), (55,56), 41  # mov rD, arN
     elif op in ("mov", "range", "assign"):
       dest, a = operands if op == "assign" else (dst, operands[0])
@@ -301,8 +302,11 @@ class MTUSCRenderer(Renderer):
       regs[u] = r
       return r
 
+    gate:UOp|None = None
     for u in uops:
-      if u.op is Ops.RANGE:
+      if u.op is Ops.IF: gate = u.src[0]
+      elif u.op is Ops.ENDIF: gate = None
+      elif u.op is Ops.RANGE:
         if u.src[0].vmin < 1 or u.src[0].vmax >= 1<<31: raise NotImplementedError("S30 USC requires a positive loop bound")
         regs[u] = emit("range", literal(0))
       elif u.op is Ops.END:
@@ -323,7 +327,9 @@ class MTUSCRenderer(Renderer):
           key = (buf, int(index.vmin))
           if key not in slots: slots[key] = emit("slot")
           if len(u.src) == 3: raise NotImplementedError("S30 USC masked register load")
-          if u.op is Ops.STORE: emit("assign", slots[key], reg(u.src[1]))
+          if u.op is Ops.STORE:
+            value = reg(u.src[1])
+            emit("assign", slots[key], value if gate is None else select(reg(gate), value, slots[key]))
           else: regs[u] = emit("mov", slots[key])
           continue
         if buf not in ptrs: raise NotImplementedError("S30 USC needs a global buffer or a fixed register index")
@@ -336,7 +342,12 @@ class MTUSCRenderer(Renderer):
           regs[u] = narrow(emit("ld"+suffix, addr, imm=ptrs[buf]), u.dtype)
           if len(u.src) == 3: regs[u] = select(reg(u.src[2]), regs[u], reg(u.src[1]))
         if u.op is Ops.LOAD and u.dtype == dtypes.bool: regs[u] = emit("and", regs[u], literal(1))
-        if u.op is Ops.STORE: emit("st"+suffix, offsets[offset], reg(u.src[1]), imm=ptrs[buf])
+        if u.op is Ops.STORE:
+          value = reg(u.src[1])
+          # IF/ENDIF encloses a single store. Compute its operands before disabling lanes.
+          if gate is not None: emit("cndst", emit("ilt", literal(0), reg(gate)))
+          emit("st"+suffix, offsets[offset], value, imm=ptrs[buf])
+          if gate is not None: emit("cndend")
       # Respect the scheduler's placement of invariant address arithmetic before nested reductions.
       elif has_loop and u not in products and u.op in (Ops.SPECIAL, Ops.TRUNCDIV, Ops.TRUNCMOD, *self.code_for_op): reg(u)
       elif u.op not in (Ops.PARAM, Ops.BUFFER, Ops.CONST, Ops.CAST, Ops.INDEX, Ops.SPECIAL, Ops.CMPEQ, Ops.CMPLT, Ops.WHERE,

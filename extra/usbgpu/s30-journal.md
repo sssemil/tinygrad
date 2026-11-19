@@ -174,3 +174,7 @@ All fifteen outputs matched MUSA. The medians of the three warm calls were 35.63
 ## November 20, 2026 — reuse one direct ring on both cores
 
 Direct initialization now sets the ring address and queue-control address once per core. Each launch updates the parameter block, both read positions and the dispatch words with one USB write while holding the device lock. The PDS and USC programs remain private to each kernel. Reusing the ring saved four register writes per launch. For two alternating three-element kernels, five batches of 200 dispatches measured 560 μs per launch warm, down from 869 μs. Output readback checked both results after every batch. All 22 tests passed on the vendor reference, including the native tests, and all twelve applicable direct tests passed with the vendor paths absent.
+
+## November 20, 2026 — native guarded stores
+
+The renderer emits conditional-start and conditional-end instructions around a store. Address and value calculations run before the lane mask changes. A hardware test wrote a mix of active and inactive lanes into a buffer with sentinel elements on both ends. All-inactive, all-active and mixed masks matched the expected whole buffer across three workgroups. This allows padded symbolic matrix dimensions to discard stores from the last partial tile.

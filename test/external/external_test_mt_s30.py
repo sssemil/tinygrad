@@ -130,6 +130,22 @@ class TestS30USB(unittest.TestCase):
       out = Tensor.empty(64, device="MT", dtype=dtypes.int).custom_kernel(fxn=kernel)[0]
       self.assertEqual(out.tolist(), [x+32*y+1024*z for z in range(2) for y in range(4) for x in range(8)])
 
+  def test_native_gated_store(self):
+    import numpy as np
+    from tinygrad.uop.ops import KernelInfo, UOp
+    def kernel(out, flags):
+      i = UOp.special(3, "gidx0")*64+UOp.special(64, "lidx0")
+      return out[(i+2).valid(flags[i]>0)].store(i.cast(dtypes.int)+91).sink(arg=KernelInfo(name="s30_gated_store", opts_to_apply=()))
+    rng = np.random.default_rng(30)
+    with Context(DEV="MT:USC", CACHELEVEL=0):
+      for gate in (np.zeros(192, np.int32), np.ones(192, np.int32), rng.integers(0, 2, 192, dtype=np.int32)):
+        original = rng.integers(-500, 500, 196, dtype=np.int32)
+        dest, flags = (Tensor(v, device="MT").realize() for v in (original, gate))
+        expected = original.copy()
+        active = np.flatnonzero(gate)
+        expected[active+2] = active+91
+        np.testing.assert_array_equal(dest.custom_kernel(flags, fxn=kernel)[0].numpy(), expected)
+
   def test_native_projection(self):
     import numpy as np
     rng = np.random.default_rng(30)
