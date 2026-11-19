@@ -208,3 +208,25 @@ The low-level store test now assembles its USC program and builds its PDS launch
 ## November 20, 2026 — native S30 default
 
 Plain `DEV=MT` on the S30 now selects USC and opens the card without management IPC. With calls to both vendor compilers, the vendor compute boot path and the management mailbox set to raise, the trained MNIST checkpoint returned all 16 reference classes in five runs. Median warm latency was 32.36 ms. An offline selection test also checked the S80's MUSA default and an explicit S30 MUSA request. The normal native MNIST training launcher completed three batch-size-two Adam updates in a separate process.
+
+## November 20, 2026 — reproduce the installed Chestnut bridge firmware
+
+The bridge identified itself as `custom ed4e39b7-CLEAN`. A clean checkout of the public bridge firmware at `ed4e39b7e0794e19ba193477067c48757a5cf9ef` built with Ubuntu's SDCC `4.2.0+dfsg-1` produced exactly the 9,207 bytes installed at offset 0x100 in this bridge's SPI flash. The wrapped image SHA-256 was `9520fde0bf43d499c07abd0a09b74e94d8a7cc3d610f577b7a4e218ab8a378e9`. Builds from the same source with SDCC 4.4, 4.5 and 4.6 differed. Only the handmade C source, assembly startup and open toolchain were used to produce the matching image. [Bridge source and build rules at the verified commit](https://github.com/tinygrad/asm2464pd-firmware/tree/ed4e39b7e0794e19ba193477067c48757a5cf9ef/handmade)
+
+To reproduce, check out the commit in a clean source tree at `$BRIDGE_SRC`, select SDCC 4.2.0 and run `make -C "$BRIDGE_SRC/handmade" wrapped`. From the tinygrad checkout, the comparison below uses the bridge's existing SPI setup and sends only the flash read opcode. It acquires tinygrad's normal S30 device lock. The comparison covers the executable image and its length, checksum and CRC wrapper.
+
+```sh
+DEV=MT:USC CACHELEVEL=0 PYTHONPATH=".:$BRIDGE_SRC/handmade" python - "$BRIDGE_SRC/handmade/build/firmware_wrapped.bin" <<'PY'
+import hashlib, sys
+from pathlib import Path
+from tinygrad import Device
+from e4_flash import flash_read
+built = Path(sys.argv[1]).read_bytes()
+handle = Device["MT"].mt.pci_dev.usb.usb.handle
+installed = flash_read(handle, 0x100, len(built))
+assert installed == built, "bridge image differs from source build"
+print(len(installed), hashlib.sha256(installed).hexdigest())
+PY
+```
+
+This verifies the installed USB bridge application. The downstream S30's expansion ROM BAR read 0x2 with its enable bit clear after attach. That register reports the host mapping state. Establishing what the GPU board controller needs for power, clocks and DDR before PCIe enumeration still requires independent evidence.
