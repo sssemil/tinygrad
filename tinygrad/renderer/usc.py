@@ -59,7 +59,7 @@ def assemble(ins:list[Instruction]) -> tuple[bytes, int]:
 
     # The USC scatters register-number bits across instruction words. Each base word selects scalar 32-bit operands.
     if op == "group": word, wait, signal = 0xc00b804a | _field(imm,(18,22)) | _field(dst,(9,10,23,24,47,56)), (20,29), 11  # mov rD, lmN
-    elif op == "lane": word, wait, signal = 0x804008000482880f | _field(dst,(4,16,24,33,42,45)), (55,56), 41  # mov rD, ar0
+    elif op == "lane": word, wait, signal = 0x804008000482880f | imm<<14 | _field(dst,(4,16,24,33,42,45)), (55,56), 41  # mov rD, arN
     elif op in ("mov", "range", "assign"):
       dest, a = operands if op == "assign" else (dst, operands[0])
       word, wait, signal = 0xc00b80ca | _field(dest,(9,10,23,24,47,56)) | _field(a,(18,22,21,25,39,50)), (20,29), 11
@@ -145,7 +145,7 @@ class MTUSCRenderer(Renderer):
   compiler = USCCompiler()
   supports_float4 = has_shared = False
   shared_max = 0
-  global_max, local_max = (0x7fffffff,65535,65535), (1024,)
+  global_max, local_max = (0x7fffffff,65535,65535), (1024,1024,64)
   code_for_op = dict.fromkeys((Ops.ADD, Ops.SHL, Ops.SHR, Ops.MUL, Ops.SQRT, Ops.RECIP, Ops.EXP2, Ops.LOG2, Ops.MAX), lambda: None)
   def __init__(self, target:Target):
     if target.arch != "mp_10": raise RuntimeError("USC requires the S30")
@@ -222,6 +222,9 @@ class MTUSCRenderer(Renderer):
         raise NotImplementedError(f"S30 USC scalar {u.op} {u.dtype}")
       if u.op is Ops.SPECIAL and u.arg in ("gidx0", "gidx1", "gidx2"): r = emit("group", imm=int(u.arg[-1]))
       elif u.op is Ops.SPECIAL and u.arg == "lidx0": r = emit("lane")
+      elif u.op is Ops.SPECIAL and u.arg in ("lidx1", "lidx2"):
+        yz = emit("lane", imm=1)
+        r = emit("and", yz, literal(0xffff)) if u.arg == "lidx1" else emit("lsr", yz, literal(16))
       elif u.op is Ops.AFTER: r = reg(u.src[0])
       elif u.op is Ops.PARAM and u.addrspace is AddrSpace.ALU: r = emit("imm", imm=ptrs[u])
       elif u.op is Ops.CONST or (u.op is Ops.CAST and u.src[0].op is Ops.CONST):

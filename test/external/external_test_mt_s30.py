@@ -120,6 +120,16 @@ class TestS30USB(unittest.TestCase):
         expected += np.maximum(data-threshold, 0.)
       np.testing.assert_allclose(y.numpy(), expected, rtol=1e-5, atol=1e-5)
 
+  def test_native_workgroup_coordinates(self):
+    from tinygrad.uop.ops import KernelInfo, UOp
+    def kernel(out):
+      x,y,z = (UOp.special(n, f"lidx{i}") for i,n in enumerate((8,4,2)))
+      return out.flatten().index(x+8*y+32*z).store(x.cast(dtypes.int)+y.cast(dtypes.int)*32+z.cast(dtypes.int)*1024).sink(
+        arg=KernelInfo(name="s30_local_ids", opts_to_apply=()))
+    with Context(DEV="MT:USC", CACHELEVEL=0):
+      out = Tensor.empty(64, device="MT", dtype=dtypes.int).custom_kernel(fxn=kernel)[0]
+      self.assertEqual(out.tolist(), [x+32*y+1024*z for z in range(2) for y in range(4) for x in range(8)])
+
   def test_native_projection(self):
     import numpy as np
     rng = np.random.default_rng(30)
