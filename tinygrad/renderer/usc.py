@@ -217,13 +217,6 @@ class MTUSCRenderer(Renderer):
     def select(cond:int, t:int, f:int) -> int:
       return emit("select", emit("ilt", literal(0), cond), t, f)
     slots:dict[tuple[UOp,int],int] = {}
-    def scale(src:int, n:int) -> int:
-      if n <= 0: raise NotImplementedError("S30 USC needs a positive integer scale")
-      acc = src
-      for bit in bin(n)[3:]:
-        acc = emit("iadd", acc, acc)
-        if bit == '1': acc = emit("iadd", acc, src)
-      return acc
     quot_rem:dict[tuple[UOp,UOp],tuple[int,int]] = {}
     def divide(n:UOp, d:UOp) -> tuple[int,int]:
       if (n,d) in quot_rem: return quot_rem[n,d]
@@ -355,7 +348,8 @@ class MTUSCRenderer(Renderer):
         else:
           if buf not in ptrs: raise NotImplementedError("S30 USC needs a global, local or fixed register index")
           offset = (index, buf.dtype.itemsize)
-          if offset not in offsets: offsets[offset] = scale(reg(index), buf.dtype.itemsize)
+          if offset not in offsets:
+            offsets[offset] = reg(index) if buf.dtype.itemsize == 1 else emit("imul", reg(index), literal(buf.dtype.itemsize))
           addr, start = offsets[offset], 0
           suffix = {1:"8", 2:"16", 4:""}[buf.dtype.itemsize]
           load, store, ptr = "ld"+suffix, "st"+suffix, ptrs[buf]
