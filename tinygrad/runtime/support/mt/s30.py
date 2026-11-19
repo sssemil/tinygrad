@@ -147,9 +147,9 @@ class MTS30Firmware(MTFirmwareBoot):
     return self._submit(token, mtfw.MTFW_SUBMISSION_CMD_GPU_NOP, mtfw.MTFW_SUB_REGION_NOP, packet, 160, timeout, signal)
 
   def cdm(self, token:int|None, words:tuple[int,...], timeout:float=5.0, *, regions:int=8) -> MTResponse:
-    # One page holds the submission, context state, two 128-byte queue controls, two 256-byte stacks and the command ring.
-    context, controls, stacks, ring = 0x200, 0x400, 0x500, 0x800
-    ring_size, write_offset = 0x1000-ring, (len(words)+1)*4 + 64  # include the CDM prefetch guard after STREAM_TERMINATE
+    # Upload the submission, both queue controls and the stream together. The context and stacks are GPU scratch.
+    controls, ring, context, stacks = 0x200, 0x300, 0xc00, 0xe00
+    ring_size, write_offset = 0x800, (len(words)+1)*4 + 64  # include the CDM prefetch guard after STREAM_TERMINATE
     if write_offset >= ring_size: raise ValueError("S30 compute stream exceeds its ring")
     base, kick, kick_size = FW_DEVVA+PACKET, 96+16, 0x158
     packet = bytearray(ring+write_offset)

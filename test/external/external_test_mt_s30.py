@@ -65,9 +65,10 @@ class TestS30USB(unittest.TestCase):
         resp = fw.cdm(i+1, ())
         self.assertEqual((resp.value, resp.token), (0, i+1))
         self.assertEqual(bytes(out.as_memoryview()), expected)
-      for i,(off,value) in enumerate(((16, 43), (40, 0x89abcdef))):
+      # Repeat the shared-register load so the second shader store executes near the end of the 2 KiB ring.
+      for i,(off,value,commands) in enumerate(((16, 43, stream), (40, 0x89abcdef, stream[:8]*59 + stream))):
         pds.host[64+14*4:] = struct.pack('<Q8xI', out.meta.va+off, value)
-        resp = fw.cdm(i+4, stream)
+        resp = fw.cdm(i+4, commands)
         self.assertEqual((resp.value, resp.token), (0, i+4))
         struct.pack_into('<I', expected, off, value)
         self.assertEqual(bytes(out.as_memoryview()), expected)
