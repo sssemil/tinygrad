@@ -84,10 +84,10 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
       elif (a:=next((i for i in reversed(k.upcastable_dims()) if k.full_shape[i]%4 == 0), None)) is not None:
         k.apply_opt(Opt(OptOps.SPLIT, a, (4, AxisType.UPCAST)))
     globals_ = [k.rngs[a] for a in k.axes_of(AxisType.GLOBAL, AxisType.WEAK, reduce=False)]
-    width = 128 if spatial else 64 if red is not None and len(globals_) > 1 else 32
+    width = 128 if spatial or tiled else 64 if red is not None and len(globals_) > 1 else 32
     for r in globals_[::-1]:
       if r.src[0].op is not Ops.CONST: continue
-      size = next((n for n in range(min(64, width), 1, -1) if r.src[0].val%n == 0), 1)
+      size = next((n for n in range(min(64, width) if spatial else width, 1, -1) if r.src[0].val%n == 0), 1)
       if size > 1:
         k.apply_opt(Opt(OptOps.SPLIT, k.rngs.index(r), (size, AxisType.LOCAL)))
         width //= size
