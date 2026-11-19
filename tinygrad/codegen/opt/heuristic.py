@@ -55,6 +55,12 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
       if size > 1:
         k.apply_opt(Opt(OptOps.SPLIT, k.rngs.index(r), (size, AxisType.LOCAL)))
         break
+    if axes:=k.upcastable_dims(reduce=True):
+      i = axes[-1]
+      if k.rngs[i].src[0].op is Ops.CONST:
+        n = k.full_shape[i]
+        if 2 <= n <= 5: k.apply_opt(Opt(OptOps.SPLIT, i, (0, AxisType.UPCAST)))
+        elif n%4 == 0: k.apply_opt(Opt(OptOps.SPLIT, i, (4, AxisType.UPCAST)))
     return k
 
   # upcast float4 images, this must be early so we don't accidentally add locals before the upcast

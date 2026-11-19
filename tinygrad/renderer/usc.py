@@ -22,14 +22,14 @@ def assemble(ins:list[Instruction]) -> tuple[bytes, int]:
   for v,i in last.items(): expires[i].append(v)
   regs:dict[int,int] = {}
   labels:dict[int,int] = {}
-  free, peak = set(range(16)), 0
+  free, peak = set(range(32)), 0
   code = bytearray()
   fence:int|None = None
   for i,(op,src,imm) in enumerate(ins):
     operands = tuple(regs[v] for v in src)
     for v in expires[i]: free.add(regs.pop(v))
     if op not in ("st", "st8", "st16", "assign", "back"):
-      if not free: raise NotImplementedError("S30 USC needs more than 16 live temporaries")
+      if not free: raise NotImplementedError("S30 USC needs more than 32 live temporaries")
       dst = min(free)
       peak = max(peak, dst+1)
       if i in last:
@@ -44,59 +44,65 @@ def assemble(ins:list[Instruction]) -> tuple[bytes, int]:
       continue
 
     # The USC scatters register-number bits across instruction words. Each base word selects scalar 32-bit operands.
-    if op == "group": word, wait, signal = 0xc00b804a | _field(imm,(18,22)) | _field(dst,(9,10,23,24)), (20,29), 11  # mov rD, lmN
-    elif op == "lane": word, wait, signal = 0x804008000482880f | _field(dst,(4,16,24,33)), (55,56), 41  # mov rD, ar0
+    if op == "group": word, wait, signal = 0xc00b804a | _field(imm,(18,22)) | _field(dst,(9,10,23,24,47)), (20,29), 11  # mov rD, lmN
+    elif op == "lane": word, wait, signal = 0x804008000482880f | _field(dst,(4,16,24,33,42)), (55,56), 41  # mov rD, ar0
     elif op in ("mov", "range", "assign"):
       dest, a = operands if op == "assign" else (dst, operands[0])
-      word, wait, signal = 0xc00b80ca | _field(dest,(9,10,23,24)) | _field(a,(18,22,21,25)), (20,29), 11
+      word, wait, signal = 0xc00b80ca | _field(dest,(9,10,23,24,47)) | _field(a,(18,22,21,25,39)), (20,29), 11
     elif op == "imul":
       a,b = operands
-      word = 0x840c0a990110200110106c20 | _field(dst,(19,41,53,59)) | _field(a,(6,16,17,36)) | _field(b,(42,61,57,74))
+      word = 0x840c0a990110200110106c20 | _field(dst,(19,41,53,59,70)) | _field(a,(6,16,17,36,48)) | _field(b,(42,61,57,74,69))
       wait, signal = (29,39), 18
     elif op in ("lsr", "asr", "and"):
       a,b = operands
-      word = {"lsr":0xa5b6200149801078, "asr":0x9a20824025b6200149801078, "and":0xa136000041801078}[op] | _field(dst,(8,14,19,33))
-      word |= _field(a,(25,36,44,47)) | _field(b,(13,17,34,29))
+      word = {"lsr":0xa5b6200149801078, "asr":0x9a20824025b6200149801078, "and":0xa136000041801078}[op] | _field(dst,(8,14,19,33,41))
+      word |= _field(a,(25,36,44,47,65)) | _field(b,(13,17,34,29,35))
       wait, signal = (11,18), 10
     elif op in ("sqrt", "recip", "exp2", "log2"):
       word = {"sqrt":0x80000a000200001a, "recip":0x80000a000000001a, "exp2":0x80000a010002001a, "log2":0x80000a010000001a}[op]
-      word |= _field(dst,(7,8,16,20)) | _field(operands[0],(9,13,19,22))
+      word |= _field(dst,(7,8,16,20,30)) | _field(operands[0],(9,13,19,22,33))
       wait, signal = (10,15), 14
     elif op in ("half_to_float", "float_to_half"):
       a, = operands
-      word = (0x804008080082880b | _field(a,(14,21,25,27)) if op == "half_to_float" else 0x8040080804c08687 | _field(a,(6,12,20,19)))
-      word |= _field(dst,(4,16,24,33))
+      word = (0x804008080082880b | _field(a,(14,21,25,27,37)) if op == "half_to_float" else 0x8040080804c08687 | _field(a,(6,12,20,19,29)))
+      word |= _field(dst,(4,16,24,33,42))
       wait, signal = (55,56), 41
     elif op == "select":
       _, t, f = operands
-      word = 0xc04008080480a68b | _field(dst,(4,16,24,33)) | _field(t,(14,21,25,27)) | _field(f,(6,12,20,19))
+      word = 0xc04008080480a68b | _field(dst,(4,16,24,33,42)) | _field(t,(14,21,25,27,37)) | _field(f,(6,12,20,19,29))
       wait, signal = (55,56), 41
     elif op in ("u8tof", "itof", "ftoi"):
       word = {"u8tof":0x80211818400388ca, "itof":0x80010818400388ca, "ftoi":0x80221818400388ca}[op]
-      word |= _field(dst,(9,10,23,24)) | _field(operands[0],(18,22,21,25))
+      word |= _field(dst,(9,10,23,24,47)) | _field(operands[0],(18,22,21,25,39))
       wait, signal = (20,29), None  # conversion waits for its own dfc0
     elif op in ("iadd", "imm", "ilt", "imax", "ieq"):
       a,b = (0,imm) if op == "imm" else operands
       word = {"iadd":0x8190200010904c00, "imm":0x8190200010804c80, "ilt":0x8596240816f07d00,
-              "imax":0x9592200a10b06d00, "ieq":0x8196240816f07d00}[op] | _field(dst,(19,41,53,59))
-      word |= _field(a,(6,16,17,36)) | _field(b,(15,38,37,40,47,54))
+              "imax":0x9592200a10b06d00, "ieq":0x8196240816f07d00}[op] | _field(dst,(19,41,53,59,70))
+      word |= _field(a,(6,16,17,36,48)) | _field(b,(15,38,37,40,47,54))
       wait, signal = (29,39), 18
     elif op in ("fadd", "fmul", "fmax", "feq", "fgt"):
       a,b = operands
       word = {"fadd":0x804008080480a60b, "fmul":0x804008080480868d,
               "fmax":0x804318080482a60b, "feq":0xa04108080482a60b, "fgt":0xa04208080482a60b}[op]
-      word |= _field(dst,(4,16,24,33)) | _field(a,(6,12,20,19))
-      word |= _field(b, (14,21,25,27) if op != "fmul" else (22,32,38,40))
+      word |= _field(dst,(4,16,24,33,42)) | _field(a,(6,12,20,19,29))
+      word |= _field(b, (14,21,25,27,37) if op != "fmul" else (22,32,38,40,50))
       wait, signal = (55,56), 41
     elif op in ("ld", "ld8", "ld16", "st", "st8", "st16"):
-      addr = _field(imm,(45,17,22,30,36)) | _field(operands[0],(20,14,26,27))  # [shared pointer pair + byte offset in rN]
-      if op.startswith("ld"): word, signal = 0xc00004000001858e | addr | _field(dst,(29,35,37,41)), None
-      else: word, signal = 0xc000008000012a4e | addr | _field(operands[1],(25,23,28,32)), 15
+      addr = _field(imm,(45,17,22,30,36)) | _field(operands[0],(20,14,26,27,34))  # [shared pointer pair + byte offset in rN]
+      if op.startswith("ld"): word, signal = 0xc00004000001858e | addr | _field(dst,(29,35,37,41,47)), None
+      else: word, signal = 0xc000008000012a4e | addr | _field(operands[1],(25,23,28,32,38)), 15
       if op.endswith("16"): word ^= 0x0004000000010000
       if op.endswith("8"): word ^= 0x0010000000010000
       wait = (18,19)
     else: raise ValueError(op)
 
+    if op in ("group", "mov", "range", "assign") and word >= 1<<32:
+      word = (word & ~(1<<31)) | 0x80000800<<32  # one-word burst
+    elif op in ("iadd", "imm", "ilt", "imax", "ieq") and word >= 1<<64:
+      word = (word & ~(1<<63)) | 0x840c0a99<<64  # scalar 32-bit integer pipeline
+    elif op in ("and", "lsr") and word >= 1<<64:
+      word = (word & ~(1<<63)) | 0x9a008240<<64
     # Alternate write fences. Each load sets and waits on its data fence (dfc0) within the instruction.
     if fence is not None: word |= 1<<wait[fence]
     fence = None if signal is None else int(fence == 0)
@@ -233,6 +239,8 @@ class MTUSCRenderer(Renderer):
           if len(u.src) == 3: regs[u] = select(reg(u.src[2]), regs[u], reg(u.src[1]))
         if u.op is Ops.LOAD and u.dtype == dtypes.bool: regs[u] = emit("and", regs[u], literal(1))
         if u.op is Ops.STORE: emit("st"+suffix, offsets[offset], reg(u.src[1]), imm=ptrs[buf])
+      # Respect the scheduler's placement of invariant address arithmetic before nested reductions.
+      elif u.op in (Ops.SPECIAL, Ops.TRUNCDIV, Ops.TRUNCMOD, *self.code_for_op): reg(u)
       elif u.op not in (Ops.PARAM, Ops.BUFFER, Ops.CONST, Ops.CAST, Ops.INDEX, Ops.SPECIAL, Ops.CMPEQ, Ops.CMPLT, Ops.WHERE,
                         Ops.AND, Ops.OR, Ops.BITCAST, Ops.TRUNCDIV, Ops.TRUNCMOD, *self.code_for_op, Ops.STACK, Ops.AFTER, Ops.SINK):
         raise NotImplementedError(f"S30 USC cannot lower {u.op}")
