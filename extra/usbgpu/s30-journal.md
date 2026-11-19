@@ -211,12 +211,13 @@ Plain `DEV=MT` on the S30 now selects USC and opens the card without management 
 
 ## November 20, 2026 — reproduce the installed Chestnut bridge firmware
 
-The bridge identified itself as `custom ed4e39b7-CLEAN`. A clean checkout of the public bridge firmware at `ed4e39b7e0794e19ba193477067c48757a5cf9ef` built with Ubuntu's SDCC `4.2.0+dfsg-1` produced exactly the 9,207 bytes installed at offset 0x100 in this bridge's SPI flash. The wrapped image SHA-256 was `9520fde0bf43d499c07abd0a09b74e94d8a7cc3d610f577b7a4e218ab8a378e9`. Builds from the same source with SDCC 4.4, 4.5 and 4.6 differed. Only the handmade C source, assembly startup and open toolchain were used to produce the matching image. [Bridge source and build rules at the verified commit](https://github.com/tinygrad/asm2464pd-firmware/tree/ed4e39b7e0794e19ba193477067c48757a5cf9ef/handmade)
+The bridge identified itself as `custom ed4e39b7-CLEAN`. A clean checkout of the public bridge firmware at `ed4e39b7e0794e19ba193477067c48757a5cf9ef` built with Ubuntu's SDCC `4.2.0+dfsg-1` produced exactly the 9,207 bytes installed at offset 0x100 in this bridge's SPI flash. The wrapped image SHA-256 was `9520fde0bf43d499c07abd0a09b74e94d8a7cc3d610f577b7a4e218ab8a378e9`. Builds from the same source with SDCC 4.4, 4.5 and 4.6 differed. The normal SDCC link used seven objects from its packaged open-source 8051 runtime. The source-only build below replaces them all. [Bridge source and build rules at the verified commit](https://github.com/tinygrad/asm2464pd-firmware/tree/ed4e39b7e0794e19ba193477067c48757a5cf9ef/handmade)
 
-To reproduce, check out the commit in a clean source tree at `$BRIDGE_SRC`, select SDCC 4.2.0 and run `make -C "$BRIDGE_SRC/handmade" wrapped`. From the tinygrad checkout, the comparison below uses the bridge's existing SPI setup and sends only the flash read opcode. It acquires tinygrad's normal S30 device lock. The comparison covers the executable image and its length, checksum and CRC wrapper.
+From the tinygrad checkout, use SDCC 4.2.0 with its runtime sources installed. The build script extracts the pinned bridge revision from the source repository and compiles each target object. The comparison uses the bridge's existing SPI setup and sends only the flash read opcode. It acquires tinygrad's normal S30 device lock. The comparison covers the executable image and its length, checksum and CRC wrapper.
 
 ```sh
-DEV=MT:USC CACHELEVEL=0 PYTHONPATH=".:$BRIDGE_SRC/handmade" python - "$BRIDGE_SRC/handmade/build/firmware_wrapped.bin" <<'PY'
+extra/usbgpu/s30/build_chestnut.sh "$BRIDGE_SRC" /usr/share/sdcc/lib/src /tmp/chestnut-from-source.bin
+DEV=MT:USC CACHELEVEL=0 PYTHONPATH=".:$BRIDGE_SRC/handmade" python - /tmp/chestnut-from-source.bin <<'PY'
 import hashlib, sys
 from pathlib import Path
 from tinygrad import Device
@@ -290,3 +291,9 @@ The native renderer now multiplies an element index by its byte width with one i
 For a 32×896 input times 4,864 projection rows, storing the weights with adjacent output channels contiguous reduced the warm product from 35.32 to 23.33 ms. The 32×4,864 input times 896 rows improved from 35.54 to 23.02 ms. Fourteen layouts per shape were tested with random FP16 weights and FP32 activations. Every output element matched NumPy. Splitting the format into eight-row tiles slowed the first projection to 172 ms. For single-token decoding the full transpose changed those two products from 1.69 to 2.08 ms and 2.04 to 1.98 ms respectively.
 
 The native GGUF loader now materializes eligible linear block weights once in this layout. The logical tensor shape and values are preserved. The output vocabulary projection and tied token embedding keep their original storage. Five isolated full Qwen calls verified 75 unique source-generated shaders and the same eight output IDs as MUSA each time. Warm latency fell from 8.129 s with the address optimization alone to 6.801 s. Model setup took 8.006 s and time to first output was 18.514 s. The table at the top uses the isolated timings for the current branch.
+
+## November 20, 2026 — build every bridge target object from source
+
+SDCC's link map identified five C runtime helpers for arithmetic, generic pointer stores and startup, plus two assembly startup objects. A fresh offline build compiled the five C files, assembled the two assembly files and linked them explicitly with the bridge's C and assembly objects using `--nostdlib`. The build directory started empty and the isolated toolchain contained only the host executables and headers. The eight-character source revision and clean flag reproduce the version string embedded by the upstream Makefile.
+
+All 9,207 bytes, including the wrapper, matched a new read from this Chestnut's SPI flash at offset 0x100. A subsequent native GPU calculation returned [12, 14]. The build script above reproduces this check's input without a packaged target library or prebuilt firmware image. The comparison covers the bridge application. Startup inside the bridge silicon and the S30 board's first-stage firmware remain outside that byte comparison.
