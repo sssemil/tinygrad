@@ -84,6 +84,19 @@ class TestS30USB(unittest.TestCase):
         self.assertEqual(bytes(a.as_memoryview()), left)
         self.assertEqual(bytes(b.as_memoryview()), right)
 
+  def test_native_staged_upload(self):
+    from tinygrad.runtime.support.usb import HALF, SLOT
+    rng = random.Random(31)
+    with Context(DEV="MT:USC", CACHELEVEL=0):
+      buf = Buffer("MT", HALF*2+256, initial_value=bytes(HALF*2+256))
+      expected = bytearray(buf.nbytes)
+      for offset, n in ((4, SLOT-1), (128, SLOT), (128, HALF), (4, HALF+3), (4, HALF*2+127), (5, SLOT+1)):
+        with self.subTest(offset=offset, n=n):
+          data = rng.randbytes(n)
+          buf.host.view(offset-1)[1:1+n] = data
+          expected[offset:offset+n] = data
+          self.assertEqual(bytes(buf.as_memoryview()), expected)
+
   def test_tensor_copy(self):
     original = [13, 21, 34, 55]
     resident = Tensor(original, device="CPU", dtype=dtypes.int32).to("MT").realize()

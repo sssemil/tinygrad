@@ -250,3 +250,11 @@ These images target the host CPU's UEFI environment. The native Chestnut driver 
 Full prompt chunks on the S30 now have their actual length at compile time. This lets the renderer tile the prompt matrix dimensions. A separate JIT handles the variable final chunk. Changing chunk size recreates the appropriate captures. Sixteen LLM server tests passed, including a new test that switches between four- and eight-token chunks with a partial tail and compares generated tokens.
 
 On the physical S30, five native and five MUSA runs returned the same eight tokens. The native warm median improved from 10.622 s to 8.471 s. Applying the same optimization to MUSA improved its warm median from 9.622 s to 4.811 s. The updated proprietary reference took 143.941 s for setup and 172.244 s to first output. Each timed call starts with the same prompt and clears the prefix cache.
+
+## November 20, 2026 — upload weights through Chestnut SRAM
+
+A GPU load from Sudi physical address bit 39 can reach Chestnut's PCIe SRAM. The native allocator reserves that SRAM, maps its upper 256 KiB read-only into the GPU and submits a tinygrad copy kernel. Each group of 32 lanes copies 128 bytes. The bridge's normal command traffic uses the lower half. Short writes and final partial groups use the original PCIe path. The copy kernel itself is generated from UOps at first use. This path is enabled on the tested custom bridge firmware.
+
+In four alternating-payload trials per method on one card, uploading 2 MiB took a median 548.0 ms with the existing direct BAR write and 9.39 ms with the staged copy, from 3.83 to 223.32 MB/s. Every byte matched an independent BAR readback. The first staged transfer took 73 ms including kernel setup. Hardware regression cases covered guard bytes, unaligned nested views, the 16 KiB threshold and writes spanning two SRAM windows plus a tail. An initial experiment with a reverse copy timed out waiting for USB bulk IN. Ordinary VRAM reads still use the BAR.
+
+The isolated native Whisper setup fell from 22 s to 2.94 s. Qwen setup fell from 142 s to about seven seconds. The normal S30 hardware suite passed all 25 tests with vendor tools available and all 15 applicable tests with vendor paths absent.

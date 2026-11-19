@@ -1,5 +1,5 @@
 from __future__ import annotations
-import dataclasses, os, pathlib, re, subprocess, tempfile, hashlib
+import dataclasses, os, pathlib, re, subprocess, tempfile, hashlib, functools
 from typing import Any
 from tinygrad.device import Compiled, Program, Allocator, BufferStorage, BufferSpec, Buffer
 from tinygrad.renderer import Compiler, TinyELF
@@ -8,9 +8,10 @@ from tinygrad.renderer.usc import MTUSCRenderer
 from tinygrad.renderer.llvmir import LLVMRenderer, base_rewrite, ldt, llvm_intrinsics
 from tinygrad.dtype import dtypes, AddrSpace
 from tinygrad.helpers import round_up, diskcache_get, diskcache_put, DEV, Target, unwrap
-from tinygrad.uop.ops import Ops, PatternMatcher, UOp, UPat
+from tinygrad.uop.ops import KernelInfo, Ops, PatternMatcher, UOp, UPat
 from tinygrad.runtime.support.memory import TLSFAllocator
-from tinygrad.runtime.support.mt.mmu import MT_PTE_READ_WRITE
+from tinygrad.runtime.support.usb import USBMMIOInterface, HALF, SLOT
+from tinygrad.runtime.support.mt.mmu import MT_PTE_READ_ONLY, MT_PTE_READ_WRITE
 from tinygrad.runtime.support.mt.mtdev import MTDev
 from tinygrad.runtime.support.mt.launch import MTLaunch, parse_mt_bundle, compress_mt_bundle, decompress_mt_bundle
 from tinygrad.runtime.support.mt.compiler import MTCompiler, MTLLVMCompiler
@@ -141,6 +142,34 @@ class MTBufferMeta:
   pa: int
   size: int
 
+S30_STAGE_VA = 0x7000000000
+
+class S30VRAMView(USBMMIOInterface):
+  def __init__(self, view:USBMMIOInterface, dev:MTDevice, va:int):
+    super().__init__(view.usb, view.addr, view.nbytes, view.fmt)
+    self.dev, self.va = dev, va
+
+  def view(self, offset:int=0, size:int|None=None, fmt=None):
+    return S30VRAMView(super().view(offset, size, fmt), self.dev, self.va+offset)
+
+  def __setitem__(self, index, data):
+    offset, _ = self._off_from_index(index)
+    if (self.fmt == 'B' and isinstance(index, slice) and isinstance(data, (bytes, bytearray, memoryview)) and
+        SLOT <= memoryview(data).nbytes <= self.nbytes-offset and offset >= 0 and
+        (self.va+offset)%4 == 0 and self.dev.renderer.target.renderer == "USC"):
+      src = bytes(data)  # a USB read can alias the buffer used by the next transfer
+      n = len(src)//128*128
+      # The upper SRAM half survives the bridge's ordinary F0 traffic for command packets and page tables.
+      with self.dev.s30_fw.lock:
+        copy = self.dev.s30_upload
+        for off in range(0, n, HALF):
+          chunk = src[off:min(off+HALF, n)]
+          self.usb.scsi_write(chunk, slot_start=HALF//SLOT)
+          copy(self.va+offset+off, S30_STAGE_VA, global_size=(len(chunk)//128,1,1), local_size=(32,1,1))
+        if n < len(src): super().__setitem__(slice(offset+n, offset+len(src)), src[n:])
+      return
+    super().__setitem__(index, data)
+
 class MTAllocator(Allocator['MTDevice']):
   def __init__(self, dev):
     super().__init__(dev)
@@ -153,6 +182,8 @@ class MTAllocator(Allocator['MTDevice']):
     try:
       view = self.dev.mt.pci_dev.map_bar(2, off=pa, size=size, fmt='B')
       self.dev.map_buffer(va, pa, size)
+      if self.dev.mt.s30 and size >= SLOT and isinstance(view, USBMMIOInterface) and view.usb.usb.product.startswith("custom"):
+        view = S30VRAMView(view, self.dev, va)
     except Exception:
       self.vram.free(pa)
       raise
@@ -248,6 +279,18 @@ class MTDevice(Compiled):
 
   @property
   def has_copy_queue(self) -> bool: return False
+
+  @functools.cached_property
+  def s30_upload(self) -> MTS30Program:
+    from tinygrad.codegen import to_program
+    dst, src = (UOp.placeholder((HALF//4,), dtypes.uint, slot=i) for i in range(2))
+    idx = UOp.special(HALF//128, "gidx0")*32+UOp.special(32, "lidx0")
+    copy = dst[idx].store(src[idx]).sink(arg=KernelInfo(name="s30_upload", optimized=True))
+    program = MTS30Program(self, TinyELF.from_program(to_program(copy, self.renderer)), {})
+    # Sudi physical address bit 39 selects outbound PCIe. Reserve the bridge SRAM and map its upper half.
+    _, (pa,) = self.mt.pci_dev.alloc_sysmem(2*HALF)
+    self.s30_fw.mmu.map_range(S30_STAGE_VA, (1<<39) | (pa+HALF), HALF, MT_PTE_READ_ONLY)
+    return program
 
   def get_launch(self, obj:TinyELF, global_size:tuple[int,int,int]=(1,1,1), local_size:tuple[int,int,int]=(1,1,1)) -> MTLaunch:
     if os.environ.get('MT_GENERATE','1') == '0':
