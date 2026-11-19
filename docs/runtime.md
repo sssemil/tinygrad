@@ -37,7 +37,13 @@ extra/usbgpu/s30/bench_isolated.sh qwen /path/to/Qwen2.5-0.5B-Instruct-Q8_0.gguf
 
 For the vendor reference, select `DEV=MT:MUSA`. Point `MUSA_PATH` at the MUSA 4.3.0 toolkit containing `bin/mcc`. Both that renderer and `DEV=MT:LLVM`, which uses the toolkit's MTGPU `bin/clang-14`, load `mtfw-gen1.bin` from the `mtgpu-s30` 3.1.0-6 package. Set `MT_FIRMWARE` if the file is outside `/lib/firmware/mthreads`. [Hardware measurements and bring-up journal](../extra/usbgpu/s30-journal.md)
 
-Run the MNIST training and evaluation demo from the checkout.
+For a short native training check, run three Adam updates on the S30. The ten-step evaluation interval in this example exceeds the length of the check.
+
+```sh
+DEV=MT:USC CACHELEVEL=0 PYTHONPATH=. BS=2 STEPS=3 python3 examples/beautiful_mnist.py
+```
+
+Run the full MNIST training and evaluation demo on the vendor reference from the checkout.
 
 ```sh
 DEV=MT:MUSA MUSA_PATH=/path/to/musa MT_FIRMWARE=/path/to/mtfw-gen1.bin \
