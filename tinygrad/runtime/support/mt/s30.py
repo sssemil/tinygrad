@@ -102,9 +102,8 @@ class MTS30Firmware(MTFirmwareBoot):
       if struct.unpack('<II', ack) != (domain, 0): raise RuntimeError(f"S30 GPU reset failed for domain {domain}")
 
   @contextmanager
-  def boot(self, timeout:float=5.0) -> Iterator[MTS30Firmware]:
+  def _boot(self, image:bytes|bytearray, *, master:bool=True) -> Iterator[None]:
     if self.queue is not None: raise RuntimeError("S30 firmware is already running")
-    image = self.image
     timers = (0x400008, 0x40000c)  # Sudi GPU subsystem SOC and USC timer enables
     saved = [self.dev.smc._r32(reg) for reg in timers]
     try:
@@ -114,21 +113,28 @@ class MTS30Firmware(MTFirmwareBoot):
       self.v[:len(image)] = image
       self.upload_mmu(full=True)
       self._setup_mmu()
+      if not master: self._write(0xbf8, 0, 4)  # host starts META through its control port
       time.sleep(3e-6)
       self._write(0x100, 0)
       self._read(0x100)
-      self._wait_started(FWIF, timeout)
-      self.queue = MTCCB(self.dev, self.v, ITEM, QUEUES + 3 * mtfw.MTFW_CCB_QUEUE.SIZE, batch_responses=True)
-      yield self
+      yield
     finally:
       try:
-        with self.lock:
-          queue, self.queue = self.queue, None
-          if queue is not None and queue.wr_idx != queue.response_rd: self._reset_domains()
         self._write(0x100, 0x2000000000)  # hold META in reset before releasing its memory
         self._read(0x100)
       finally:
         for reg,old in zip(timers, saved): self.dev.smc._w32(reg, old)
+
+  @contextmanager
+  def boot(self, timeout:float=5.0) -> Iterator[MTS30Firmware]:
+    with self._boot(self.image):
+      self._wait_started(FWIF, timeout)
+      self.queue = MTCCB(self.dev, self.v, ITEM, QUEUES + 3 * mtfw.MTFW_CCB_QUEUE.SIZE, batch_responses=True)
+      try: yield self
+      finally:
+        with self.lock:
+          queue, self.queue = self.queue, None
+          if queue is not None and queue.wr_idx != queue.response_rd: self._reset_domains()
 
   def submit(self, token:int|None, command:int, size:int, data:bytearray, timeout:float, signal:tuple[int,int]|None=None,
              resident:Buffer|None=None, offset:int=0) -> MTResponse:
