@@ -229,12 +229,12 @@ def s30_cdm_packet(words:tuple[int,...], regions:int, addr:int, controls:int=0x2
   struct.pack_into('<5Q', packet, kick+0x118, scratch+0xc00, addr+ring, addr+controls, CDM_RING_SIZE, scratch+0xe00)
   return packet
 
-def s30_shader(obj:TinyELF) -> tuple[bytes, bytearray, int, int, list[tuple[int,str]]]:
+def s30_shader(obj:TinyELF) -> tuple[bytes, bytearray, int, int, int, list[tuple[int,str]]]:
   if obj.target.renderer == "USC":
-    ntemps, nconst = struct.unpack_from('<II', obj.lib)
+    ntemps, local_words, nconst = struct.unpack_from('<HHI', obj.lib)
     native_args = [(8*i, '<i' if space is AddrSpace.ALU else '<Q') for i,(_,space,_,_) in enumerate(obj.signature)]
     off = 8+4*nconst
-    return obj.lib[off:], bytearray(8*len(native_args))+obj.lib[8:off], ceildiv(ntemps, 2), 1, native_args
+    return obj.lib[off:], bytearray(8*len(native_args))+obj.lib[8:off], ceildiv(ntemps, 2), 1, local_words, native_args
   image = MTKernelImage.from_elf(obj.lib)
   k = image.metadata.kernel
   if k['.arch_id'] != 110 or k['.private_memory_size'] or k['.coef_reg_count'] or k['.const_calc_kernel'] or k['.has_barrier']:
@@ -251,9 +251,9 @@ def s30_shader(obj:TinyELF) -> tuple[bytes, bytearray, int, int, list[tuple[int,
     if space is not AddrSpace.ALU: dt = dtypes.uint64
     if param['.reg_bank'] != 3 or param['.size'] != dt.itemsize: raise NotImplementedError("Unsupported S30 kernel argument layout")
     args.append((4*param['.offset'], '<'+unwrap(dt.fmt)))
-  return image.text, params, temps, attrs, args
+  return image.text, params, temps, attrs, 0, args
 
-def s30_pds(params:int, shared:int, usc:int, temps:int) -> bytearray:
+def s30_pds(params:int, shared:int, usc:int, temps:int, local:bool=False) -> bytearray:
   # DOUT encodes a 64-bit source pair, a 32-bit control word and a destination (DMA, register write, USC).
   def dout(dest:int, pair:int, ctrl:int=0, *, end:bool=False, pred:bool=False) -> int:
     return 0xf<<28 | pred<<27 | end<<26 | ctrl<<11 | pair<<3 | dest
@@ -269,14 +269,18 @@ def s30_pds(params:int, shared:int, usc:int, temps:int) -> bytearray:
   branch_instance = 0xd4800000 | 1<<27 | 3<<20 | 2<<17 | 3  # branch three instructions to the instance path
   halt = 0xd2800000
   temp_pair = 0xc0//2
-  struct.pack_into('<5I', pds, 64, branch_instance, dout(1, temp_pair, 2), halt, dout(1, temp_pair, 3), dout(2, 2, end=True, pred=True))
+  # DOUTW addresses common-store groups of four. Clear LM4 before the first task enters the barrier.
+  if local: struct.pack_into('<I', pds, 56, 3<<28 | 1<<13 | 1<<6 | 3)
+  program = [branch_instance+int(local)] + ([dout(1, 0, 6)] if local else []) + [dout(1, temp_pair, 2), halt, dout(1, temp_pair, 3),
+                                                                                  dout(2, 2, end=True, pred=True)]
+  struct.pack_into(f'<{len(program)}I', pds, 64, *program)
   return pds
 
 class MTS30Program(Program['MTDevice']):
   def __init__(self, dev:MTDevice, obj:TinyELF, links:dict):
     self.dev, self.name, self.profile_key = dev, obj.name, obj.profile_key
     self.direct = obj.target.renderer == "USC"
-    text, params, temps, attrs, self.args = s30_shader(obj)
+    text, params, temps, attrs, local_words, self.args = s30_shader(obj)
     shared = len(params)//4
     # Rogue USC prefetches one more instruction (up to 32 bytes), even when the shader ends at a page boundary.
     code = text + bytes(32)
@@ -292,13 +296,14 @@ class MTS30Program(Program['MTDevice']):
     packet_off, usc_off = self.packet.meta.va & 0xffffffff, self.code.meta.va & 0xffffffff
     pds_off = packet_off + pds_start
     params_base = FW_DEVVA if self.direct else PDS_BASE+packet_off
-    pds = s30_pds(params_base+self.param_offset, shared, usc_off, temps)
+    pds = s30_pds(params_base+self.param_offset, shared, usc_off, temps, bool(local_words))
     with dev.s30_fw.lock:
       dev.s30_fw.mmu.map_range(PDS_BASE+packet_off, self.packet.meta.pa, self.packet.meta.size, MT_PTE_READ_ONLY)
       dev.s30_fw.mmu.map_range(USC_BASE+usc_off, self.code.meta.pa, self.code.meta.size, MT_PTE_READ_ONLY)
     self.shared = ceildiv(shared, 16)
     dispatch = (2, pds_off | 2, pds_off+16, 0, 0, 0, 0x02000000 | self.shared, 0, 0x100085 | attrs<<12, pds_off+32, pds_off+64)
     words = dispatch + (0,)*5
+    self.shared += ceildiv(local_words, 16)
     self.grid_offset = param_size+2*CDM_CONTROL_SIZE+4*len(dispatch)
     if self.direct:
       self.packet.host[:len(pds)] = pds

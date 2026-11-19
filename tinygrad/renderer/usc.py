@@ -46,7 +46,7 @@ def assemble(ins:list[Instruction]) -> tuple[bytes, int]:
     if op in ("imm", "half_to_float") and i not in last: continue
     operands = tuple(regs[v] if v >= 0 else ~v for v in src)
     for v in expires[i]: free.add(regs.pop(v))
-    if op not in ("st", "st8", "st16", "assign", "back", "cndst", "cndend"):
+    if op not in ("st", "st8", "st16", "assign", "back", "cndst", "cndend", "lmst", "barrier"):
       if not free: raise NotImplementedError("S30 USC needs more than 64 live temporaries")
       dst = min(free)
       peak = max(peak, dst+1)
@@ -117,6 +117,13 @@ def assemble(ins:list[Instruction]) -> tuple[bytes, int]:
       word |= _field(dst,(4,16,24,33,42,45)) | _field(a,(6,12,20,19,29,28))
       word |= _field(b, (14,21,25,27,37,39) if op != "fmul" else (22,32,38,40,50,58))
       wait, signal = (55,56), 41
+    elif op in ("lmld", "lmst"):
+      # Indexed local dwords. LM0:2 hold the workgroup ID and LM4 is the workgroup barrier.
+      dest, source = (dst, 5) if op == "lmld" else (5, operands[1])
+      word = 0x800008084003980a if op == "lmld" else 0x80000c080003888a
+      word |= _field(dest,(9,10,23,24,47,56,59,61)) | _field(source,(18,22,21,25,39,50,58,60)) | _field(operands[0],(27,26,28,32,34,38,40,46))
+      wait, signal = (20,29), None
+    elif op == "barrier": word, wait, signal = 0x8a355ce8, (9,26), None  # increment LM4, wait for all tasks, reinitialize
     elif op in ("ld", "ld8", "ld16", "st", "st8", "st16"):
       addr = _field(imm,(45,17,22,30,36)) | _field(operands[0],(20,14,26,27,34,40))  # [shared pointer pair + byte offset in rN]
       if op.startswith("ld"): word, signal = 0xc00004000001858e | addr | _field(dst,(29,35,37,41,47,53)), None
@@ -152,8 +159,8 @@ class USCCompiler(Compiler):
 
 class MTUSCRenderer(Renderer):
   compiler = USCCompiler()
-  supports_float4 = has_shared = False
-  shared_max = 0
+  supports_float4 = False
+  shared_max = 2048  # bytes guaranteed even for narrow elements, each occupying one local dword
   global_max, local_max = (0x7fffffff,65535,65535), (1024,1024,64)
   code_for_op = dict.fromkeys((Ops.ADD, Ops.SHL, Ops.SHR, Ops.MUL, Ops.SQRT, Ops.RECIP, Ops.EXP2, Ops.LOG2, Ops.MAX), lambda: None)
   def __init__(self, target:Target):
@@ -179,6 +186,14 @@ class MTUSCRenderer(Renderer):
            (p.addrspace != AddrSpace.ALU or p.dtype != dtypes.int) for p in params):
       raise NotImplementedError("S30 USC requires supported global buffer arguments")
     ptrs = {p:2*i for i,p in enumerate(params)}
+    local_offsets:dict[UOp,int] = {}
+    local_words = 0
+    for u in uops:
+      if u.op is Ops.BUFFER and u.addrspace == AddrSpace.LOCAL:
+        local_offsets[u] = local_words
+        local_words += u.max_numel()
+    if local_words > self.shared_max: raise NotImplementedError("S30 local storage exceeds the supported allocation")
+    local_words = local_words+5 if local_words or any(u.op is Ops.BARRIER for u in uops) else 0
     ins:list[Instruction] = []
     constants:list[int] = []
     regs:dict[UOp,int] = {}
@@ -306,6 +321,7 @@ class MTUSCRenderer(Renderer):
     for u in uops:
       if u.op is Ops.IF: gate = u.src[0]
       elif u.op is Ops.ENDIF: gate = None
+      elif u.op is Ops.BARRIER: emit("barrier")
       elif u.op is Ops.RANGE:
         if u.src[0].vmin < 1 or u.src[0].vmax >= 1<<31: raise NotImplementedError("S30 USC requires a positive loop bound")
         regs[u] = emit("range", literal(0))
@@ -332,21 +348,27 @@ class MTUSCRenderer(Renderer):
             emit("assign", slots[key], value if gate is None else select(reg(gate), value, slots[key]))
           else: regs[u] = emit("mov", slots[key])
           continue
-        if buf not in ptrs: raise NotImplementedError("S30 USC needs a global buffer or a fixed register index")
-        offset = (index, buf.dtype.itemsize)
-        if offset not in offsets: offsets[offset] = scale(reg(index), buf.dtype.itemsize)
-        suffix = {1:"8", 2:"16", 4:""}[buf.dtype.itemsize]
+        if buf in local_offsets:
+          start = local_offsets[buf]
+          addr = emit("iadd", reg(index), literal(start)) if start else reg(index)
+          load, store, ptr = "lmld", "lmst", 0
+        else:
+          if buf not in ptrs: raise NotImplementedError("S30 USC needs a global, local or fixed register index")
+          offset = (index, buf.dtype.itemsize)
+          if offset not in offsets: offsets[offset] = scale(reg(index), buf.dtype.itemsize)
+          addr, start = offsets[offset], 0
+          suffix = {1:"8", 2:"16", 4:""}[buf.dtype.itemsize]
+          load, store, ptr = "ld"+suffix, "st"+suffix, ptrs[buf]
         if u.op is Ops.LOAD:
-          addr = offsets[offset]
-          if len(u.src) == 3: addr = select(reg(u.src[2]), addr, literal(0))
-          regs[u] = narrow(emit("ld"+suffix, addr, imm=ptrs[buf]), u.dtype)
+          if len(u.src) == 3: addr = select(reg(u.src[2]), addr, literal(start))
+          regs[u] = narrow(emit(load, addr, imm=ptr), u.dtype)
           if len(u.src) == 3: regs[u] = select(reg(u.src[2]), regs[u], reg(u.src[1]))
-        if u.op is Ops.LOAD and u.dtype == dtypes.bool: regs[u] = emit("and", regs[u], literal(1))
-        if u.op is Ops.STORE:
+          if u.dtype == dtypes.bool: regs[u] = emit("and", regs[u], literal(1))
+        else:
           value = reg(u.src[1])
           # IF/ENDIF encloses a single store. Compute its operands before disabling lanes.
           if gate is not None: emit("cndst", emit("ilt", literal(0), reg(gate)))
-          emit("st"+suffix, offsets[offset], value, imm=ptrs[buf])
+          emit(store, addr, value, imm=ptr)
           if gate is not None: emit("cndend")
       # Respect the scheduler's placement of invariant address arithmetic before nested reductions.
       elif has_loop and u not in products and u.op in (Ops.SPECIAL, Ops.TRUNCDIV, Ops.TRUNCMOD, *self.code_for_op): reg(u)
@@ -355,4 +377,4 @@ class MTUSCRenderer(Renderer):
         raise NotImplementedError(f"S30 USC cannot lower {u.op}")
     code, temps = assemble(ins)
     # Shared registers hold pointer pairs followed by the shader's literal words.
-    return (struct.pack(f'<II{len(constants)}I', temps, len(constants), *constants) + code).hex()
+    return (struct.pack(f'<HHI{len(constants)}I', temps, local_words, len(constants), *constants) + code).hex()

@@ -130,6 +130,26 @@ class TestS30USB(unittest.TestCase):
       out = Tensor.empty(64, device="MT", dtype=dtypes.int).custom_kernel(fxn=kernel)[0]
       self.assertEqual(out.tolist(), [x+32*y+1024*z for z in range(2) for y in range(4) for x in range(8)])
 
+  def test_native_workgroup_exchange(self):
+    import numpy as np
+    from tinygrad.dtype import AddrSpace
+    from tinygrad.uop.ops import KernelInfo, UOp
+    rng = np.random.default_rng(30)
+    with Context(DEV="MT:USC", CACHELEVEL=0):
+      for width in (32,64,128,256):
+        def kernel(out, src):
+          lane, group = UOp.special(width, "lidx0"), UOp.special(33, "gidx0")
+          a,b = (UOp.placeholder((4*width,), dtypes.int, slot=i, addrspace=AddrSpace.LOCAL) for i in range(2))
+          idx, start = group*width+lane, group%4*width
+          fill = a[start+lane].store(src[idx]).barrier()
+          swap = b[start+lane].store(a.after(fill)[start+(lane^(width//2))]+group.cast(dtypes.int)).barrier()
+          return out[idx].store(b.after(swap)[start+(lane^(width//4))]).sink(arg=KernelInfo(name="s30_exchange", opts_to_apply=()))
+        for _ in range(3):
+          values = rng.integers(-10000, 10000, (33,width), dtype=np.int32)
+          inputs = Tensor(values.flatten(), device="MT").realize()
+          out = inputs.empty_like().custom_kernel(inputs, fxn=kernel)[0].numpy().reshape(33,width)
+          np.testing.assert_array_equal(out, values[:,np.arange(width)^(width//2)^(width//4)]+np.arange(33)[:,None])
+
   def test_native_gated_store(self):
     import numpy as np
     from tinygrad.uop.ops import KernelInfo, UOp

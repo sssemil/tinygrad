@@ -54,10 +54,10 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
     spatial = dot is not None and sum(1 < k.full_shape[i] <= 5 for i in k.upcastable_dims(reduce=True)) >= 2
     tiled = False
     if dot is not None and red is not None and red.dtype == dtypes.float and len(red.src) == 2:
-      lhs, rhs = (x.ranges.keys() for x in dot.src)
+      lhs, rhs = (x.ranges for x in dot.src)
       dims = [r for r in k.rngs if r.axis_type is AxisType.GLOBAL and (r.src[0].op is Ops.CONST or r.src[0].is_variable) and r.vmax+1 >= 16]
-      rows, cols = [r for r in dims if r in lhs-rhs], [r for r in dims if r in rhs-lhs]
-      if len(rows) == len(cols) == 1 and red.src[1] in lhs&rhs:
+      rows, cols = [r for r in dims if r in lhs and r not in rhs], [r for r in dims if r in rhs and r not in lhs]
+      if len(rows) == len(cols) == 1 and red.src[1] in lhs and red.src[1] in rhs:
         for r,n in ((rows[0], 2 if rows[0].src[0].is_variable else 4), (cols[0], 2)):
           if r.src[0].is_variable: r = k.apply_opt(Opt(OptOps.PADTO, k.rngs.index(r), n))
           if r.src[0].divides(n) is not None:

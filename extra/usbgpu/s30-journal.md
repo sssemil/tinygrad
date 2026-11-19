@@ -190,3 +190,13 @@ With the resident ring and the new scheduler, all fifteen model outputs matched 
 Each invocation of the isolated benchmark starts a new offline process with its own home, temporary directory and Python bytecode cache path. The script mounts the selected input and allowlisted dataset or model files. Each of the 15 outputs matched the vendor reference. The updated measurements at the top use this command. MUSA ran on the same hardware with its compiler cache disabled and the same inputs and warm-up policy.
 
 The S30 reported VBIOS 10520 and management RTOS 10206 in the earlier board-identification test. The published driver headers describe management RPCs after PCIe attach. They do not specify a volatile boot path for replacing the onboard controller before enumeration. The open META diagnostic controls a different processor. No onboard flash was modified. [Moore Threads management software and SUDI firmware release matrix](https://docs.mthreads.com/gmc/gmc-doc-online/gmi/releasenotes/gmi_releasenote/)
+
+## November 20, 2026 — workgroup memory and barriers
+
+A PDS workgroup launch wrote two distinctive constants to local memory. Destination field 1 placed them at LM4 and LM5. Field 4 placed them at LM16 and LM17. The earlier barrier timeout had initialized the wrong address. Clearing LM4 before starting the workgroup lets the USC atomic barrier count all participating tasks and reset for the next barrier.
+
+Tinygrad now lowers local buffer loads, stores and barriers for the native renderer. An exchange test used two local arrays and two barriers to permute random inputs across lanes. It compared every element in 33 independent workgroups, including sizes 32, 64, 128 and 256. The largest case addressed 2,048 local dwords. Narrow elements occupy one dword each, so the scheduler advertises 2 KiB for every supported dtype. Fourteen applicable direct S30 hardware tests passed, including these exchanges. The generic tinygrad local-storage test also passed.
+
+The unmodified beautiful_mnist training example executed three batch-size-two Adam updates with the native renderer, disabled compiler cache and nonexistent vendor paths. The final reported loss was 1.74. A CPU run captured 118 training kernels that also compiled with the native renderer. Full training convergence was not measured.
+
+A separate clock diagnostic requested P0 via the management controller solely for comparison. The same native 128×1,536×384 projection took 14.76 ms beforehand and 14.83 ms in P0. The driver restored the board's idle policy. Native model runs continue to use direct attach.
