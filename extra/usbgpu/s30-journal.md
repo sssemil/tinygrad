@@ -75,3 +75,7 @@ Placing address calculations where tinygrad scheduled them, before the inner red
 Whisper tiny.en completed on the S30 with the MUSA path unavailable and the compiler cache disabled. The complete audio-to-transcript call returned “Could you please let me out of the box?” in 67.804 s after checkpoint loading. This run included per-kernel diagnostic logging. It used the vendor compute firmware for dispatch.
 
 Symbolic attention shapes required quotient and remainder by a runtime divisor. The native renderer emits integer shifts, comparisons and subtraction for this case. On the card, one replayable kernel matched NumPy on 4,097 input values and six divisors covering 1 through 448. All 92 captured Whisper graphs compiled offline. The matching transcript is the separate hardware check. Warm timing is recorded separately from this first call.
+
+## November 20, 2026 — narrow integer kernels for quantized weights
+
+The Qwen cold loader reads raw GGUF bytes and combines them into FP32 and FP16 values. Added signed byte and halfword extension, modulo-width arithmetic, unsigned comparisons and integer-to-float conversion, bitwise OR/XOR, and variable shifts. S30 runs matched NumPy for signed and unsigned 8- and 16-bit data and unsigned 32-bit data. Offline compilation of the 63 captured Qwen graphs now succeeds for 61. Two exceed the current 32-register limit. This is compiler coverage, not yet an end-to-end token result.

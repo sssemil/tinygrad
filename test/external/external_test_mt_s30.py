@@ -154,6 +154,18 @@ class TestS30USB(unittest.TestCase):
         return ((n//d)*1024 + n%d).realize()
       for d in (1,2,3,17,127,448): np.testing.assert_array_equal(run(x, divisor.bind(d)).numpy(), data//d*1024+data%d)
 
+  @requires_firmware
+  def test_native_integer_lanes(self):
+    import numpy as np
+    rng = np.random.default_rng(30)
+    with Context(DEV="MT:USC", CACHELEVEL=0):
+      for dt in (np.int8,np.uint8,np.int16,np.uint16,np.uint32):
+        a = rng.integers(np.iinfo(dt).min, np.iinfo(dt).max, 255, dtype=dt)
+        b = rng.integers(0, 5, 255, dtype=dt)
+        x,y = Tensor(a, device="MT"), Tensor(b, device="MT")
+        np.testing.assert_array_equal((((x*y)>>y) ^ (x<<y)).numpy(), ((a*b)>>b) ^ (a<<b))
+        np.testing.assert_array_equal(x.float().numpy(), a.astype(np.float32))
+
   @requires_compiler
   def test_tensor_compute(self):
     for n,dt in ((4, dtypes.int32), (257, dtypes.int32), (4099, dtypes.float32)):
