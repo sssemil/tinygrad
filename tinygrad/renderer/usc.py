@@ -151,6 +151,26 @@ class MTUSCRenderer(Renderer):
         acc = emit("iadd", acc, acc)
         if bit == '1': acc = emit("iadd", acc, src)
       return acc
+    quot_rem:dict[tuple[UOp,UOp],tuple[int,int]] = {}
+    def divide(n:UOp, d:UOp) -> tuple[int,int]:
+      if (n,d) in quot_rem: return quot_rem[n,d]
+      a,b = reg(n), reg(d)
+      from tinygrad.codegen.decomp.op import magicgu
+      if d.vmin == d.vmax and (m_shift:=magicgu(int(n.vmax), int(d.vmin)))[0]*n.vmax < 1<<32:
+        m,shift = m_shift
+        q = emit("lsr", emit("imul", a, literal(m)), literal(shift))
+        rem = emit("iadd", a, emit("imul", q, literal(-int(d.vmin) & 0xffffffff)))
+      else:
+        # Shift the remainder right for the comparison so the trial divisor cannot overflow.
+        q, rem = literal(0), a
+        for i in reversed(range((int(n.vmax)//int(d.vmin)).bit_length())):
+          trial = emit("iadd", rem, emit("imul", b, literal((-1<<i) & 0xffffffff)))
+          with_bit = emit("iadd", q, literal(1<<i))
+          keep = emit("ilt", emit("lsr", rem, literal(i)), b)
+          rem = emit("select", keep, rem, trial)
+          q = emit("select", keep, q, with_bit)
+      quot_rem[n,d] = q,rem
+      return q,rem
     def reg(u:UOp) -> int:
       if u in regs: return regs[u]
       if u._shape != () or u.dtype not in (dtypes.int, dtypes.float, dtypes.half, dtypes.uchar, dtypes.bool):
@@ -192,13 +212,8 @@ class MTUSCRenderer(Renderer):
         if u.dtype == dtypes.half: r = emit("float_to_half", r)
       elif u.op is Ops.SHL and u.src[1].vmin == u.src[1].vmax: r = emit("imul", reg(u.src[0]), literal(1<<(int(u.src[1].vmin)%32)))
       elif u.op is Ops.SHR: r = emit("lsr" if u.src[0].vmin >= 0 else "asr", *(reg(x) for x in u.src))
-      elif u.op in (Ops.TRUNCDIV, Ops.TRUNCMOD) and u.src[0].vmin >= 0 and u.src[1].vmin == u.src[1].vmax and u.src[1].vmin > 0:
-        from tinygrad.codegen.decomp.op import magicgu
-        n,d = reg(u.src[0]), int(u.src[1].vmin)
-        m,shift = magicgu(int(u.src[0].vmax), d)
-        if m*u.src[0].vmax >= 1<<32: raise NotImplementedError("S30 USC division needs a wide product")
-        q = emit("lsr", emit("imul", n, literal(m)), literal(shift))
-        r = q if u.op is Ops.TRUNCDIV else emit("iadd", n, emit("imul", q, literal(-d & 0xffffffff)))
+      elif u.op in (Ops.TRUNCDIV, Ops.TRUNCMOD) and u.dtype == dtypes.int and u.src[0].vmin >= 0 and u.src[1].vmin > 0:
+        r = divide(*u.src)[u.op is Ops.TRUNCMOD]
       else: raise NotImplementedError(f"S30 USC cannot lower {u.op} {u.dtype}")
       regs[u] = r
       return r

@@ -142,6 +142,18 @@ class TestS30USB(unittest.TestCase):
       run = TinyJit(lambda x,v: ((x+Tensor(v, device=x.device))>>2).float().exp2().log2().realize())
       for n in (-11,3,17,-2): np.testing.assert_allclose(run(x, offset.bind(n)).numpy(), (data+n)>>2, atol=1e-5)
 
+  @requires_firmware
+  def test_native_variable_divisor(self):
+    import numpy as np
+    data = np.arange(4097, dtype=np.int32)
+    with Context(DEV="MT:USC", CACHELEVEL=0):
+      x, divisor = Tensor(data, device="MT"), Variable("divisor", 1, 448)
+      @TinyJit
+      def run(x, divisor):
+        n, d = x & 8191, Tensor(divisor, device=x.device)
+        return ((n//d)*1024 + n%d).realize()
+      for d in (1,2,3,17,127,448): np.testing.assert_array_equal(run(x, divisor.bind(d)).numpy(), data//d*1024+data%d)
+
   @requires_compiler
   def test_tensor_compute(self):
     for n,dt in ((4, dtypes.int32), (257, dtypes.int32), (4099, dtypes.float32)):

@@ -69,3 +69,9 @@ Added signed 32-bit scalar arguments to the native launch ABI. One TinyJit progr
 Extended physical-register selection to 32 temporaries. The 80×201 Whisper mel filter now executes directly on the S30, with a maximum absolute difference of 5.22e-8 against tinygrad CPU. A full Whisper encoder attempt timed out. The card's PCIe configuration subsequently stopped responding. Chestnut reported no power fault, and its normal downstream power control restored the card. A subsequent SMC test and native model run passed.
 
 Placing address calculations where tinygrad scheduled them, before the inner reduction, reduced the warm MNIST batch time from 2.456 s to 1.581 s. Unrolling three- and five-tap convolution reductions and groups of four in longer reductions reduced it to 1.060 s. All 16 predictions still matched the reference on every run. This is a 2.32× native speedup and leaves a 74× gap to the 14.31 ms MUSA reference.
+
+## November 20, 2026 — Whisper from an empty shader cache
+
+Whisper tiny.en completed on the S30 with the MUSA path unavailable and the compiler cache disabled. The complete audio-to-transcript call returned “Could you please let me out of the box?” in 67.804 s after checkpoint loading. This run included per-kernel diagnostic logging. It used the vendor compute firmware for dispatch.
+
+Symbolic attention shapes required quotient and remainder by a runtime divisor. The native renderer emits integer shifts, comparisons and subtraction for this case. On the card, one replayable kernel matched NumPy on 4,097 input values and six divisors covering 1 through 448. All 92 captured Whisper graphs compiled offline. The matching transcript is the separate hardware check. Warm timing is recorded separately from this first call.
