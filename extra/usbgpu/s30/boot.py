@@ -1,5 +1,5 @@
 """Boot an open META mailbox on the S30. META_AS and META_OBJCOPY select GNU binutils configured for metag-elf."""
-import os, random, subprocess, tempfile, time
+import os, random, struct, subprocess, tempfile, time
 from pathlib import Path
 from tinygrad import Device
 from tinygrad.runtime.support.mt.compute import FW_BASE, FW_DEVVA, ROOT_BASE
@@ -26,6 +26,10 @@ class MetaPort:
     self.fw._read(0xa08, 4)
   def start(self):
     self.write(0x04830030, 4)  # select the control port for thread register access
+    # META segment 1 covers 0x20000000..0x3fffffff. Its global alias at 0xb0000000 bypasses META's data cache.
+    # Set the SLC uncached bit in the output address so the USB BAR and META see each other's writes.
+    mailbox = FW_DEVVA + 0x1000 | 1<<40
+    for i, word in enumerate((0x30000f02, 0, mailbox & 0xffffffff, mailbox >> 32)): self.write(0x04850010+i*4, word)
     self.write(0x0480fff0, 0xc0000000)  # boot segment in the global address range
     self.write(0x0480fff8, 5)  # transfer to thread 0 PC
     deadline = time.monotonic()+1
@@ -52,8 +56,8 @@ if __name__ == "__main__":
     port = MetaPort(fw)
     port.start()
     for challenge in (*random.sample(range(1<<32), 4), 0xffffffff):
-      port.write(0xc0001000, challenge)
+      fw.v[0x1000:0x1004] = struct.pack("<I", challenge)
       deadline = time.monotonic()+1
-      while (reply:=port.read(0xc0001004)) != (challenge+1) & 0xffffffff:
+      while (reply:=struct.unpack("<I", fw.v[0x1004:0x1008])[0]) != (challenge+1) & 0xffffffff:
         if time.monotonic() >= deadline: raise TimeoutError(f"META mailbox {challenge=:08x} {reply=:08x}")
       print(f"{challenge:08x} -> {reply:08x}")
