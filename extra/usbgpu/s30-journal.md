@@ -8,9 +8,9 @@ Measured on the same Chestnut S30 with compiler caching disabled. The cold colum
 
 | Workload | Native cold | MUSA cold | Native warm | MUSA warm |
 | --- | ---: | ---: | ---: | ---: |
-| MNIST, batch of 16 | 0.848 s | 3.506 s | 27.32 ms | 13.82 ms |
-| Whisper tiny.en, test.wav | 11.083 s | 50.836 s | 5.172 s | 2.595 s |
-| Qwen2.5-0.5B Q8_0 | 17.814 s | 172.244 s | 6.012 s | 4.811 s |
+| MNIST, batch of 16 | 0.864 s | 3.506 s | 27.60 ms | 13.82 ms |
+| Whisper tiny.en, test.wav | 11.067 s | 50.836 s | 5.172 s | 2.595 s |
+| Qwen2.5-0.5B Q8_0 | 17.327 s | 172.244 s | 5.587 s | 4.811 s |
 
 All five native outputs per model matched the reference. The native column uses the offline, isolated benchmark. It checked every loaded USC program against compiler output generated in the same process. The check covered 10 distinct binaries for MNIST, 88 for Whisper and 75 for Qwen. The benchmark also checked that compute startup received only zero-filled context memory, with META master boot disabled. It blocked vendor firmware boot and management mailbox construction. The card powered up with its factory firmware still installed. The host did not upload proprietary code during these model runs. The board-management mailbox was unused.
 
@@ -341,3 +341,7 @@ The configuration contains enclosure identification strings and board parameters
 A fused Qwen projection produced a 483-instruction kernel with 78 simultaneously live values for the S30's 64 registers. Postponing input loads and their integer address calculations until their first use reduced the allocation to 42 registers. The new pass retries only when allocation exhausts the register file. It keeps loads on the original side of stores, branches, mutable assignments and barriers. Applying delayed loads to every shader slowed the normal Qwen run to 6.211 s and Whisper to 5.501 s.
 
 A regression shader on the physical S30 loaded 80 floats before their first sum, compiled them in at most eight registers, and returned their exact sum. The experimental fused model that previously failed compilation ran and produced the reference eight tokens on all five calls. Its weight packing stays outside the model loader.
+
+## November 20, 2026 — combine two independent matrix-vector reductions
+
+Qwen's gate and up projections each reduced a row of 896 elements. Profiling measured 168 launches of the combined kernel at 1.188 s per eight-token response. The compiler now gives two independent row-wise dot products with identical reduction bounds the same loop index before splitting it across the workgroup. A dedicated device test compared every output of two 256×192 projections against NumPy. The cold-cache Qwen run fell from 17.814 to 17.327 s and its warm median from 6.012 to 5.587 s. All fifteen model outputs matched, 17 applicable hardware tests passed, and the native compiler accepted all 165 saved inference graphs and 118 MNIST training graphs. The MUSA reference uses the previous measurement on this card.

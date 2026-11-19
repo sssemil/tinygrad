@@ -52,14 +52,21 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
     red = k.reduceop
     dot = red.src[0] if red is not None and red.arg[0] is Ops.ADD and red.src[0].op is Ops.MUL else None
     # Coalesce eight adjacent reduction elements per row, then combine their partials in local memory.
-    if dot is not None and red is not None and len(red.src) == 2 and len(k.reduceops) == 1 and len(outs:=k.axes_of(AxisType.GLOBAL)) == 1:
+    if dot is not None and red is not None and len(red.src) == 2 and len(outs:=k.axes_of(AxisType.GLOBAL)) == 1:
       row, inner = k.rngs[outs[0]], red.src[1]
       if (row.src[0].op is Ops.CONST and row.src[0].val >= 128 and row.src[0].val%8 == 0 and inner.src[0].op is Ops.CONST and
           inner.src[0].val >= 128 and inner.src[0].val%32 == 0):
-        k.apply_opt(Opt(OptOps.SPLIT, k.rngs.index(inner), (8, AxisType.LOCAL)))
-        k.apply_opt(Opt(OptOps.SPLIT, k.rngs.index(row), (8, AxisType.LOCAL)))
-        k.apply_opt(Opt(OptOps.SPLIT, k.upcastable_dims(reduce=True)[-1], (4, AxisType.UPCAST)))
-        return k
+        # Independent row-wise dot products of equal length can use the same reduction loop and workgroup.
+        others = k.reduceops[1:]
+        if len(others) <= 1 and all(len(r.src) == 2 and r.arg == red.arg and r.src[0].op is Ops.MUL and r.dtype == red.dtype and
+                                    r.src[1].src == inner.src and r.src[1].axis_type == inner.axis_type and r.src[1].dtype == inner.dtype and
+                                    set(dot.ranges) == {row, inner} and set(r.src[0].ranges) == {row, r.src[1]} and
+                                    r not in dot.backward_slice and red not in r.src[0].backward_slice for r in others):
+          if others: k.ast = k.ast.substitute({r:r.substitute({r.src[1]:inner}) for r in others})
+          k.apply_opt(Opt(OptOps.SPLIT, k.rngs.index(inner), (8, AxisType.LOCAL)))
+          k.apply_opt(Opt(OptOps.SPLIT, k.rngs.index(row), (8, AxisType.LOCAL)))
+          k.apply_opt(Opt(OptOps.SPLIT, k.upcastable_dims(reduce=True)[-1], (4, AxisType.UPCAST)))
+          return k
     spatial = dot is not None and sum(1 < k.full_shape[i] <= 5 for i in k.upcastable_dims(reduce=True)) >= 2
     tiled = False
     if dot is not None and red is not None and red.dtype == dtypes.float and len(red.src) == 2:

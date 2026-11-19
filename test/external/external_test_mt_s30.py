@@ -205,6 +205,15 @@ class TestS30USB(unittest.TestCase):
       prg(dst.meta.va, src.meta.va, wait=True)
       self.assertEqual(struct.unpack("<f", dst.as_memoryview())[0], sum(vals))
 
+  def test_native_paired_projections(self):
+    import numpy as np
+    rng = np.random.default_rng(30)
+    a,b = (rng.integers(-4, 5, (256, 192)).astype(np.float32) for _ in range(2))
+    v = rng.integers(-9, 10, 192).astype(np.float32)
+    with Context(DEV="MT:USC", CACHELEVEL=0):
+      x, w, u = (Tensor(i, device="MT") for i in (v, a, b))
+      np.testing.assert_array_equal(((x*w).sum(-1) * (x*u).sum(-1)).numpy(), (a@v)*(b@v))
+
   def test_native_projection(self):
     import numpy as np
     rng = np.random.default_rng(30)
