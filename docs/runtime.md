@@ -16,16 +16,18 @@ tinygrad supports various runtimes, enabling your code to scale across a wide ra
 
 ## MTT S30 on USB Chestnut
 
-Select `DEV=MT` for a two-core S30 on a Chestnut USB bridge. The runtime uses MUSA 4.3.0 to compile for `mp_10` and loads `mtfw-gen1.bin` from the `mtgpu-s30` 3.1.0-6 package. Point `MUSA_PATH` at the toolkit root containing `bin/mcc`. Set `MT_FIRMWARE` if the firmware is outside `/lib/firmware/mthreads`.
+Select `DEV=MT:USC` to run native inference on a two-core S30. Tinygrad generates USC shader instructions and the PDS launch program, maps them into VRAM, and submits work directly to both compute cores. This path requires the Chestnut USB bridge and access to its USB device. The S30 can still run factory firmware at power-on. Direct host dispatch uses neither the management mailbox nor a host-supplied firmware image.
 
-With `DEV=MT:LLVM`, tinygrad emits LLVM IR directly. Its compiler is the MTGPU-enabled `bin/clang-14` under `MUSA_PATH`. The compiler can also load helper routines from `mtgpu/bitcode/`. Both renderers upload the resulting shader to VRAM and submit commands to the S30 firmware over USB. Once kernels are cached, `ASSERT_COMPILE=1` runs them with the compiler offline and reports a cache miss if a new kernel is needed.
-
-`DEV=MT:USC` selects tinygrad's experimental native S30 shader compiler. It encodes USC instructions directly and supports the trained MNIST inference graph. Unsupported kernels raise an error. The S30 still boots the vendor compute firmware. For a cold compiler run and a warm latency measurement, run the following from the checkout with the trained checkpoint.
+Run a model five times from the checkout with the normal Python dependencies for that example. Set `CACHELEVEL=0` to compile from source in a fresh process. The benchmark reports time to the first output and median warm latency. Whisper uses the repository audio fixture. Qwen processes the same prompt each time.
 
 ```sh
-DEV=MT:USC CACHELEVEL=0 MUSA_PATH=/nonexistent PYTHONPATH=. \
-  python extra/usbgpu/bench_s30.py mnist /path/to/mnist-s30.safetensors
+export DEV=MT:USC CACHELEVEL=0 PYTHONPATH=.
+python extra/usbgpu/bench_s30.py mnist /path/to/mnist-s30.safetensors
+python extra/usbgpu/bench_s30.py whisper test/models/whisper/test.wav
+python extra/usbgpu/bench_s30.py qwen /path/to/Qwen2.5-0.5B-Instruct-Q8_0.gguf
 ```
+
+For the vendor reference, select `DEV=MT:MUSA` (also the current default for `DEV=MT`). Point `MUSA_PATH` at the MUSA 4.3.0 toolkit containing `bin/mcc`. Both that renderer and `DEV=MT:LLVM`, which uses the toolkit's MTGPU `bin/clang-14`, load `mtfw-gen1.bin` from the `mtgpu-s30` 3.1.0-6 package. Set `MT_FIRMWARE` if the file is outside `/lib/firmware/mthreads`. [Hardware measurements and bring-up journal](../extra/usbgpu/s30-journal.md)
 
 Run the MNIST training and evaluation demo from the checkout.
 
