@@ -8,11 +8,11 @@ Measured on the same Chestnut S30 with compiler caching disabled. The cold colum
 
 | Workload | Native cold | MUSA cold | Native warm | MUSA warm |
 | --- | ---: | ---: | ---: | ---: |
-| MNIST, batch of 16 | 0.838 s | 3.506 s | 28.51 ms | 13.82 ms |
-| Whisper tiny.en, test.wav | 12.020 s | 50.836 s | 6.210 s | 2.595 s |
-| Qwen2.5-0.5B Q8_0 | 19.207 s | 172.244 s | 8.466 s | 4.811 s |
+| MNIST, batch of 16 | 0.852 s | 3.506 s | 26.62 ms | 13.82 ms |
+| Whisper tiny.en, test.wav | 11.546 s | 50.836 s | 5.688 s | 2.595 s |
+| Qwen2.5-0.5B Q8_0 | 18.514 s | 172.244 s | 6.801 s | 4.811 s |
 
-All five native outputs per model matched the reference. The native column uses the offline, isolated benchmark. It checked every loaded USC program against compiler output generated in the same process. The check covered 10 distinct binaries for MNIST, 88 for Whisper and 68 for Qwen. The benchmark also disabled vendor firmware boot and management mailbox construction. The card powered up with its factory firmware still installed. The host did not upload proprietary code during these model runs. The board-management mailbox was unused.
+All five native outputs per model matched the reference. The native column uses the offline, isolated benchmark. It checked every loaded USC program against compiler output generated in the same process. The check covered 10 distinct binaries for MNIST, 88 for Whisper and 75 for Qwen. The benchmark also disabled vendor firmware boot and management mailbox construction. The card powered up with its factory firmware still installed. The host did not upload proprietary code during these model runs. The board-management mailbox was unused.
 
 ## November 20, 2026 — proprietary reference
 
@@ -284,3 +284,9 @@ A read-only capability walk found standard capabilities 01, 05 and 10, and exten
 ## November 20, 2026 — fewer USC instructions per memory access
 
 The native renderer now multiplies an element index by its byte width with one integer instruction, using a shared literal for the element size. Byte loads and stores use the index directly. The earlier implementation doubled the index twice for a four-byte element. Replacing it removed six lines from the renderer. All 165 saved inference graphs and 118 training graphs compiled. The physical suite passed all 15 applicable tests with the vendor paths absent. On the same inputs the change alone took warm MNIST from 28.51 to about 27 ms, Whisper from 6.210 to 5.717 s and Qwen from 8.466 to 8.129 s. Each output matched the reference on all five calls.
+
+## November 20, 2026 — contiguous output channels for native Qwen prompt projection
+
+For a 32×896 input times 4,864 projection rows, storing the weights with adjacent output channels contiguous reduced the warm product from 35.32 to 23.33 ms. The 32×4,864 input times 896 rows improved from 35.54 to 23.02 ms. Fourteen layouts per shape were tested with random FP16 weights and FP32 activations. Every output element matched NumPy. Splitting the format into eight-row tiles slowed the first projection to 172 ms. For single-token decoding the full transpose changed those two products from 1.69 to 2.08 ms and 2.04 to 1.98 ms respectively.
+
+The native GGUF loader now materializes eligible linear block weights once in this layout. The logical tensor shape and values are preserved. The output vocabulary projection and tied token embedding keep their original storage. Five isolated full Qwen calls verified 75 unique source-generated shaders and the same eight output IDs as MUSA each time. Warm latency fell from 8.129 s with the address optimization alone to 6.801 s. Model setup took 8.006 s and time to first output was 18.514 s. The table at the top uses the isolated timings for the current branch.

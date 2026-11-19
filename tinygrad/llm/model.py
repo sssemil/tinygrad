@@ -965,8 +965,14 @@ class Transformer:
     nn.state.load_state_dict(model, state_dict, verbose=False, consume=True, realize=False)  # NOTE: rope_freqs.weight (32,) is unused
     # NOTE: without this contiguous, it unpacks the weights from the model every time. we shouldn't need this, but for now it's faster
     if realize:
-      for s in (params:=nn.state.get_parameters(model)): s.replace(s.contiguous())
-      Tensor.realize(*params)
+      params = nn.state.get_state_dict(model)
+      transpose = is_s30(dev:=model.token_embd.weight.device) and Device[dev].renderer.target.renderer == "USC"
+      for name, s in params.items():
+        # Store block projections with adjacent output channels contiguous for the S30's prefill workgroups.
+        if transpose and name.startswith("blk.") and name.endswith(".weight") and s.ndim == 2 and isinstance(get_child(model, name[:-7]), Linear):
+          s.replace(s.T.contiguous().T)
+        else: s.replace(s.contiguous())
+      Tensor.realize(*params.values())
     if config.ple is not None: model.blk[config.ple.layer].ple.table = GGUFPackedTable(unwrap(ple_entry))
     return model, kv
 
