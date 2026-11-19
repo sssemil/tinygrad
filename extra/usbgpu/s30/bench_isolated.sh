@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Offline S30 inference on a merged-/usr Linux host with open-source system libraries.
 set -eu
-if [[ $# != 2 ]]; then echo "usage: $0 {mnist|whisper|qwen} INPUT" >&2; exit 2; fi
+if [[ $# != 2 && ( $# != 3 || ${3:-} != --check-reference ) ]]; then
+  echo "usage: $0 {mnist|whisper|qwen} INPUT [--check-reference]" >&2; exit 2
+fi
 repo=$(cd "$(dirname "$0")/../../.." && pwd)
 input=$(realpath "$2")
 python=${PYTHON:-python}
@@ -40,4 +42,4 @@ esac
 for asset in "${assets[@]}"; do
   opts+=(--ro-bind "$downloads/$asset" "/home/bench/.cache/tinygrad/downloads/$asset")
 done
-exec bwrap "${opts[@]}" -- /venv/bin/python s30/verify_native.py "$1" /input
+exec bwrap "${opts[@]}" -- /venv/bin/python s30/verify_native.py "$1" /input "${@:3}"

@@ -8,11 +8,11 @@ Measured on the same Chestnut S30 with compiler caching disabled. The cold colum
 
 | Workload | Native cold | MUSA cold | Native warm | MUSA warm |
 | --- | ---: | ---: | ---: | ---: |
-| MNIST, batch of 16 | 0.851 s | 3.506 s | 26.76 ms | 13.82 ms |
-| Whisper tiny.en, test.wav | 11.056 s | 50.836 s | 5.175 s | 2.595 s |
-| Qwen2.5-0.5B Q8_0 | 17.029 s | 172.244 s | 5.146 s | 4.811 s |
+| MNIST, batch of 16 | 0.851 s | 3.583 s | 26.76 ms | 14.09 ms |
+| Whisper tiny.en, test.wav | 11.056 s | 50.641 s | 5.175 s | 2.608 s |
+| Qwen2.5-0.5B Q8_0 | 17.029 s | 172.371 s | 5.146 s | 4.818 s |
 
-All five native outputs per model matched the reference. The native column uses the offline, isolated benchmark. It checked every loaded USC program against compiler output generated in the same process. The check covered 10 distinct binaries for MNIST, 88 for Whisper and 77 for Qwen. The benchmark also checked that compute startup received only zero-filled context memory, with META master boot disabled. It blocked vendor firmware boot and management mailbox construction. The card powered up with its factory firmware still installed. The host did not upload proprietary code during these model runs. The board-management mailbox was unused.
+The benchmark checked all five outputs against the recorded reference for each model on each backend. The native column uses the offline, isolated benchmark. It checked every loaded USC program against compiler output generated in the same process. The check covered 10 distinct binaries for MNIST, 88 for Whisper and 77 for Qwen. The benchmark also checked that compute startup received only zero-filled context memory, with META master boot disabled. It blocked vendor firmware boot and management mailbox construction. The card powered up with its factory firmware still installed. The host did not upload proprietary code during these model runs. The board-management mailbox was unused.
 
 ## November 20, 2026 — proprietary reference
 
@@ -359,3 +359,13 @@ For the captured paired projection, distributing a group over 32 rows and four r
 ## November 20, 2026 — check the vendor's Sudi controller startup hook
 
 The generic 3.1.0 driver exposes a FEC startup hook taking a program counter. The Sudi-specific operation table points to `sudi_startup`. Its entire implementation returns `-EOPNOTSUPP`; the two neighboring clock-gating and force-stop hooks do the same. The relocated operand reads entry 173 of the driver's 64-bit `os_value` table, and both the matching debug enumeration and kernel wrapper identify that entry as EOPNOTSUPP. None of these three implementations writes a device register. The generic FEC API therefore supplies no S30 bootstrap path in this driver. This check was offline and concerned the FEC API, separate from the board's MGBL inventory.
+
+## November 20, 2026 — check every benchmark prediction on both paths
+
+Both benchmark commands accept `--check-reference` for the three recorded fixtures. Each rejects a different prediction on the first mismatched call. The isolated native runs verified 10, 88 and 77 distinct source-generated programs and all 15 predictions. Fresh processes using MUSA with compiler caching disabled independently passed the same 15 checks on the same S30. The table at the top reports this pair of runs.
+
+As a negative control, the isolated MNIST runner received a copy of the checkpoint with every tensor set to zero. It returned sixteen zeros and exited with a mismatch on call zero. Repeating the run with the trained weights passed all five calls. For example, from the checkout with the model virtualenv active:
+
+```sh
+extra/usbgpu/s30/bench_isolated.sh mnist ../.s30-tools/mnist-s30.safetensors --check-reference
+```
