@@ -8,9 +8,9 @@ Measured on the same Chestnut S30 with compiler caching disabled. The cold colum
 
 | Workload | Native cold | MUSA cold | Native warm | MUSA warm |
 | --- | ---: | ---: | ---: | ---: |
-| MNIST, batch of 16 | 0.936 s | 3.506 s | 32.04 ms | 13.82 ms |
-| Whisper tiny.en, test.wav | 32.161 s | 50.836 s | 6.514 s | 2.595 s |
-| Qwen2.5-0.5B Q8_0 | 157.689 s | 171.460 s | 12.147 s | 9.622 s |
+| MNIST, batch of 16 | 0.938 s | 3.506 s | 32.48 ms | 13.82 ms |
+| Whisper tiny.en, test.wav | 31.976 s | 50.836 s | 6.434 s | 2.595 s |
+| Qwen2.5-0.5B Q8_0 | 156.041 s | 171.460 s | 10.622 s | 9.622 s |
 
 All five native outputs per model matched the reference. The native column uses the offline, isolated benchmark. Separate hardware runs also disabled vendor compilation, vendor firmware boot and management mailbox construction. The card powered up with its factory firmware still installed. The host did not upload proprietary code during these model runs. The board-management mailbox was unused.
 
@@ -230,3 +230,9 @@ PY
 ```
 
 This verifies the installed USB bridge application. The downstream S30's expansion ROM BAR read 0x2 with its enable bit clear after attach. That register reports the host mapping state. Establishing what the GPU board controller needs for power, clocks and DDR before PCIe enumeration still requires independent evidence.
+
+## November 20, 2026 — one workgroup reduction per matrix-vector projection
+
+On eligible native matrix-vector products an 8×8 workgroup reads eight adjacent reduction elements for each of eight rows. The lanes combine partial sums in local memory, avoiding the global temporary and second dispatch used by the earlier S30 model path. For a 4,864×896 projection this reduced 2.705 ms to 1.712 ms. All 165 captured model graphs compiled from source. Five isolated Qwen runs produced the same eight greedy tokens as MUSA. Warm latency fell from 12.147 s to 10.622 s. MUSA took 9.622 s on the same prompt and tokens. The table at the top includes the corresponding isolated Whisper and MNIST reruns. Rebuilding all three workloads in separate empty namespaces preserved all 15 outputs.
+
+A Whisper experiment materialized attention probabilities before the value product. It took 5.999 s warm compared with 6.434 s for the normal graph. An 8×8 workgroup layout for static matrix products alone took 6.444 s. Neither experiment changed the shipped attention graph.

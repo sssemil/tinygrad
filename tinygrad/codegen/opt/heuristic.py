@@ -51,6 +51,15 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
   if k.ren.target.renderer == "USC":
     red = k.reduceop
     dot = red.src[0] if red is not None and red.arg[0] is Ops.ADD and red.src[0].op is Ops.MUL else None
+    # Coalesce eight adjacent reduction elements per row, then combine their partials in local memory.
+    if dot is not None and red is not None and len(red.src) == 2 and len(k.reduceops) == 1 and len(outs:=k.axes_of(AxisType.GLOBAL)) == 1:
+      row, inner = k.rngs[outs[0]], red.src[1]
+      if (row.src[0].op is Ops.CONST and row.src[0].val >= 128 and row.src[0].val%8 == 0 and inner.src[0].op is Ops.CONST and
+          inner.src[0].val >= 128 and inner.src[0].val%32 == 0):
+        k.apply_opt(Opt(OptOps.SPLIT, k.rngs.index(inner), (8, AxisType.LOCAL)))
+        k.apply_opt(Opt(OptOps.SPLIT, k.rngs.index(row), (8, AxisType.LOCAL)))
+        k.apply_opt(Opt(OptOps.SPLIT, k.upcastable_dims(reduce=True)[-1], (4, AxisType.UPCAST)))
+        return k
     spatial = dot is not None and sum(1 < k.full_shape[i] <= 5 for i in k.upcastable_dims(reduce=True)) >= 2
     tiled = False
     if dot is not None and red is not None and red.dtype == dtypes.float and len(red.src) == 2:

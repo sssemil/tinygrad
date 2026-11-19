@@ -1,9 +1,10 @@
 import math
+from typing import TypeGuard
 from tinygrad import Context, Device, Tensor, UOp, dtypes
 from tinygrad.helpers import all_int, prod
 from tinygrad.uop.ops import KernelInfo, Ops
 
-def is_s30(device:str|tuple[str, ...]|None) -> bool:
+def is_s30(device:str|tuple[str, ...]|None) -> TypeGuard[str]:
   if not isinstance(device, str) or device.partition(":")[0] != "MT": return False
   with Context(ALLOW_DEVICE_USAGE=1): return Device[device].arch == "mp_10"
 
@@ -12,7 +13,9 @@ def s30_gemv(x:Tensor, weight:Tensor) -> Tensor|None:
   if x.dtype != dtypes.float or weight.dtype != dtypes.half or weight.ndim != 2 or not all_int(x.shape) or not all_int(weight.shape): return None
   rows, k = weight.shape
   if not x.ndim or x.shape[-1] != k or prod(x.shape[:-1]) != 1 or k % 32 or not (1<<21 <= rows*k <= 1<<28): return None
-  if x.device != weight.device or not is_s30(x.device): return None
+  if (device:=x.device) != weight.device or not is_s30(device): return None
+  with Context(ALLOW_DEVICE_USAGE=1):
+    if rows >= 128 and rows%8 == 0 and k >= 128 and Device[device].renderer.has_shared: return None  # native workgroup reduction
   # Adjacent work items can read short contiguous spans of a row before the second kernel adds the partial sums.
   partials = (weight.reshape(rows, k//32, 32) * x.reshape(k//32, 32)).sum(-1).contiguous()
   return partials.sum(-1).reshape(*x.shape[:-1], rows)
