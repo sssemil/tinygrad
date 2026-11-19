@@ -1,6 +1,6 @@
 import os, random, struct, unittest
 from pathlib import Path
-from tinygrad import Device, Tensor, TinyJit, dtypes
+from tinygrad import Device, Tensor, TinyJit, Variable, dtypes
 from tinygrad.device import Buffer
 from tinygrad.helpers import DEV
 from tinygrad.runtime.support.mt.compiler import MTCompiler
@@ -103,11 +103,12 @@ class TestS30USB(unittest.TestCase):
   @requires_compiler
   def test_resident_programs_after_restart(self):
     @TinyJit
-    def run(x): return ((x+3).realize() * 7).realize()
-    for i in range(4):
-      if i == 3: Device["MT"].s30_fw.session.close()
-      values = list(range(i, i+257))
-      self.assertEqual(run(Tensor(values, device="MT")).tolist(), [(x+3)*7 for x in values])
+    def run(x, n): return (x[:n]+3).realize().pad(((0, 512-n),)).contiguous().realize()
+    count = Variable("count", 1, 512)
+    for i,n in enumerate((129, 129, 257, 17, 129)):
+      if i == 4: Device["MT"].s30_fw.session.close()
+      values = list(range(i, i+512))
+      self.assertEqual(run(Tensor(values, device="MT"), count.bind(n)).tolist(), [x+3 for x in values[:n]] + [0]*(512-n))
 
   @requires_compiler
   def test_grid(self):

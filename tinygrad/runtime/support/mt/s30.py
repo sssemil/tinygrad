@@ -31,6 +31,8 @@ UTIL = REG_BUF + 64 * 48
 WATCHDOG = UTIL + 0x4c0
 ITEM = round_up(WATCHDOG + 16, 0x1000)
 PACKET = ITEM + 0x1000
+CDM_CONTROLS, CDM_RING, CDM_KICK_SIZE = 0x200, 0x300, 0x158
+CDM_SUBMISSION_SIZE = 96+16+CDM_KICK_SIZE
 PDS_BASE, USC_BASE = 0xda00000000, 0xe000000000
 
 def s30_boot_image(raw:bytes) -> bytearray:
@@ -128,38 +130,46 @@ class MTS30Firmware(MTFirmwareBoot):
       finally:
         for reg,old in zip(timers, saved): self.dev.smc._w32(reg, old)
 
-  def _submit(self, token:int|None, command:int, region:int, packet:bytearray, region_size:int, timeout:float,
-              signal:tuple[int,int]|None=None) -> MTResponse:
-    # 3.1.0 submission header and single region descriptor.
-    struct.pack_into('<I', packet, 28, command)
-    struct.pack_into('<II', packet, 40, 72, 1)
-    struct.pack_into('<I4xQI', packet, 72, region, 72+24, region_size)
+  def submit(self, token:int|None, command:int, size:int, data:bytearray, timeout:float, signal:tuple[int,int]|None=None,
+             resident:Buffer|None=None, offset:int=0) -> MTResponse:
     with self.lock:
       if self.queue is None: raise RuntimeError("S30 firmware is not running")
       if self.queue.wr_idx != self.queue.response_rd: raise RuntimeError("Previous S30 submission is still pending")
-      self.v[PACKET:PACKET+len(packet)] = packet
-      self.queue.submit(FW_DEVVA+PACKET, 96+region_size, ROOT_BASE, generation=self.queue.seq+1, command=command, token=token, signal=signal)
+      addr, mem = (FW_DEVVA+PACKET, self.v.view(PACKET)) if resident is None else (resident.meta.va, resident.host)
+      mem[offset:offset+len(data)] = data
+      self.queue.submit(addr, size, ROOT_BASE, generation=self.queue.seq+1, command=command, token=token, signal=signal)
       return self.queue.wait(timeout)
 
   def nop(self, token:int, timeout:float=5.0, *, signal:tuple[int,int]|None=None) -> MTResponse:
-    packet = bytearray(96+160)
+    packet = s30_submission(mtfw.MTFW_SUBMISSION_CMD_GPU_NOP, mtfw.MTFW_SUB_REGION_NOP, 160)
     struct.pack_into('<I', packet, 96+8, 160)
-    return self._submit(token, mtfw.MTFW_SUBMISSION_CMD_GPU_NOP, mtfw.MTFW_SUB_REGION_NOP, packet, 160, timeout, signal)
+    return self.submit(token, mtfw.MTFW_SUBMISSION_CMD_GPU_NOP, len(packet), packet, timeout, signal)
 
   def cdm(self, token:int|None, words:tuple[int,...], timeout:float=5.0, *, regions:int=8) -> MTResponse:
-    # Upload the submission, both queue controls and the stream together. The context and stacks are GPU scratch.
-    controls, ring, context, stacks = 0x200, 0x300, 0xc00, 0xe00
-    ring_size, write_offset = 0x800, (len(words)+1)*4 + 64  # include the CDM prefetch guard after STREAM_TERMINATE
-    if write_offset >= ring_size: raise ValueError("S30 compute stream exceeds its ring")
-    base, kick, kick_size = FW_DEVVA+PACKET, 96+16, 0x158
-    packet = bytearray(ring+write_offset)
-    struct.pack_into('<II', packet, 96+8, 16, 1)
-    struct.pack_into('<I', packet, kick+8, kick_size)
-    struct.pack_into('<II', packet, kick+0xc0, regions, regions)  # attribute and temporary regions
-    struct.pack_into('<5Q', packet, kick+0x118, base+context, base+ring, base+controls, ring_size, base+stacks)
-    for core in range(2): struct.pack_into('<Q', packet, controls+core*128, write_offset)
-    struct.pack_into(f'<{len(words)+1}I', packet, ring, *words, 0x80000000)
-    return self._submit(token, mtfw.MTFW_SUBMISSION_CMD_GPU_CDM, mtfw.MTFW_SUB_REGION_CDM, packet, 16+kick_size, timeout)
+    packet = s30_cdm_packet(words, regions, FW_DEVVA+PACKET)
+    return self.submit(token, mtfw.MTFW_SUBMISSION_CMD_GPU_CDM, CDM_SUBMISSION_SIZE, packet, timeout)
+
+def s30_submission(command:int, region:int, region_size:int) -> bytearray:
+  # 3.1.0 submission header and single region descriptor.
+  packet = bytearray(96+region_size)
+  struct.pack_into('<I', packet, 28, command)
+  struct.pack_into('<II', packet, 40, 72, 1)
+  struct.pack_into('<I4xQI', packet, 72, region, 96, region_size)
+  return packet
+
+def s30_cdm_packet(words:tuple[int,...], regions:int, addr:int) -> bytearray:
+  ring_size, write_offset = 0x800, (len(words)+1)*4 + 64  # include the CDM prefetch guard after STREAM_TERMINATE
+  if write_offset >= ring_size: raise ValueError("S30 compute stream exceeds its ring")
+  packet = s30_submission(mtfw.MTFW_SUBMISSION_CMD_GPU_CDM, mtfw.MTFW_SUB_REGION_CDM, 16+CDM_KICK_SIZE)
+  packet.extend(bytes(CDM_RING+write_offset-len(packet)))
+  struct.pack_into('<II', packet, 96+8, 16, 1)
+  kick, scratch = 96+16, FW_DEVVA+PACKET
+  struct.pack_into('<I', packet, kick+8, CDM_KICK_SIZE)
+  struct.pack_into('<II', packet, kick+0xc0, regions, regions)
+  struct.pack_into('<5Q', packet, kick+0x118, scratch+0xc00, addr+CDM_RING, addr+CDM_CONTROLS, ring_size, scratch+0xe00)
+  for core in range(2): struct.pack_into('<Q', packet, CDM_CONTROLS+core*128, write_offset)
+  struct.pack_into(f'<{len(words)+1}I', packet, CDM_RING, *words, 0x80000000)
+  return packet
 
 class MTS30Program(Program['MTDevice']):
   def __init__(self, dev:MTDevice, obj:TinyELF, links:dict):
@@ -171,7 +181,6 @@ class MTS30Program(Program['MTDevice']):
     shared, temps = k['.shared_reg_count'], ceildiv(k['.temp_reg_count'], 2)
     attrs = max(1, ceildiv(k['.attr_reg_count'], 2))
     if not 0 < shared <= 0xfff or max(attrs, temps) > 0x7f: raise ValueError("S30 shader register allocation exceeds dispatch fields")
-    self.regions = max(8, temps, attrs)
     self.params = bytearray(4*shared)
     for imm in image.metadata.immediates: struct.pack_into('<I', self.params, 4*imm.offset, imm.value)
     self.args = []
@@ -198,13 +207,16 @@ class MTS30Program(Program['MTDevice']):
       dev.s30_fw.mmu.map_range(PDS_BASE+pds_off, self.pds.meta.pa, self.pds.meta.size, MT_PTE_READ_ONLY)
       dev.s30_fw.mmu.map_range(USC_BASE+usc_off, self.code.meta.pa, self.code.meta.size, MT_PTE_READ_ONLY)
     self.shared = ceildiv(shared, 16)
-    self.dispatch = (2, pds_off | 2, pds_off+16, 0, 0, 0, 0x02000000 | self.shared, 0, 0x100085 | attrs<<12, pds_off+32, pds_off+64)
+    dispatch = (2, pds_off | 2, pds_off+16, 0, 0, 0, 0x02000000 | self.shared, 0, 0x100085 | attrs<<12, pds_off+32, pds_off+64)
+    self.packet = Buffer(dev.device, 0x1000, preallocate=True)
+    packet = s30_cdm_packet(dispatch + (0,)*5, max(8, temps, attrs), self.packet.meta.va)
+    self.packet.host[:len(packet)] = packet
+    # Every launch resets both queue controls and updates the five grid words at the end of the stream.
+    self.launch = packet[CDM_CONTROLS:CDM_RING+4*(len(dispatch)+5)]
 
   def __call__(self, *args, global_size:tuple[int,int,int]=(1,1,1), local_size:tuple[int,int,int]=(1,1,1), wait:bool=False, timeout:int|None=None):
     lx,ly,lz = local_size
     lanes = lx*ly*lz
-    stream = self.dispatch + tuple(g-1 for g in global_size) + ((lanes if lanes < 32 else 0)<<25 | 2<<11 | self.shared,
-                                                                (lx-1)<<20 | (ly-1)<<10 | (lz-1))
     fw = self.dev.s30_fw
     with fw.lock:
       for value,(off,fmt) in zip(args, self.args, strict=True): struct.pack_into(fmt, self.params, off, value)
@@ -216,7 +228,10 @@ class MTS30Program(Program['MTDevice']):
       else: fw.upload_mmu()
       try:
         start = time.perf_counter()
-        resp = fw.cdm(None, stream, timeout=5.0 if timeout is None else timeout/1000, regions=self.regions)
+        struct.pack_into('<5I', self.launch, -20, *(g-1 for g in global_size),
+                         (lanes if lanes < 32 else 0)<<25 | 2<<11 | self.shared, (lx-1)<<20 | (ly-1)<<10 | (lz-1))
+        resp = fw.submit(None, mtfw.MTFW_SUBMISSION_CMD_GPU_CDM, CDM_SUBMISSION_SIZE, self.launch, 5.0 if timeout is None else timeout/1000,
+                         resident=self.packet, offset=CDM_CONTROLS)
         if resp.value: raise RuntimeError(f"S30 kernel {self.name} failed with firmware status {resp.value:#x}")
         return time.perf_counter()-start if wait else None
       except BaseException:
