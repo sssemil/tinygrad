@@ -28,7 +28,7 @@ def assemble(ins:list[Instruction]) -> tuple[bytes, int]:
   for i,(op,src,imm) in enumerate(ins):
     operands = tuple(regs[v] for v in src)
     for v in expires[i]: free.add(regs.pop(v))
-    if op not in ("st", "st8", "assign", "back"):
+    if op not in ("st", "st8", "st16", "assign", "back"):
       if not free: raise NotImplementedError("S30 USC needs more than 16 live temporaries")
       dst = min(free)
       peak = max(peak, dst+1)
@@ -61,6 +61,15 @@ def assemble(ins:list[Instruction]) -> tuple[bytes, int]:
     elif op in ("sqrt", "recip"):
       word = (0x80000a000200001a if op == "sqrt" else 0x80000a000000001a) | _field(dst,(7,8,16,20)) | _field(operands[0],(9,13,19,22))
       wait, signal = (10,15), 14
+    elif op in ("half_to_float", "float_to_half"):
+      a, = operands
+      word = (0x804008080082880b | _field(a,(14,21,25,27)) if op == "half_to_float" else 0x8040080804c08687 | _field(a,(6,12,20,19)))
+      word |= _field(dst,(4,16,24,33))
+      wait, signal = (55,56), 41
+    elif op == "select":
+      _, t, f = operands
+      word = 0xc04008080480a68b | _field(dst,(4,16,24,33)) | _field(t,(14,21,25,27)) | _field(f,(6,12,20,19))
+      wait, signal = (55,56), 41
     elif op == "u8tof":
       word = 0x80211818400388ca | _field(dst,(9,10,23,24)) | _field(operands[0],(18,22,21,25))
       wait, signal = (20,29), None  # converts the low byte and waits for dfc0
@@ -70,16 +79,18 @@ def assemble(ins:list[Instruction]) -> tuple[bytes, int]:
               "imax":0x9592200a10b06d00, "ieq":0x8196240816f07d00}[op] | _field(dst,(19,41,53,59))
       word |= _field(a,(6,16,17,36)) | _field(b,(15,38,37,40,47,54))
       wait, signal = (29,39), 18
-    elif op in ("fadd", "fmul", "fmax", "feq"):
+    elif op in ("fadd", "fmul", "fmax", "feq", "fgt"):
       a,b = operands
       word = {"fadd":0x804008080480a60b, "fmul":0x804008080480868d,
-              "fmax":0x804318080482a60b, "feq":0xa04108080482a60b}[op] | _field(dst,(4,16,24,33)) | _field(a,(6,12,20,19))
+              "fmax":0x804318080482a60b, "feq":0xa04108080482a60b, "fgt":0xa04208080482a60b}[op]
+      word |= _field(dst,(4,16,24,33)) | _field(a,(6,12,20,19))
       word |= _field(b, (14,21,25,27) if op != "fmul" else (22,32,38,40))
       wait, signal = (55,56), 41
-    elif op in ("ld", "ld8", "st", "st8"):
+    elif op in ("ld", "ld8", "ld16", "st", "st8", "st16"):
       addr = _field(imm,(45,17,22,30,36)) | _field(operands[0],(20,14,26,27))  # [shared pointer pair + byte offset in rN]
       if op.startswith("ld"): word, signal = 0xc00004000001858e | addr | _field(dst,(29,35,37,41)), None
       else: word, signal = 0xc000008000012a4e | addr | _field(operands[1],(25,23,28,32)), 15
+      if op.endswith("16"): word ^= 0x0004000000010000
       if op.endswith("8"): word ^= 0x0010000000010000
       wait = (18,19)
     else: raise ValueError(op)
@@ -105,7 +116,7 @@ class MTUSCRenderer(Renderer):
   def __init__(self, target:Target):
     if target.arch != "mp_10": raise RuntimeError("USC requires the S30")
     super().__init__(target)
-  def supported_dtypes(self): return {dtypes.float, dtypes.int, dtypes.uchar}
+  def supported_dtypes(self): return {dtypes.float, dtypes.half, dtypes.int, dtypes.uchar, dtypes.bool}
   def render(self, uops:list[UOp]) -> str:
     params = sorted((u for u in uops if u.op is Ops.PARAM), key=lambda u:u.arg.slot)
     if any(p.addrspace != AddrSpace.GLOBAL or p.dtype not in self.supported_dtypes() for p in params):
@@ -121,6 +132,8 @@ class MTUSCRenderer(Renderer):
     def literal(bits:int) -> int:
       if bits not in constants: constants.append(bits)
       return emit("imm", imm=2*len(params)+constants.index(bits))
+    def select(cond:int, t:int, f:int) -> int:
+      return emit("select", emit("ilt", literal(0), cond), t, f)
     slots:dict[tuple[UOp,int],int] = {}
     def scale(src:int, n:int) -> int:
       if n <= 0: raise NotImplementedError("S30 USC needs a positive integer scale")
@@ -131,23 +144,34 @@ class MTUSCRenderer(Renderer):
       return acc
     def reg(u:UOp) -> int:
       if u in regs: return regs[u]
-      if u._shape != () or u.dtype not in (dtypes.int, dtypes.float, dtypes.uchar, dtypes.bool):
+      if u._shape != () or u.dtype not in (dtypes.int, dtypes.float, dtypes.half, dtypes.uchar, dtypes.bool):
         raise NotImplementedError(f"S30 USC scalar {u.op} {u.dtype}")
       if u.op is Ops.SPECIAL and u.arg in ("gidx0", "gidx1", "gidx2"): r = emit("group", imm=int(u.arg[-1]))
       elif u.op is Ops.SPECIAL and u.arg == "lidx0": r = emit("lane")
       elif u.op is Ops.AFTER: r = reg(u.src[0])
       elif u.op is Ops.CONST or (u.op is Ops.CAST and u.src[0].op is Ops.CONST):
         val = u.val if u.op is Ops.CONST else u.src[0].val
-        bits = struct.unpack('<I', struct.pack('<f', val))[0] if u.dtype == dtypes.float else int(val) & 0xffffffff
+        bits = int.from_bytes(struct.pack('<'+u.dtype.fmt, val), 'little') if u.dtype in (dtypes.half, dtypes.float) else int(val) & 0xffffffff
         r = literal(bits)
       elif u.op is Ops.CAST and u.dtype == dtypes.float and u.src[0].dtype == dtypes.uchar: r = emit("u8tof",reg(u.src[0]))
       elif u.op is Ops.CAST and u.dtype == dtypes.int and u.src[0].dtype == dtypes.bool: r = reg(u.src[0])
       elif u.op is Ops.CAST and u.dtype == dtypes.int and u.src[0].dtype == dtypes.uchar: r = emit("and", reg(u.src[0]), literal(255))
-      elif u.op is Ops.CMPEQ and u.src[0].dtype in (dtypes.int, dtypes.float):
+      elif u.op is Ops.CAST and (u.src[0].dtype, u.dtype) in ((dtypes.half,dtypes.float),(dtypes.float,dtypes.half)):
+        r = emit("float_to_half" if u.dtype == dtypes.half else "half_to_float", reg(u.src[0]))
+      elif u.op in (Ops.CMPEQ, Ops.CMPLT) and u.src[0].dtype in (dtypes.int, dtypes.float, dtypes.bool):
         a,b = (reg(x) for x in u.src)
-        r = emit("ilt", literal(0), emit("feq", a, b)) if u.src[0].dtype == dtypes.float else emit("ieq", a, b)
-      elif u.op in (Ops.ADD, Ops.MUL, Ops.MAX) and u.dtype in (dtypes.int, dtypes.float):
-        r = emit(("f" if u.dtype == dtypes.float else "i")+u.op.name.lower(), *(reg(x) for x in u.src))
+        if u.src[0].dtype != dtypes.float: r = emit("ieq" if u.op is Ops.CMPEQ else "ilt", a, b)
+        else: r = emit("ilt", literal(0), emit("feq", a, b) if u.op is Ops.CMPEQ else emit("fgt", b, a))
+      elif u.op is Ops.AND and u.dtype in (dtypes.bool, dtypes.int): r = emit("and", *(reg(x) for x in u.src))
+      elif u.op is Ops.OR and u.dtype == dtypes.bool: r = emit("imax", *(reg(x) for x in u.src))
+      elif u.op is Ops.WHERE:
+        cond, t, f = (reg(x) for x in u.src)
+        r = select(cond, t, f)
+      elif u.op in (Ops.ADD, Ops.MUL, Ops.MAX) and u.dtype in (dtypes.int, dtypes.float, dtypes.half):
+        a,b = (reg(x) for x in u.src)
+        if u.dtype == dtypes.half: a,b = emit("half_to_float", a), emit("half_to_float", b)
+        r = emit(("i" if u.dtype == dtypes.int else "f")+u.op.name.lower(), a, b)
+        if u.dtype == dtypes.half: r = emit("float_to_half", r)
       elif u.op in (Ops.RECIP, Ops.SQRT): r = emit(u.op.name.lower(), reg(u.src[0]))
       elif u.op is Ops.SHL and u.src[1].vmin == u.src[1].vmax: r = emit("imul", reg(u.src[0]), literal(1<<(int(u.src[1].vmin)%32)))
       elif u.op is Ops.SHR and u.src[0].vmin >= 0: r = emit("lsr", *(reg(x) for x in u.src))
@@ -175,25 +199,31 @@ class MTUSCRenderer(Renderer):
         emit("back", counter, pred)
       elif u.op in (Ops.LOAD, Ops.STORE):
         idx = u.src[0]
-        if (len(u.src) != (1 if u.op is Ops.LOAD else 2) or idx.op is not Ops.INDEX or len(idx.src) != 2 or
+        if (len(u.src) not in ((1,3) if u.op is Ops.LOAD else (2,)) or idx.op is not Ops.INDEX or len(idx.src) != 2 or
             idx._shape != () or idx.dtype != idx.src[0].dtype):
-          raise NotImplementedError("S30 USC requires an unconditional scalar buffer access")
+          raise NotImplementedError("S30 USC requires a scalar buffer access")
         index = idx.src[1]
         buf = idx.src[0].without_after
         if buf.op is Ops.BUFFER and buf.addrspace == AddrSpace.REG and index.vmin == index.vmax:
           key = (buf, int(index.vmin))
           if key not in slots: slots[key] = emit("slot")
+          if len(u.src) == 3: raise NotImplementedError("S30 USC masked register load")
           if u.op is Ops.STORE: emit("assign", slots[key], reg(u.src[1]))
           else: regs[u] = emit("mov", slots[key])
           continue
         if buf not in ptrs: raise NotImplementedError("S30 USC needs a global buffer or a fixed register index")
         offset = (index, buf.dtype.itemsize)
         if offset not in offsets: offsets[offset] = scale(reg(index), buf.dtype.itemsize)
-        suffix = "8" if buf.dtype.itemsize == 1 else ""
-        if u.op is Ops.LOAD: regs[u] = emit("ld"+suffix, offsets[offset], imm=ptrs[buf])
-        else: emit("st"+suffix, offsets[offset], reg(u.src[1]), imm=ptrs[buf])
-      elif u.op not in (Ops.PARAM, Ops.BUFFER, Ops.CONST, Ops.CAST, Ops.INDEX, Ops.SPECIAL, Ops.CMPEQ, Ops.TRUNCDIV, Ops.TRUNCMOD,
-                        *self.code_for_op, Ops.STACK, Ops.AFTER, Ops.SINK):
+        suffix = {1:"8", 2:"16", 4:""}[buf.dtype.itemsize]
+        if u.op is Ops.LOAD:
+          addr = offsets[offset]
+          if len(u.src) == 3: addr = select(reg(u.src[2]), addr, literal(0))
+          regs[u] = emit("ld"+suffix, addr, imm=ptrs[buf])
+          if len(u.src) == 3: regs[u] = select(reg(u.src[2]), regs[u], reg(u.src[1]))
+        if u.op is Ops.LOAD and u.dtype == dtypes.bool: regs[u] = emit("and", regs[u], literal(1))
+        if u.op is Ops.STORE: emit("st"+suffix, offsets[offset], reg(u.src[1]), imm=ptrs[buf])
+      elif u.op not in (Ops.PARAM, Ops.BUFFER, Ops.CONST, Ops.CAST, Ops.INDEX, Ops.SPECIAL, Ops.CMPEQ, Ops.CMPLT, Ops.WHERE,
+                        Ops.AND, Ops.OR, Ops.TRUNCDIV, Ops.TRUNCMOD, *self.code_for_op, Ops.STACK, Ops.AFTER, Ops.SINK):
         raise NotImplementedError(f"S30 USC cannot lower {u.op}")
     code, temps = assemble(ins)
     # Shared registers hold pointer pairs followed by the shader's literal words.

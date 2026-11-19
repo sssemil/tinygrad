@@ -121,6 +121,18 @@ class TestS30USB(unittest.TestCase):
       np.testing.assert_array_equal(out.numpy(), np.maximum(x@w.T, 0))
       np.testing.assert_array_equal((inputs.int() * inputs.int()).numpy(), x.astype(np.int32)**2)
 
+  @requires_firmware
+  def test_native_half_and_mask(self):
+    import numpy as np
+    rng = np.random.default_rng(30)
+    a,b = (rng.normal(size=65).astype(np.float16) for _ in range(2))
+    with Context(DEV="MT:USC", CACHELEVEL=0):
+      x,y = Tensor(a, device="MT"), Tensor(b, device="MT")
+      np.testing.assert_array_equal((x*y).numpy(), a*b)
+      np.testing.assert_array_equal((x.float()<y.float()).where(x,y).numpy(), np.minimum(a,b))
+      np.testing.assert_array_equal(x.pad(((2,3),), value=2.).numpy(), np.pad(a, (2,3), constant_values=2.))
+      np.testing.assert_array_equal(Tensor.full((37,37), -float("inf"), device="MT").triu(1).numpy(), np.triu(np.full((37,37), -np.inf), 1))
+
   @requires_compiler
   def test_tensor_compute(self):
     for n,dt in ((4, dtypes.int32), (257, dtypes.int32), (4099, dtypes.float32)):
