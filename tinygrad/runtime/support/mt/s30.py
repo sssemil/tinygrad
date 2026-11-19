@@ -189,6 +189,7 @@ class MTS30Program(Program['MTDevice']):
       if param['.reg_bank'] != 3 or param['.size'] != dt.itemsize: raise NotImplementedError("Unsupported S30 kernel argument layout")
       self.args.append((4*param['.offset'], '<'+unwrap(dt.fmt)))
     self.pds = Buffer(dev.device, len(pds)+len(self.params), initial_value=bytes(pds+self.params))
+    self.last_params:bytearray|None = self.params.copy()
     self.code = Buffer(dev.device, len(image.text), initial_value=image.text)
     self.shared = ceildiv(shared, 16)
     self.dispatch = (2, 2, 16, 0, 0, 0, 0x02000000 | self.shared, 0, 0x100085 | attrs<<12, 32, 64)
@@ -201,7 +202,10 @@ class MTS30Program(Program['MTDevice']):
     fw = self.dev.s30_fw
     with fw.lock:
       for value,(off,fmt) in zip(args, self.args, strict=True): struct.pack_into(fmt, self.params, off, value)
-      self.pds.host[96:] = self.params
+      if self.params != self.last_params:
+        self.last_params = None
+        self.pds.host[96:] = self.params
+        self.last_params = self.params.copy()
       fw.mmu.map_range(PDS_BASE, self.pds.meta.pa, self.pds.meta.size, MT_PTE_READ_ONLY)
       fw.mmu.map_range(USC_BASE, self.code.meta.pa, self.code.meta.size, MT_PTE_READ_ONLY)
       if fw.queue is None: fw.session.enter_context(fw.boot())

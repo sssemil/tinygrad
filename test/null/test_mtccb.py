@@ -11,13 +11,15 @@ class TestMTCCB(unittest.TestCase):
   def test_submission_and_response(self):
     dev, mem = _Dev(), bytearray(0x30000)
     q = MTCCB(dev, mem, 0x10000, 0x20000)
-    q.submit(0x8000420000, 0x19250, 0x30000000)
-    ci = mtfw.MTFW_CCB_ITEM.from_buffer_copy(mem[0x10000:0x10000+mtfw.MTFW_CCB_ITEM.SIZE])
+    q.submit(0x8000420000, 0x19250, 0x30000000, signal=(0x9000, 37))
+    ci = mtfw.MTFW_CCB_ITEM.from_buffer(mem, 0x10000)
     self.assertEqual(ci.submissionCmd, 104)
     self.assertEqual(ci.ccbItemToken, 0x103)
     self.assertEqual(ci.ccbItemPara.submissionPara.submissionAddr, 0x8000420000)
     self.assertEqual(ci.ccbItemPara.submissionPara.submissionSize, 0x19250)
     self.assertEqual(ci.ccbItemPara.submissionPara.pageTableRootAddr, 0x30000000)
+    sp = ci.ccbItemPara.submissionPara
+    self.assertEqual((sp.finishQSemValidMask, sp.finishQSem[0].addr, sp.finishQSem[0].value), (1, 0x9001, 37))
     self.assertEqual(struct.unpack_from('<Q', mem, 0x20000)[0], 0x90000000 + 0x10000)
     self.assertEqual(struct.unpack_from('<I', mem, 0x24000)[0], 1)
     self.assertEqual(dev.doorbell, (0xc00b00, struct.pack('<I', 3)))
@@ -29,8 +31,11 @@ class TestMTCCB(unittest.TestCase):
     self.assertEqual(q.wait(0.01), response)
     self.assertEqual(struct.unpack_from('<I', mem, 0x24028)[0], 1)
 
-    q.submit(0x8000420000, 0x19250, 0x30000000)
-    ci = mtfw.MTFW_CCB_ITEM.from_buffer_copy(mem[0x10000:0x10000+mtfw.MTFW_CCB_ITEM.SIZE])
+    ci.fwBuffer.field.submState = mtfw.MTFW_SUBMISSION_STATE_FINISHED
+    q.submit(0x8000500000, 0x400, 0x30000000)
+    self.assertEqual((sp.dependQSemValidMask, sp.finishQSemValidMask), (0, 0))
+    self.assertEqual((sp.submissionAddr, sp.submissionSize), (0x8000500000, 0x400))
+    self.assertEqual(ci.fwBuffer.field.submState, mtfw.MTFW_SUBMISSION_STATE_INIT)
     self.assertEqual(ci.ccbItemToken, 0x104)
     self.assertEqual(struct.unpack_from('<Q', mem, 0x20008)[0], 0x90000000 + 0x10000)
     self.assertEqual(struct.unpack_from('<I', mem, 0x24000)[0], 2)

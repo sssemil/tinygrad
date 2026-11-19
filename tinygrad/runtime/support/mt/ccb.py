@@ -1,5 +1,5 @@
 from __future__ import annotations
-import dataclasses, struct, time
+import ctypes, dataclasses, struct, time
 from tinygrad.runtime.autogen import mtfw
 from tinygrad.runtime.support.mt.mtdev import MTDev
 
@@ -22,15 +22,23 @@ class MTResponse:
 class MTCCB:
   def __init__(self, dev:MTDev, mem, item_off:int, queue_off:int, ccb_type:int=3, meta_base:int=0x90000000):
     self.dev, self.mem, self.item_off, self.queue_off = dev, mem, item_off, queue_off
-    self.ccb_type, self.meta_base, self.wr_idx = ccb_type, meta_base, 0
+    self.ccb_type, self.wr_idx = ccb_type, 0
     self.response_rd = 0
     self.pending_token = 0
     self.seq = 0
+    # Synchronous submissions reuse one item for every slot in the request ring.
+    self.mem[queue_off:queue_off+256*8] = struct.pack('<Q', meta_base+item_off) * 256
 
-  def _publish(self, ci) -> None:
-    self.mem[self.item_off:self.item_off+ci.SIZE] = bytes(ci)
-    cell_off = self.queue_off + (self.wr_idx % 256) * 8
-    self.mem[cell_off:cell_off+8] = struct.pack('<Q', self.meta_base + self.item_off)
+  def _publish(self, ci, skip_semaphores:bool=False) -> None:
+    item = bytes(ci)
+    if skip_semaphores:
+      # Both valid masks are zero. The firmware only needs the header and the fields after the semaphore arrays.
+      sp = ci.ccbItemPara.submissionPara
+      start = ctypes.addressof(sp.dependQSem) - ctypes.addressof(ci)
+      end = start + ctypes.sizeof(sp.dependQSem) + ctypes.sizeof(sp.finishQSem)
+      self.mem[self.item_off:self.item_off+start] = item[:start]
+      self.mem[self.item_off+end:self.item_off+len(item)] = item[end:]
+    else: self.mem[self.item_off:self.item_off+len(item)] = item
     self.pending_token = ci.ccbItemToken
     self.seq += 1
     self.wr_idx = (self.wr_idx + 1) & 0xff
@@ -54,7 +62,7 @@ class MTCCB:
       sp.finishQSemValidMask = 1
       sp.finishQSem[0].addr, sp.finishQSem[0].value = addr | 1, value  # META address, binary finish semaphore
     sp.qSempOutofOrder = 1
-    self._publish(ci)
+    self._publish(ci, skip_semaphores=signal is None)
 
   def flush_mmu(self, root_pa:int, generation:int=1) -> None:
     ci = mtfw.MTFW_CCB_ITEM()
