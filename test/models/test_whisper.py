@@ -1,11 +1,13 @@
+from copy import copy
 import unittest
 import pathlib
-from examples.whisper import init_whisper, load_file_waveform, transcribe_file, transcribe_waveform
+from examples.whisper import _token_norm, MultiHeadAttention
+from examples.whisper import AudioEncoder, TextDecoder, init_whisper, load_file_waveform, transcribe_file, transcribe_waveform
 from examples.audio_helpers import mel
 import examples.mlperf.metrics as metrics
 from tinygrad.helpers import fetch
 from test.helpers import slow
-from tinygrad import Tensor, Device, dtypes
+from tinygrad import Tensor, TinyJit, Variable, Device, dtypes, nn
 import numpy as np
 
 # Audio generated with the command on MacOS:
@@ -50,6 +52,76 @@ def wer_helper(result: str, reference: str)->float:
   reference = metrics.normalize_string(reference)
   wer, _, _ = metrics.word_error_rate([result], [reference])
   return wer
+
+class TestWhisperDecoder(unittest.TestCase):
+  def test_token_norm(self):
+    rng = np.random.default_rng(30)
+    layer = nn.LayerNorm(384)
+    layer.weight = Tensor(rng.uniform(0, 2, 384).astype(np.float16))
+    layer.bias = Tensor(rng.uniform(-1, 1, 384).astype(np.float16))
+    for tokens, dtype in ((1, dtypes.float), (2, dtypes.half)):
+      values = rng.normal(size=(1, tokens, 384)).astype(np.float32)
+      for samples in (values, np.ones_like(values), 32 + 0.25*values):
+        with self.subTest(tokens=tokens, dtype=dtype):
+          x = Tensor(samples).cast(dtype)
+          expected, actual = layer(x), _token_norm(layer, x)
+          self.assertEqual(actual.dtype, expected.dtype)
+          np.testing.assert_allclose(actual.numpy(), expected.numpy(), atol=8e-3 if dtype == dtypes.half else 1e-3, rtol=2e-3)
+
+  def test_token_self_attention(self):
+    rng = np.random.default_rng(30)
+    ref = MultiHeadAttention(32, 4, "self", max_self_attn_cache_len=32)
+    for w in nn.state.get_state_dict(ref).values(): w.replace(Tensor(rng.normal(0, 0.2, w.shape).astype(np.float16)))
+    fast = copy(ref)
+    for name in ("cache_k", "cache_v"):
+      data = rng.normal(size=(2, 32, 32)).astype(np.float32)
+      for attn in (ref, fast): setattr(attn, name, Tensor(data.copy()).realize())
+    step = TinyJit(lambda x, pos: fast.decode_token(x, pos).realize())
+    for index in (1, 2, 17, 31, 1):
+      pos = Variable("pos", 1, 31).bind(index)
+      x = Tensor(rng.normal(size=(2, 1, 32)).astype(np.float32))
+      np.testing.assert_allclose(step(x, pos).numpy(), ref(x, len=pos).numpy(), atol=1e-5, rtol=1e-4)
+      for name in ("cache_k", "cache_v"):
+        np.testing.assert_allclose(getattr(fast, name).numpy(), getattr(ref, name).numpy(), atol=1e-5, rtol=1e-4)
+
+  def test_aligned_audio_cache(self):
+    dims = dict(n_vocab=47, n_text_ctx=12, n_text_state=16, n_text_head=2, n_text_layer=1)
+    ref, aligned = TextDecoder(**dims), TextDecoder(**dims, audio_ctx_alignment=8)
+    ref.positional_embedding = Tensor.randn(12, 16)
+    nn.state.load_state_dict(aligned, nn.state.get_state_dict(ref), verbose=False)
+    for _ in range(2):
+      audio = Tensor.randn(1, 11, 16)
+      for pos, tokens in ((0, [[1, 3]]), (2, [[5]])):
+        args = Tensor(tokens), pos, audio if pos == 0 else None
+        np.testing.assert_allclose(aligned(*args).numpy(), ref(*args).numpy(), rtol=1e-4, atol=1e-5)
+
+  def test_greedy_matches_last_position(self):
+    decoder = TextDecoder(n_vocab=47, n_text_ctx=12, n_text_state=48, n_text_head=3, n_text_layer=1)
+    decoder.positional_embedding = Tensor.randn(12, 48)
+    audio = Tensor.randn(2, 8, 48)
+    for pos, tokens in ((0, [[1, 7], [8, 3]]), (2, [[2], [5]]), (3, [[6], [4]])):
+      x = Tensor(tokens)
+      encoded = audio if pos == 0 else None
+      expected = decoder(x, pos, encoded)[:, -1].argmax(-1).tolist()
+      self.assertEqual(decoder(x, pos, encoded, greedy=True).tolist(), expected)
+
+class TestWhisperEncoder(unittest.TestCase):
+  def test_silence_tail(self):
+    encoder = AudioEncoder(n_mels=4, n_audio_ctx=32, n_audio_state=8, n_audio_head=2, n_audio_layer=1, audio_ctx_alignment=8)
+    encoder.positional_embedding = Tensor.randn(32, 8)
+    for frames in (16, 32, 64):
+      silence = Tensor.randn(1, 4, 1)
+      prefix = Tensor.randn(1, 4, frames-6).cat(silence.expand(1, 4, 6), dim=-1)
+      full = prefix.pad((0, 64-frames), mode="replicate")
+      np.testing.assert_allclose(encoder(prefix, pad_silence=True).numpy(), encoder(full).numpy(), rtol=1e-4, atol=1e-5)
+
+  def test_aligned_attention(self):
+    encoder = AudioEncoder(n_mels=4, n_audio_ctx=16, n_audio_state=8, n_audio_head=2, n_audio_layer=2)
+    encoder.positional_embedding = Tensor.randn(16, 8)
+    audio = Tensor.randn(2, 4, 20)
+    expected = encoder(audio).numpy()
+    encoder.audio_ctx_alignment = 8
+    np.testing.assert_allclose(encoder(audio).numpy(), expected, rtol=1e-4, atol=1e-5)
 
 # TODO: WEBGPU GPU dispatch dimensions limit
 @unittest.skipIf(Device.DEFAULT == "WEBGPU", "WEBGPU GPU dispatch dimensions limit")
