@@ -4,10 +4,11 @@ from dataclasses import dataclass, replace
 from typing import Callable
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, dtypes, Device
 from tinygrad.llm.kernels.amd import Linear, ExpertWeights, fp8_matmul, gated_delta_prefill, flash_attention, amd_custom_kernels_supported
+from tinygrad.llm.kernels.mt import is_s30, s30_decode_attention
 from tinygrad.llm.gguf import gguf_parse, gguf_shard, GGUFPackedTable, _GGML_QUANT
 from tinygrad.llm.hf import hf_load
 from tinygrad.uop.ops import resolve, smax, ssimplify
-from tinygrad.helpers import unwrap, round_up, ceildiv, get_child
+from tinygrad.helpers import unwrap, round_up, ceildiv, get_child, TRAINING
 
 StartPos = tuple[int|UOp, ...]
 
@@ -43,6 +44,7 @@ def gated_activation(gate:Tensor, up:Tensor, config:TransformerConfig) -> Tensor
   alpha, limit, up_bias, situ = config.swiglu_alpha, config.swiglu_limit, config.swiglu_up_bias, config.situ
   if situ is not None: return (gate / situ[0]).tanh() * situ[0] * gate.sigmoid() * (up / situ[1]).tanh() * situ[1]
   if limit is not None and limit > 0: gate, up = gate.clamp(max_=limit), up.clamp(-limit, limit)
+  if gate.ndim == 3 and gate.shape[1] == 1 and alpha == 1.0 and up_bias == 0.0 and is_s30(gate.device): return gate.silu() * up
   # TODO: remove the need for this contiguous
   return gate * (gate * alpha).sigmoid().contiguous() * (up + up_bias)
 
@@ -408,8 +410,8 @@ class TransformerBlock(FFNBlock):
       attn = flash_attention(q, assigned_kv.transpose(0, 1), start_pos[0]+T)
       attn = attn.transpose(1, 2).reshape(B, T, -1)                                    # back to (B,T,D)
       return self.attn_output(attn if not self.config.attn_output_gate else (attn * gate.sigmoid()))
-    assigned_kv = _cache_prefix(assigned_kv, start_pos, T, 3).transpose(0, 1)
-    k, v = assigned_kv[0], assigned_kv[1]
+    prefix = _cache_prefix(assigned_kv, start_pos, T, 3).transpose(0, 1)
+    k, v = prefix[0], prefix[1]
     mask = (idx_mask.repeat_interleave(self.config.n_heads // int(idx_mask.shape[1]), dim=1) if idx_mask is not None else
             _causal_mask(x, start_pos, self.config.sliding_window))
     if hasattr(self, 'attn_sinks'):
@@ -418,7 +420,10 @@ class TransformerBlock(FFNBlock):
       sink_col = self.attn_sinks["weight"].reshape(1, -1, 1, 1).expand(1, self.config.n_heads, T, 1)
       if mask is None: mask = Tensor.zeros(1, 1, T, S, dtype=x.dtype, buffer=False)
       mask = mask.expand(B, self.config.n_heads, T, S).cat(sink_col.expand(B, -1, -1, -1), dim=-1)
-    attn = q.scaled_dot_product_attention(k, v, attn_mask=mask, enable_gqa=True)     # (B,H,T,Hd)
+    if not TRAINING and mask is None and T == 1 and self.config.max_context <= 128 and self.config.head_dim == 64 and q.dtype == dtypes.float and \
+        isinstance(pos:=start_pos[0], UOp) and pos.is_variable and is_s30(q.device):
+      attn = s30_decode_attention(q, assigned_kv.transpose(0, 1), pos)
+    else: attn = q.scaled_dot_product_attention(k, v, attn_mask=mask, enable_gqa=True)  # (B,H,T,Hd)
     attn = attn.transpose(1, 2).reshape(B, T, -1)                                    # back to (B,T,D)
     return self.attn_output(attn if not self.config.attn_output_gate else (attn * gate.sigmoid()))
 

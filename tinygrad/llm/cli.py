@@ -37,7 +37,7 @@ class FallbackTemplate:
   def role(self, role:str) -> str:
     if self.tok.preset == 'olmo': return "<|" + role + "|>\n"  # OLMoE Instruct format
     if self.tok.preset == 'kimi-k2': return "<|im_" + role + "|>" + role + "<|im_middle|>"
-    if self.tok.preset == 'qwen2': return "<|im_start|>" + role + "\n"
+    if self.tok.preset in ('qwen2', 'smollm'): return "<|im_start|>" + role + "\n"
     if self.tok.preset == 'glm4': return "<|" + role + "|>"
     if self.tok.preset == 'tekken':
       if role == 'user': return "[INST]"
@@ -47,7 +47,7 @@ class FallbackTemplate:
   def end_turn(self) -> str:
     if self.tok.preset == 'olmo': return "\n"
     if self.tok.preset == 'kimi-k2': return self.tok.decode([self.tok.eos_id])
-    if self.tok.preset == 'qwen2': return self.tok.decode([self.tok.eos_id]) + "\n"
+    if self.tok.preset in ('qwen2', 'smollm'): return self.tok.decode([self.tok.eos_id]) + "\n"
     if self.tok.preset == 'glm4': return ""
     if self.tok.preset == 'tekken': return "[/INST]"
     return self.tok.decode([self.tok.eos_id])

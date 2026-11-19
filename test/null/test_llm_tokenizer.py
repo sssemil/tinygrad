@@ -74,6 +74,12 @@ class TestLLMTokenizer(unittest.TestCase):
     self.llama_tok.encode(first)
     self.assertEqual(self.llama_tok.encode(changed), expected)
 
+  def test_smollm_digits(self):
+    tok = SimpleTokenizer({"Ġ":0, "1":1, "2":2, "12":3, "Ġ1":4, "Ġ12":5}, {"<|im_end|>":6}, "smollm", eos_id=6)
+    self._test_coding(tok, " 12", [0, 1, 2])
+    self.assertEqual(FallbackTemplate(tok).role("user"), "<|im_start|>user\n")
+    self.assertEqual(FallbackTemplate(tok).end_turn(), "<|im_end|>\n")
+
   def test_tekken_from_gguf_kv(self):
     kv = {
       "tokenizer.ggml.tokens": ["<unk>", "<s>", "</s>", "[INST]", "[/INST]", "hello"],

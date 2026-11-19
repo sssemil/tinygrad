@@ -114,6 +114,39 @@ class TestS30USB(unittest.TestCase):
         np.testing.assert_array_equal(result.numpy(), a @ b.transpose(0, 2, 1))
 
   @requires_compiler
+  def test_llm_decode_attention(self):
+    import numpy as np
+    from tinygrad.llm.kernels.mt import s30_decode_attention
+    rng = np.random.default_rng(30)
+    q = rng.normal(size=(2, 6, 1, 64)).astype(np.float32)
+    kv = rng.normal(size=(2, 2, 2, 128, 64)).astype(np.float16)
+    pos = Variable("pos", 0, 127)
+    run = TinyJit(lambda q, kv, p: s30_decode_attention(q, kv, p).realize())
+    for p in (0, 31, 127, 5):
+      cache = kv.copy()
+      cache[:, :, :, p+1:] = np.nan
+      keys, values = (a[:, :, :p+1].astype(np.float32).repeat(3, axis=1) for a in cache)
+      scores = q @ keys.swapaxes(-2, -1) / 8
+      exp = np.exp(scores - scores.max(axis=-1, keepdims=True))
+      result = run(Tensor(q, device="MT"), Tensor(cache, device="MT"), pos.bind(p))
+      np.testing.assert_allclose(result.numpy(), (exp / exp.sum(axis=-1, keepdims=True)) @ values, atol=2e-5, rtol=2e-5)
+
+  @requires_compiler
+  def test_llm_gemv(self):
+    import numpy as np
+    from tinygrad.llm.kernels.amd import Linear
+    rng = np.random.default_rng(30)
+    rows, k = 2048, 1024
+    w = rng.integers(-4, 5, (rows, k)).astype(np.float16)
+    bias = rng.integers(-8, 9, rows).astype(np.float32)
+    layer = Linear(k, rows)
+    layer.weight, layer.bias = Tensor(w, device="MT").realize(), Tensor(bias, device="MT").realize()
+    run = TinyJit(lambda x: layer(x).realize())
+    for _ in range(3):
+      x = rng.integers(-4, 5, (1, 1, k)).astype(np.float32)
+      np.testing.assert_array_equal(run(Tensor(x, device="MT")).numpy(), x @ w.astype(np.float32).T + bias)
+
+  @requires_compiler
   def test_symbolic_matmul(self):
     import numpy as np
     rng = np.random.default_rng(30)

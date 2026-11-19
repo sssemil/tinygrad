@@ -102,6 +102,9 @@ class Linear(nn.Linear):
       # symbolic token count: pad to the max chunk size so the kernels see static shapes, garbage rows are sliced off
       out = q8_linear(self, x.pad_to(x.max_shape))
       return out.shrink(tuple((0, s) for s in (*x.shape[:-1], self.out_features)))
+    if isinstance(device:=self.weight.device, str) and device.partition(":")[0] == "MT":
+      from tinygrad.llm.kernels.mt import s30_gemv
+      if (mt_out:=s30_gemv(x, self.weight)) is not None: return mt_out + self.bias if self.bias is not None else mt_out
     return super().__call__(x)
 
 class ExpertWeights:

@@ -7,7 +7,7 @@ class SimpleTokenizer:
                bos_id:int|None=None, add_bos:bool=True, eos_id:int=0, eot_id:int|None=None, eom_id:int|None=None, chat_template:str|None=None):
     marks = preset in ("qwen35", "qwen35moe")
     preset = {"qwen35":"qwen2","qwen35moe":"qwen2","minimax-m2":"gpt-4o","deepseek-v3":"joyai-llm"}.get(preset, preset)
-    if preset not in ("llama3","llama-v3","llama-bpe","qwen2","olmo","kimi-k2","tekken","glm4","gpt-4o","joyai-llm","bailingmoe2"):
+    if preset not in ("llama3","llama-v3","llama-bpe","qwen2","olmo","smollm","kimi-k2","tekken","glm4","gpt-4o","joyai-llm","bailingmoe2"):
       raise ValueError(f"Invalid tokenizer preset '{preset}'")
     # https://github.com/openai/gpt-2/blob/9b63575ef42771a015060c964af2c3da4cf7c8ab/src/encoder.py#L9
     bs = [*range(33, 127), *range(161, 173), *range(174, 256)]  # bytes that map to themselves
@@ -25,7 +25,7 @@ class SimpleTokenizer:
     r_ws, r_p_N, r_p_L = r"\t\n\x0b\x0c\r\x85" + ucat_range("Z"), ucat_range("N"), ucat_range(("L", "M") if marks else "L")
     contr, r_l, r_n = "(?i:'s|'t|'re|'ve|'m|'ll|'d)", f"[^\\r\\n{r_p_N}{r_p_L}]?", f"[{r_p_N}]" if preset == "tekken" else f"[{r_p_N}]{{1,3}}"
     r_p, r_w, r_t = f" ?[^{r_ws}{r_p_N}{r_p_L}]+[\\r\\n]*", f"{contr}|{r_l}[{r_p_L}]+", f"[{r_ws}]*[\\r\\n]+|[{r_ws}]+(?![^{r_ws}])|[{r_ws}]+"
-    if preset == "olmo":
+    if preset in ("olmo", "smollm"):
       r_w, r_n = f"'s|'t|'re|'ve|'m|'ll|'d| ?[{r_p_L}]+", f" ?[{r_p_N}]+"
       r_p, r_t = f" ?[^{r_ws}{r_p_N}{r_p_L}]+", f"[{r_ws}]+(?![^{r_ws}])|[{r_ws}]+"
     if preset in ("tekken", "gpt-4o", "kimi-k2"):
@@ -33,7 +33,7 @@ class SimpleTokenizer:
       sfx = "" if preset == "tekken" else f"{contr}?"
       r_w = f"{r_l}[{r_up}]*[{r_lo}]+{sfx}|{r_l}[{r_up}]+[{r_lo}]*{sfx}"
       if preset != "kimi-k2": r_p = f" ?[^{r_ws}{r_p_N}{r_p_L}]+[\\r\\n/]*"
-    self._pre_split = None
+    self._pre_split = re.compile(f"([{r_p_N}])") if preset == "smollm" else None
     if preset == "joyai-llm":
       r_ps = ucat_range(("P", "S"))
       r_p, r_w = f" ?[{r_ps}]+[\\r\\n]*", f"[{re.escape(string.punctuation)}][A-Za-z]+|[^\\r\\n{r_p_L}{r_ps}]?[{r_p_L}{ucat_range('M')}]+"
