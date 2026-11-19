@@ -413,3 +413,9 @@ PYTHONPATH=. python extra/usbgpu/s30/sram_mnist.py ../.s30-tools/mnist-s30.safet
 The factory board boot storage remained present. The SRAM run removes GPU DDR initialization from MNIST's compute and data path. It cannot establish which board code executed before the PCIe link came up.
 
 A separate launch-latency experiment read 0xff03 from the multicore routing register. After clearing the primary completion event, the primary event word read 0 and the secondary still read 4. The normal launcher continues to acknowledge each core.
+
+The offline sandbox also accepts the SRAM model as a target. Its verifier rejects VRAM BAR mappings and TLPs, ties each loaded shader to freshly emitted UOps, and retains the normal checks on zeroed compute startup and blocked management IPC. All 16 test images passed in 16 independent sandboxes. Each verified nine distinct generated shaders and returned its class by 341–367 ms. Reproduce with the model virtualenv active:
+
+```sh
+extra/usbgpu/s30/bench_isolated.sh sram-mnist ../.s30-tools/mnist-s30.safetensors --index 0
+```
