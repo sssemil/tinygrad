@@ -106,8 +106,6 @@ class TestS30USB(unittest.TestCase):
             a,b = (rng.integers(-(1<<31), 1<<31, n, dtype=dt) if dt == np.int32 else rng.normal(size=n).astype(dt) for _ in range(2))
             np.testing.assert_array_equal((Tensor(a, device="MT")+Tensor(b, device="MT")).numpy(), a+b)
       self.assertGreater(Device["MT"].s30_fw.queue.seq, 0)
-      x = Tensor([1., 2.], device="MT")
-      with self.assertRaisesRegex(NotImplementedError, "S30 USC"): x.sin().realize()
 
   @requires_firmware
   def test_native_projection(self):

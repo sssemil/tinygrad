@@ -79,3 +79,7 @@ Symbolic attention shapes required quotient and remainder by a runtime divisor. 
 ## November 20, 2026 — narrow integer kernels for quantized weights
 
 The Qwen cold loader reads raw GGUF bytes and combines them into FP32 and FP16 values. Added signed byte and halfword extension, modulo-width arithmetic, unsigned comparisons and integer-to-float conversion, bitwise OR/XOR, and variable shifts. S30 runs matched NumPy for signed and unsigned 8- and 16-bit data and unsigned 32-bit data. Offline compilation of the 63 captured Qwen graphs now succeeds for 61. Two exceed the current 32-register limit. This is compiler coverage, not yet an end-to-end token result.
+
+## November 20, 2026 — Qwen rotary embeddings
+
+Qwen's 623-operation rotary kernel exhausted the 32-register allocator. The scalar encodings now address up to 64 temporaries. Reloading shared constants near use avoids keeping every coefficient live for the whole kernel. The 159×64 rotary embedding test ran on hardware with maximum absolute error 7.60e-6 relative to tinygrad CPU. All 63 captured Qwen graphs now compile offline. Token generation is a separate acceptance check.
