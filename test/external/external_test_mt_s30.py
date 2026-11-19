@@ -108,6 +108,18 @@ class TestS30USB(unittest.TestCase):
       self.assertTrue(Device["MT"].s30_fw.direct)
       self.assertIsNone(Device["MT"].s30_fw.queue)
 
+  def test_native_shared_constants(self):
+    import numpy as np
+    data = np.linspace(-2, 3, 257, dtype=np.float32)
+    with Context(DEV="MT:USC", CACHELEVEL=0):
+      x = Tensor(data, device="MT")
+      y, expected = Tensor.zeros_like(x), np.zeros_like(data)
+      for i in range(1, 74):
+        threshold = np.float32(i/37)
+        y = y + (x-threshold.item()).relu()
+        expected += np.maximum(data-threshold, 0.)
+      np.testing.assert_allclose(y.numpy(), expected, rtol=1e-5, atol=1e-5)
+
   def test_native_projection(self):
     import numpy as np
     rng = np.random.default_rng(30)

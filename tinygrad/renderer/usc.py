@@ -82,7 +82,8 @@ def assemble(ins:list[Instruction]) -> tuple[bytes, int]:
       a,b = (0,imm) if op == "imm" else operands
       word = {"iadd":0x8190200010904c00, "imm":0x8190200010804c80, "ilt":0x8596240816f07d00,
               "imax":0x9592200a10b06d00, "ieq":0x8196240816f07d00}[op] | _field(dst,(19,41,53,59,70,46))
-      word |= _field(a,(6,16,17,36,48,27)) | _field(b,(15,38,37,40,47,54))
+      src_bits = (15,38,37,40,47,54)
+      word |= _field(a,(6,16,17,36,48,27)) | _field(b,src_bits+(66,76) if op == "imm" else src_bits)
       wait, signal = (29,39), 18
     elif op in ("fadd", "fmul", "fmax", "feq", "fgt"):
       a,b = operands
