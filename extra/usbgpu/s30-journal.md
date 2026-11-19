@@ -8,11 +8,11 @@ Measured on the same Chestnut S30 with compiler caching disabled. The cold colum
 
 | Workload | Native cold | MUSA cold | Native warm | MUSA warm |
 | --- | ---: | ---: | ---: | ---: |
-| MNIST, batch of 16 | 0.754 s | 3.506 s | 32.52 ms | 13.82 ms |
-| Whisper tiny.en, test.wav | 30.814 s | 50.836 s | 6.517 s | 2.595 s |
-| Qwen2.5-0.5B Q8_0 | 157.466 s | 171.460 s | 12.135 s | 9.622 s |
+| MNIST, batch of 16 | 0.936 s | 3.506 s | 32.04 ms | 13.82 ms |
+| Whisper tiny.en, test.wav | 32.161 s | 50.836 s | 6.514 s | 2.595 s |
+| Qwen2.5-0.5B Q8_0 | 157.689 s | 171.460 s | 12.147 s | 9.622 s |
 
-All five native outputs per model matched the reference. These native measurements disabled vendor compilation, vendor firmware boot and management mailbox construction. All three models have also run offline in fresh filesystem namespaces (details below). The card powered up with its factory firmware still installed. The host did not upload proprietary code during these model runs. The board-management mailbox was unused.
+All five native outputs per model matched the reference. The native column uses the offline, isolated benchmark. Separate hardware runs also disabled vendor compilation, vendor firmware boot and management mailbox construction. The card powered up with its factory firmware still installed. The host did not upload proprietary code during these model runs. The board-management mailbox was unused.
 
 ## November 20, 2026 — proprietary reference
 
@@ -184,3 +184,9 @@ The renderer emits conditional-start and conditional-end instructions around a s
 The native scheduler now groups independent output rows and columns into small register tiles. A symbolic row dimension is rounded up to an even number and guarded stores protect the last row. A NumPy comparison checked every output of both Qwen feed-forward projections for 1, 4, 17 and 32 input rows. With 32 rows, two-by-two tiles reduced one projection from 87 ms to 50 ms and the other from 96 ms to 48 ms. One-row inputs to the symbolic kernel were slower. Qwen's normal one-token decode uses a separate matrix-vector graph.
 
 With the resident ring and the new scheduler, all fifteen model outputs matched MUSA. Warm medians were 32.52 ms for MNIST, 6.517 s for Whisper and 12.135 s for Qwen. Whisper regressed from 6.300 s, while MNIST and Qwen improved. The native and vendor Whisper runs both used the example's normal 30-second encoder context for the short fixture with context alignment 64. The model's silence handling preserves that context. The two slowest Qwen prompt projections and Whisper's encoder projections remain candidates for better memory access scheduling.
+
+## November 20, 2026 — reproducible offline acceptance
+
+Each invocation of the isolated benchmark starts a new offline process with its own home, temporary directory and Python bytecode cache path. The script mounts the selected input and allowlisted dataset or model files. Each of the 15 outputs matched the vendor reference. The updated measurements at the top use this command. MUSA ran on the same hardware with its compiler cache disabled and the same inputs and warm-up policy.
+
+The S30 reported VBIOS 10520 and management RTOS 10206 in the earlier board-identification test. The published driver headers describe management RPCs after PCIe attach. They do not specify a volatile boot path for replacing the onboard controller before enumeration. The open META diagnostic controls a different processor. No onboard flash was modified. [Moore Threads management software and SUDI firmware release matrix](https://docs.mthreads.com/gmc/gmc-doc-online/gmi/releasenotes/gmi_releasenote/)
