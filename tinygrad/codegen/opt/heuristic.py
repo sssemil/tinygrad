@@ -64,18 +64,22 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
                                     r not in dot.backward_slice and red not in r.src[0].backward_slice for r in others):
           if others: k.ast = k.ast.substitute({r:r.substitute({r.src[1]:inner}) for r in others})
           row_lanes, sum_lanes = (32, 4) if others and row.src[0].val%32 == 0 else (8, 8)
+          if not others and row.src[0].val%64 == 0 and inner.src[0].val >= 2*row.src[0].val: row_lanes, sum_lanes = 64, 2
           k.apply_opt(Opt(OptOps.SPLIT, k.rngs.index(inner), (sum_lanes, AxisType.LOCAL)))
           k.apply_opt(Opt(OptOps.SPLIT, k.rngs.index(row), (row_lanes, AxisType.LOCAL)))
           k.apply_opt(Opt(OptOps.SPLIT, k.upcastable_dims(reduce=True)[-1], (4, AxisType.UPCAST)))
           return k
     spatial = dot is not None and sum(1 < k.full_shape[i] <= 5 for i in k.upcastable_dims(reduce=True)) >= 2
-    tiled = False
+    tiled = wide_cols = False
     if dot is not None and red is not None and red.dtype == dtypes.float and len(red.src) == 2:
       lhs, rhs = (x.ranges for x in dot.src)
       dims = [r for r in k.rngs if r.axis_type is AxisType.GLOBAL and (r.src[0].op is Ops.CONST or r.src[0].is_variable) and r.vmax+1 >= 16]
       rows, cols = [r for r in dims if r in lhs and r not in rhs], [r for r in dims if r in rhs and r not in lhs]
       if len(rows) == len(cols) == 1 and red.src[1] in lhs and red.src[1] in rhs:
-        for r,n in ((rows[0], 2 if rows[0].src[0].is_variable else 4), (cols[0], 2)):
+        # For long, fixed reductions, move two accumulators from the reduction axis to the output columns.
+        wide_cols = (not rows[0].src[0].is_variable and cols[0].src[0].op == red.src[1].src[0].op == Ops.CONST and
+                     red.src[1].src[0].val >= 2*cols[0].src[0].val and len(k.reduceops) == 1 and len(dot.ranges) == 3)
+        for r,n in ((rows[0], 2 if rows[0].src[0].is_variable else 4), (cols[0], 4 if wide_cols else 2)):
           if r.src[0].is_variable: r = k.apply_opt(Opt(OptOps.PADTO, k.rngs.index(r), n))
           if r.src[0].divides(n) is not None:
             k.apply_opt(Opt(OptOps.SPLIT, k.rngs.index(r), (n, AxisType.UPCAST)))
@@ -109,7 +113,7 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
       if k.rngs[i].src[0].op is Ops.CONST:
         n = k.full_shape[i]
         if 2 <= n <= 5: k.apply_opt(Opt(OptOps.SPLIT, i, (0, AxisType.UPCAST)))
-        elif n%4 == 0: k.apply_opt(Opt(OptOps.SPLIT, i, (4, AxisType.UPCAST)))
+        elif n%4 == 0: k.apply_opt(Opt(OptOps.SPLIT, i, (2 if wide_cols else 4, AxisType.UPCAST)))
     return k
 
   # upcast float4 images, this must be early so we don't accidentally add locals before the upcast

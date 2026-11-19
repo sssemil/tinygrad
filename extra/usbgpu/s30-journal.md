@@ -8,9 +8,9 @@ Measured on the same Chestnut S30 with compiler caching disabled. The cold colum
 
 | Workload | Native cold | MUSA cold | Native warm | MUSA warm |
 | --- | ---: | ---: | ---: | ---: |
-| MNIST, batch of 16 | 0.851 s | 3.583 s | 26.76 ms | 14.09 ms |
-| Whisper tiny.en, test.wav | 11.056 s | 50.641 s | 5.175 s | 2.608 s |
-| Qwen2.5-0.5B Q8_0 | 17.029 s | 172.371 s | 5.146 s | 4.818 s |
+| MNIST, batch of 16 | 0.850 s | 3.583 s | 27.44 ms | 14.09 ms |
+| Whisper tiny.en, test.wav | 11.131 s | 50.641 s | 5.162 s | 2.608 s |
+| Qwen2.5-0.5B Q8_0 | 16.869 s | 172.371 s | 5.031 s | 4.818 s |
 
 The benchmark checked all five outputs against the recorded reference for each model on each backend. The native column uses the offline, isolated benchmark. It checked every loaded USC program against compiler output generated in the same process. The check covered 10 distinct binaries for MNIST, 88 for Whisper and 77 for Qwen. The benchmark also checked that compute startup received only zero-filled context memory, with META master boot disabled. It blocked vendor firmware boot and management mailbox construction. The card powered up with its factory firmware still installed. The host did not upload proprietary code during these model runs. The board-management mailbox was unused.
 
@@ -419,3 +419,9 @@ The offline sandbox also accepts the SRAM model as a target. Its verifier reject
 ```sh
 extra/usbgpu/s30/bench_isolated.sh sram-mnist ../.s30-tools/mnist-s30.safetensors --index 0
 ```
+
+## November 20, 2026 — distribute long dot products across more output rows
+
+A 896-row, 4,864-element FP16 weight projection took 1.897 ms with eight rows and eight reduction lanes per workgroup, and 1.611 ms with 64 rows and two reduction lanes. All outputs matched NumPy. The compiler applies the latter shape to single row reductions at least twice as long as the output row count when that count is divisible by 64. For fixed matrix products with a long reduction, four output columns and two unrolled reduction terms also reuse the input across more outputs. A broader heuristic exhausted the register file on Qwen. The accepted rule requires three matrix axes and a single reduction.
+
+Warm Qwen took 5.020 s in the tuning process and 5.031 s in the offline sandbox, down from 5.144 s immediately before the change. All five calls returned the reference tokens. Whisper measured 5.162 s and batch-16 MNIST 27.44 ms in the same isolated suite. The comparison table uses this native run and the previous MUSA run on this card. All 165 archived inference graphs and 118 MNIST training graphs compiled, and all 17 applicable native hardware tests passed.
