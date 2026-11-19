@@ -49,12 +49,18 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
 
   # Keep the scalar S30 renderer within its register file while packing independent outputs into one wave.
   if k.ren.target.renderer == "USC":
-    for r in [k.rngs[a] for a in k.axes_of(AxisType.GLOBAL, AxisType.WEAK, reduce=False)][::-1]:
+    globals_ = [k.rngs[a] for a in k.axes_of(AxisType.GLOBAL, AxisType.WEAK, reduce=False)]
+    width = 64 if k.reduceop is not None and len(globals_) > 1 else 32
+    for r in globals_[::-1]:
       if r.src[0].op is not Ops.CONST: continue
-      size = next((n for n in range(32, 1, -1) if r.src[0].val%n == 0), 1)
+      size = next((n for n in range(width, 1, -1) if r.src[0].val%n == 0), 1)
       if size > 1:
         k.apply_opt(Opt(OptOps.SPLIT, k.rngs.index(r), (size, AxisType.LOCAL)))
         break
+    if k.reduceop is not None and k.reduceop.arg[0] is Ops.ADD and (mul:=k.reduceop.src[0]).op is Ops.MUL:
+      lhs, rhs = (x.ranges for x in mul.src)
+      if (a:=next((i for i in k.upcastable_dims() if k.full_shape[i]%2 == 0 and (k.rngs[i] in lhs) != (k.rngs[i] in rhs)), None)) is not None:
+        k.apply_opt(Opt(OptOps.SPLIT, a, (2, AxisType.UPCAST)))
     if axes:=k.upcastable_dims(reduce=True):
       i = axes[-1]
       if k.rngs[i].src[0].op is Ops.CONST:

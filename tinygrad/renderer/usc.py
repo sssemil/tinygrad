@@ -9,7 +9,8 @@ def _field(value:int, bits:tuple[int, ...]) -> int:
   if not 0 <= value < 1<<len(bits): raise NotImplementedError(f"S30 USC operand {value} exceeds {len(bits)} bits")
   return sum(((value >> i) & 1) << bit for i,bit in enumerate(bits))
 
-# One scalar instruction per entry. Sources refer to previous instruction indices, imm selects a shared register.
+# Sources are instruction indices. A complemented index selects a shared register directly on these arithmetic operands.
+shared_bits:dict[str,tuple[int|None,...]] = {"iadd":(28,20), "imul":(28,None), "imad":(28,None,20), "fmul":(15,43), "fma":(15,43,35)}
 Instruction = tuple[str, tuple[int, ...], int]
 
 def assemble(ins:list[Instruction]) -> tuple[bytes, int]:
@@ -17,7 +18,8 @@ def assemble(ins:list[Instruction]) -> tuple[bytes, int]:
   last:dict[int,int] = {}
   loops = [(src[0], i) for i,(op,src,_) in enumerate(ins) if op == "back"]
   for i,(_,src,_) in enumerate(ins):
-    for v in src: last[v] = max(last.get(v, i), i, *(end for start,end in loops if v <= start <= i <= end))
+    for v in src:
+      if v >= 0: last[v] = max(last.get(v, i), i, *(end for start,end in loops if v <= start <= i <= end))
   # Overlap two independent reads. Keep the first address live until the second DMA waits for both data fences.
   first:set[int] = set()
   second:set[int] = set()
@@ -40,7 +42,8 @@ def assemble(ins:list[Instruction]) -> tuple[bytes, int]:
   code = bytearray()
   fence:int|None = None
   for i,(op,src,imm) in enumerate(ins):
-    operands = tuple(regs[v] for v in src)
+    if op == "imm" and i not in last: continue
+    operands = tuple(regs[v] if v >= 0 else ~v for v in src)
     for v in expires[i]: free.add(regs.pop(v))
     if op not in ("st", "st8", "st16", "assign", "back"):
       if not free: raise NotImplementedError("S30 USC needs more than 64 live temporaries")
@@ -123,6 +126,9 @@ def assemble(ins:list[Instruction]) -> tuple[bytes, int]:
       wait = (18,19)
     else: raise ValueError(op)
 
+    for v,bit in zip(src, shared_bits.get(op, ())):
+      if v < 0 and bit is not None: word ^= 1<<bit
+
     if op in ("group", "mov", "range", "assign") and word >= 1<<32:
       word = (word & ~(1<<31)) | 0x80000800<<32  # one-word burst
     elif op in ("iadd", "imm", "ilt", "imax", "ieq") and word >= 1<<64:
@@ -175,6 +181,12 @@ class MTUSCRenderer(Renderer):
     regs:dict[UOp,int] = {}
     offsets:dict[tuple[UOp,int],int] = {}
     def emit(op:str, *src:int, imm:int=0) -> int:
+      if op in shared_bits:
+        if op in ("imul", "imad") and ins[src[1]][0] == "imm": src = (src[1],src[0],*src[2:])
+        for i,(v,bit) in enumerate(zip(src, shared_bits[op])):
+          if bit is not None and ins[v][0] == "imm" and ins[v][2] < 64:
+            src = (*src[:i], ~ins[v][2], *src[i+1:])
+            break
       ins.append((op, src, imm))
       return len(ins)-1
     def literal(bits:int) -> int:

@@ -2,6 +2,18 @@
 
 Hardware used for these measurements is the 4 GiB MTT S30 on Chestnut over USB. The host runs tinygrad. Model checkpoints are inputs. The shader cache starts empty for native acceptance runs.
 
+## Latest end-to-end cold and warm measurements
+
+Measured on the same Chestnut S30 with compiler caching disabled. The cold column starts before device and checkpoint setup and stops when the first result is available. Warm latency is the median of calls 3–5 in the same process. Each Qwen call reprocesses the prompt and returns eight tokens. The input files and output comparisons are described below.
+
+| Workload | Native cold | MUSA cold | Native warm | MUSA warm |
+| --- | ---: | ---: | ---: | ---: |
+| MNIST, batch of 16 | 0.849 s | 3.506 s | 171.51 ms | 13.82 ms |
+| Whisper tiny.en, test.wav | 30.457 s | 50.836 s | 6.419 s | 2.595 s |
+| Qwen2.5-0.5B Q8_0 | 162.740 s | 171.460 s | 17.283 s | 9.622 s |
+
+All five native outputs per model matched the reference. The native measurements blocked the two vendor compiler entry points, vendor compute-firmware boot and construction of the management mailbox. They use the paired-load renderer, direct shared arithmetic operands, two-core dispatch and two-output tiling. The card powered up with its factory firmware still installed. The host did not supply proprietary code or communicate with that firmware during these model runs.
+
 ## November 20, 2026 — proprietary reference
 
 The existing `MT:MUSA` path uses mcc to build GPU code. The alternate `MT:LLVM` path uses the vendor MTGPU clang. Both use tinygrad's USB transport, MMU, queues and shader dispatch. The S30 boot path uploads the vendor's `mtfw-gen1.bin`. The board management controller also runs firmware.
@@ -135,3 +147,8 @@ The earlier two-core timeout consumed four bytes on core 0 while core 1's ring r
 The native host path now programs each core's context-zero translation and compute heaps, kicks both cores, and waits for both hardware events. The production hardware suite passed its ten applicable tests. Fresh-cache MNIST returned the same 16 predictions five times and improved from 427.02 to 219.97 ms warm. The parked management controller received no requests in the strict workload test.
 
 Native kernels can also use all three local coordinates. AR0 supplies X, while AR1 packs Y in the low 16 bits and Z in the high 16. A tinygrad custom kernel running a single 8×4×2 workgroup stored 64 distinct expected coordinate values.
+
+
+## November 20, 2026 — read shader constants directly in arithmetic
+
+USC integer multiply-add and floating-point arithmetic can take one operand directly from a shared register. This removes the temporary register and move used to copy a constant first. For dot products, placing two outputs with one common operand in the same thread allows that operand to be loaded once. Multi-axis reductions also benefited from wave groups of up to 64. The latest table above records the combined change with both GPU cores active. All 165 captured graphs compiled from source and the direct hardware suite passed 11 applicable tests.
