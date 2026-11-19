@@ -47,18 +47,24 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
   # make a copy so it does not mutate the input
   k = k.copy()
 
-  # Keep the scalar S30 renderer within its register file while packing independent outputs into one wave.
+  # Keep S30 reductions within the scalar register file. Spatial filters can share a workgroup across output axes.
   if k.ren.target.renderer == "USC":
+    red = k.reduceop
+    dot = red.src[0] if red is not None and red.arg[0] is Ops.ADD and red.src[0].op is Ops.MUL else None
+    spatial = dot is not None and sum(1 < k.full_shape[i] <= 5 for i in k.upcastable_dims(reduce=True)) >= 2
+    if spatial and (a:=next((i for i in reversed(k.upcastable_dims()) if k.full_shape[i]%4 == 0), None)) is not None:
+      k.apply_opt(Opt(OptOps.SPLIT, a, (4, AxisType.UPCAST)))
     globals_ = [k.rngs[a] for a in k.axes_of(AxisType.GLOBAL, AxisType.WEAK, reduce=False)]
-    width = 64 if k.reduceop is not None and len(globals_) > 1 else 32
+    width = 128 if spatial else 64 if red is not None and len(globals_) > 1 else 32
     for r in globals_[::-1]:
       if r.src[0].op is not Ops.CONST: continue
-      size = next((n for n in range(width, 1, -1) if r.src[0].val%n == 0), 1)
+      size = next((n for n in range(min(64, width), 1, -1) if r.src[0].val%n == 0), 1)
       if size > 1:
         k.apply_opt(Opt(OptOps.SPLIT, k.rngs.index(r), (size, AxisType.LOCAL)))
-        break
-    if k.reduceop is not None and k.reduceop.arg[0] is Ops.ADD and (mul:=k.reduceop.src[0]).op is Ops.MUL:
-      lhs, rhs = (x.ranges for x in mul.src)
+        width //= size
+        if not spatial or width == 1 or len(k.axes_of(AxisType.LOCAL)) == 3: break
+    if not spatial and dot is not None:
+      lhs, rhs = (x.ranges for x in dot.src)
       if (a:=next((i for i in k.upcastable_dims() if k.full_shape[i]%2 == 0 and (k.rngs[i] in lhs) != (k.rngs[i] in rhs)), None)) is not None:
         k.apply_opt(Opt(OptOps.SPLIT, a, (2, AxisType.UPCAST)))
     if axes:=k.upcastable_dims(reduce=True):

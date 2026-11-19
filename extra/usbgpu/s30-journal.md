@@ -8,7 +8,7 @@ Measured on the same Chestnut S30 with compiler caching disabled. The cold colum
 
 | Workload | Native cold | MUSA cold | Native warm | MUSA warm |
 | --- | ---: | ---: | ---: | ---: |
-| MNIST, batch of 16 | 0.849 s | 3.506 s | 171.51 ms | 13.82 ms |
+| MNIST, batch of 16 | 0.772 s | 3.506 s | 35.21 ms | 13.82 ms |
 | Whisper tiny.en, test.wav | 30.457 s | 50.836 s | 6.419 s | 2.595 s |
 | Qwen2.5-0.5B Q8_0 | 162.740 s | 171.460 s | 17.283 s | 9.622 s |
 
@@ -156,3 +156,9 @@ USC integer multiply-add and floating-point arithmetic can take one operand dire
 ## November 20, 2026 — recover both compute cores after a timeout
 
 An experimental workgroup barrier stalled the secondary core. A fresh process running known-good MNIST then timed out with no MMU fault. Applying the existing register reset sequence to the secondary core as well as the primary restored the card without a management message or Chestnut power cycle. The same MNIST checkpoint then passed five times (171.66 ms warm), and all eleven applicable direct hardware tests passed. Both direct initialization and timeout recovery now reset the second core.
+
+## November 20, 2026 — spatial convolution scheduling
+
+The native scheduler grouped adjacent filter outputs across up to three workgroup axes and assigned four outputs per lane when the shape allowed. Five fresh-cache passes on the trained MNIST model returned the same 16 classes as MUSA. Median warm batch latency fell from 171.51 ms to 35.21 ms. Independent tile trials ranged from 33.45 to 35.92 ms. Cold time to the first batch was 0.772 s. All 165 captured kernels from the three models still compiled from source. The direct S30 hardware suite passed its eleven applicable checks.
+
+A separate Qwen timing attributed 4.22 s and 2.33 s of a 14.59 s generation to two prompt-processing matrix multiplications. This profile was the second generation in its process. It is separate from the five-call benchmark above.
