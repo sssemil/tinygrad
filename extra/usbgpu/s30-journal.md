@@ -258,3 +258,7 @@ A GPU load from Sudi physical address bit 39 can reach Chestnut's PCIe SRAM. The
 In four alternating-payload trials per method on one card, uploading 2 MiB took a median 548.0 ms with the existing direct BAR write and 9.39 ms with the staged copy, from 3.83 to 223.32 MB/s. Every byte matched an independent BAR readback. The first staged transfer took 73 ms including kernel setup. Hardware regression cases covered guard bytes, unaligned nested views, the 16 KiB threshold and writes spanning two SRAM windows plus a tail. An initial experiment with a reverse copy timed out waiting for USB bulk IN. Ordinary VRAM reads still use the BAR.
 
 The isolated native Whisper setup fell from 22 s to 2.94 s. Qwen setup fell from 142 s to about seven seconds. The normal S30 hardware suite passed all 25 tests with vendor tools available and all 15 applicable tests with vendor paths absent.
+
+## November 20, 2026 — reuse convolution inputs across output channels
+
+The native scheduler tiles a convolution across two output channels and up to four adjacent spatial positions when the input and filter have distinct output axes. The isolated MNIST batch improved from 32.48 ms to 29.12 ms warm on the final transport run. All 16 labels matched on all five calls. Wider tiles exhausted the 64 temporary registers on some kernels. All 165 captured inference graphs and 118 captured training graphs compiled from source with the new schedule. The physical card also completed three Adam steps with a batch of two.

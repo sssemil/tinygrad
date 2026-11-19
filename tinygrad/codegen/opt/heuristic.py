@@ -72,8 +72,17 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
           if r.src[0].divides(n) is not None:
             k.apply_opt(Opt(OptOps.SPLIT, k.rngs.index(r), (n, AxisType.UPCAST)))
             tiled = True
-    if spatial and (a:=next((i for i in reversed(k.upcastable_dims()) if k.full_shape[i]%4 == 0), None)) is not None:
-      k.apply_opt(Opt(OptOps.SPLIT, a, (4, AxisType.UPCAST)))
+    if spatial and dot is not None:
+      lhs, rhs = (x.ranges for x in dot.src)
+      axes = [k.rngs[i] for i in k.upcastable_dims()]
+      rows, channels = [r for r in axes if r in lhs and r not in rhs], [r for r in axes if r in rhs and r not in lhs]
+      if len(rows) == 1: rows, channels = channels, rows
+      if len(rows) > 1 and len(channels) == 1:
+        # Reuse each input window across two output channels and each filter across four adjacent positions.
+        for r,n in ((channels[0], 2), (rows[-1], 4)):
+          if r.src[0].divides(n) is not None: k.apply_opt(Opt(OptOps.SPLIT, k.rngs.index(r), (n, AxisType.UPCAST)))
+      elif (a:=next((i for i in reversed(k.upcastable_dims()) if k.full_shape[i]%4 == 0), None)) is not None:
+        k.apply_opt(Opt(OptOps.SPLIT, a, (4, AxisType.UPCAST)))
     globals_ = [k.rngs[a] for a in k.axes_of(AxisType.GLOBAL, AxisType.WEAK, reduce=False)]
     width = 128 if spatial else 64 if red is not None and len(globals_) > 1 else 32
     for r in globals_[::-1]:
