@@ -8,11 +8,11 @@ Measured on the same Chestnut S30 with compiler caching disabled. The cold colum
 
 | Workload | Native cold | MUSA cold | Native warm | MUSA warm |
 | --- | ---: | ---: | ---: | ---: |
-| MNIST, batch of 16 | 0.938 s | 3.506 s | 32.48 ms | 13.82 ms |
-| Whisper tiny.en, test.wav | 31.976 s | 50.836 s | 6.434 s | 2.595 s |
-| Qwen2.5-0.5B Q8_0 | 156.041 s | 171.460 s | 10.622 s | 9.622 s |
+| MNIST, batch of 16 | 0.838 s | 3.506 s | 28.51 ms | 13.82 ms |
+| Whisper tiny.en, test.wav | 12.020 s | 50.836 s | 6.210 s | 2.595 s |
+| Qwen2.5-0.5B Q8_0 | 19.207 s | 172.244 s | 8.466 s | 4.811 s |
 
-All five native outputs per model matched the reference. The native column uses the offline, isolated benchmark. Separate hardware runs also disabled vendor compilation, vendor firmware boot and management mailbox construction. The card powered up with its factory firmware still installed. The host did not upload proprietary code during these model runs. The board-management mailbox was unused.
+All five native outputs per model matched the reference. The native column uses the offline, isolated benchmark. It checked every loaded USC program against compiler output generated in the same process. The check covered 10 distinct binaries for MNIST, 88 for Whisper and 68 for Qwen. The benchmark also disabled vendor firmware boot and management mailbox construction. The card powered up with its factory firmware still installed. The host did not upload proprietary code during these model runs. The board-management mailbox was unused.
 
 ## November 20, 2026 — proprietary reference
 
@@ -262,3 +262,9 @@ The isolated native Whisper setup fell from 22 s to 2.94 s. Qwen setup fell from
 ## November 20, 2026 — reuse convolution inputs across output channels
 
 The native scheduler tiles a convolution across two output channels and up to four adjacent spatial positions when the input and filter have distinct output axes. The isolated MNIST batch improved from 32.48 ms to 29.12 ms warm on the final transport run. All 16 labels matched on all five calls. Wider tiles exhausted the 64 temporary registers on some kernels. All 165 captured inference graphs and 118 captured training graphs compiled from source with the new schedule. The physical card also completed three Adam steps with a batch of two.
+
+## November 20, 2026 — check the origin of every loaded native shader
+
+An empty shader cache excludes a previous run's compiler output. To catch a precompiled shader embedded elsewhere, the offline runner now records the bytes emitted by the native USC renderer. Before any S30 program loads, it checks its target and looks up its entire binary in that set. This includes the copy kernel used to upload the checkpoint. The runner fails if it loads zero native programs, enters vendor compute firmware boot, or constructs the management IPC interface. A deliberately untracked program was rejected before accessing the device.
+
+The final isolated runs verified 10, 88 and 68 distinct loaded binaries respectively for MNIST, Whisper and Qwen. These are counts of unique binary contents per process. All fifteen outputs matched the corresponding proprietary run. The table at the top uses the instrumented native measurements. Qwen includes the full-chunk optimization on both paths. The board's own pre-PCIe startup remains outside this check. The driver exposes the Sudi management IPC rings in a 4 KiB shared SRAM window starting at BAR0 offset 0x6f000. That window supplies the post-boot IPC interface. A pre-PCIe controller bootstrap and a recovery path for this board are still unverified.

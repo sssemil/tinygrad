@@ -21,7 +21,8 @@ opts=(--die-with-parent --unshare-net --unshare-pid --clearenv
   --ro-bind /etc/passwd /etc/passwd --ro-bind /etc/group /etc/group --ro-bind /etc/ld.so.cache /etc/ld.so.cache
   --proc /proc --dev /dev --ro-bind /sys /sys --dev-bind "$node" "$node" --tmpfs /tmp --bind "$lock" "/tmp/$name"
   --ro-bind "$venv" /venv --ro-bind "$repo/tinygrad" /src/tinygrad --ro-bind "$repo/examples" /src/examples
-  --ro-bind "$repo/extra/usbgpu/bench_s30.py" /src/bench_s30.py --ro-bind "$input" /input
+  --ro-bind "$repo/extra/usbgpu/bench_s30.py" /src/bench_s30.py --ro-bind "$repo/extra/usbgpu/s30/verify_native.py" /src/s30/verify_native.py
+  --ro-bind "$input" /input
   --setenv HOME /home/bench --setenv PATH /venv/bin:/usr/bin --setenv PYTHONPATH /src
   --setenv PYTHONPYCACHEPREFIX /tmp/pycache --setenv PYTHONDONTWRITEBYTECODE 1 --setenv NUMBA_CACHE_DIR /tmp/numba --setenv CACHELEVEL 0 --setenv DEV MT:USC
   --setenv PARALLEL 0 --setenv MUSA_PATH /nonexistent --setenv MT_FIRMWARE /nonexistent --chdir /src)
@@ -39,4 +40,4 @@ esac
 for asset in "${assets[@]}"; do
   opts+=(--ro-bind "$downloads/$asset" "/home/bench/.cache/tinygrad/downloads/$asset")
 done
-exec bwrap "${opts[@]}" -- /venv/bin/python bench_s30.py "$1" /input
+exec bwrap "${opts[@]}" -- /venv/bin/python s30/verify_native.py "$1" /input
