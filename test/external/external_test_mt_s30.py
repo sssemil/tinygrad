@@ -10,8 +10,8 @@ from tinygrad.runtime.support.mt.s30 import DEFAULT_S30_FIRMWARE, PDS_BASE, USC_
 
 has_firmware = Path(os.getenv("MT_FIRMWARE", DEFAULT_S30_FIRMWARE)).is_file()
 requires_firmware = unittest.skipUnless(has_firmware, "requires mtgpu-s30 3.1.0-6 mtfw-gen1.bin")
-compiler_bin = 'clang-14' if DEV.renderer == "LLVM" else 'mcc'
-requires_compiler = unittest.skipUnless(has_firmware and DEV.renderer != "USC" and (MTCompiler().bin/compiler_bin).is_file(),
+compiler_bin = 'clang-14' if DEV.target("MT").renderer == "LLVM" else 'mcc'
+requires_compiler = unittest.skipUnless(has_firmware and DEV.target("MT").renderer in ("MUSA", "LLVM") and (MTCompiler().bin/compiler_bin).is_file(),
                                         f"requires S30 firmware and the renderer using {compiler_bin}")
 
 

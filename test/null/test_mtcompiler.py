@@ -3,6 +3,16 @@ from tinygrad.runtime.support.mt.compiler import MTCompiler, MTLLVMCompiler
 from tinygrad.runtime.support.mt.elf import MTKernelImage
 
 class TestMTCompiler(unittest.TestCase):
+  def test_default_renderer(self):
+    from tinygrad.device import select_renderer
+    from tinygrad.helpers import Target
+    from tinygrad.runtime.ops_mt import MTUSCRenderer, MUSARenderer
+    native = select_renderer(Target("MT", arch="mp_10"))
+    self.assertIsInstance(native, MTUSCRenderer)
+    self.assertEqual(native.target.renderer, "USC")
+    self.assertIsInstance(select_renderer(Target("MT", arch="mp_21")), MUSARenderer)
+    self.assertIsInstance(select_renderer(Target("MT", "MUSA", "mp_10")), MUSARenderer)
+
   @unittest.skipUnless((MTCompiler().bin/'mcc').is_file(), 'MUSA toolchain is not installed')
   def test_compile_and_metadata(self):
     image = MTCompiler().compile('#include <musa.h>\nextern "C" __global__ void mt_compute(int *out) { out[0] = 43; }\n')

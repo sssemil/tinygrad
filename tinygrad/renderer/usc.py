@@ -165,7 +165,7 @@ class MTUSCRenderer(Renderer):
   code_for_op = dict.fromkeys((Ops.ADD, Ops.SHL, Ops.SHR, Ops.MUL, Ops.SQRT, Ops.RECIP, Ops.EXP2, Ops.LOG2, Ops.MAX), lambda: None)
   def __init__(self, target:Target):
     if target.arch != "mp_10": raise RuntimeError("USC requires the S30")
-    super().__init__(target)
+    super().__init__(target.replacedefault(renderer="USC"))
   def supported_dtypes(self):
     return {dtypes.float, dtypes.half, dtypes.int, dtypes.uint, dtypes.short, dtypes.ushort, dtypes.char, dtypes.uchar, dtypes.bool}
   def render(self, uops:list[UOp]) -> str:

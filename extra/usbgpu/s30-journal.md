@@ -204,3 +204,7 @@ A separate clock diagnostic requested P0 via the management controller solely fo
 ## November 20, 2026 — source-built device diagnostics
 
 The low-level store test now assembles its USC program and builds its PDS launch code on each run. Both store values reached the expected offsets, including a dispatch near the end of the ring. All 24 hardware tests passed on the MUSA reference. The optional META boot and CDM diagnostics also ran with management mailbox construction disabled. Fresh assembly returned all five challenge responses, including wraparound, and the open CDM program consumed four bytes. Model inference reaches the compute queues directly and does not invoke these diagnostics.
+
+## November 20, 2026 — native S30 default
+
+Plain `DEV=MT` on the S30 now selects USC and opens the card without management IPC. With calls to both vendor compilers, the vendor compute boot path and the management mailbox set to raise, the trained MNIST checkpoint returned all 16 reference classes in five runs. Median warm latency was 32.36 ms. An offline selection test also checked the S80's MUSA default and an explicit S30 MUSA request. The normal native MNIST training launcher completed three batch-size-two Adam updates in a separate process.

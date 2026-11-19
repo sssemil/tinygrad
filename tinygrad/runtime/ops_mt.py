@@ -227,10 +227,10 @@ class MTProgram(Program['MTDevice']):
     return result.run_time / 25_000_000 if wait else None
 
 class MTDevice(Compiled):
-  renderers = [MUSARenderer, MTLLVMRenderer, MTUSCRenderer]
+  renderers = [MTUSCRenderer, MUSARenderer, MTLLVMRenderer]
   def __init__(self, device:str=''):
     dev_id = int(device.split(':')[1]) if ':' in device else 0
-    self.mt = MTDev.open_usb(dev_id, manage_power=DEV.renderer != "USC")
+    self.mt = MTDev.open_usb(dev_id, manage_power=DEV.target("MT").renderer in ("MUSA", "LLVM"))
     self.views:dict[int,tuple[Any,MTBufferMeta]] = {}
     super().__init__(device, MTAllocator(self), MTS30Program if self.mt.s30 else MTProgram, arch='mp_10' if self.mt.s30 else 'mp_21')
     if self.mt.s30:
