@@ -966,7 +966,7 @@ class Transformer:
     # NOTE: without this contiguous, it unpacks the weights from the model every time. we shouldn't need this, but for now it's faster
     if realize:
       params = nn.state.get_state_dict(model)
-      transpose = is_s30(dev:=model.token_embd.weight.device) and Device[dev].renderer.target.renderer == "USC"
+      transpose = is_s30(model.token_embd.weight.device, "USC")
       for name, s in params.items():
         # Store block projections with adjacent output channels contiguous for the S30's prefill workgroups.
         if transpose and name.startswith("blk.") and name.endswith(".weight") and s.ndim == 2 and isinstance(get_child(model, name[:-7]), Linear):

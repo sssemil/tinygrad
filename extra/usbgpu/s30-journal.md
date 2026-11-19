@@ -8,11 +8,11 @@ Measured on the same Chestnut S30 with compiler caching disabled. The cold colum
 
 | Workload | Native cold | MUSA cold | Native warm | MUSA warm |
 | --- | ---: | ---: | ---: | ---: |
-| MNIST, batch of 16 | 0.864 s | 3.506 s | 27.60 ms | 13.82 ms |
-| Whisper tiny.en, test.wav | 11.067 s | 50.836 s | 5.172 s | 2.595 s |
-| Qwen2.5-0.5B Q8_0 | 17.327 s | 172.244 s | 5.587 s | 4.811 s |
+| MNIST, batch of 16 | 0.851 s | 3.506 s | 26.76 ms | 13.82 ms |
+| Whisper tiny.en, test.wav | 11.056 s | 50.836 s | 5.175 s | 2.595 s |
+| Qwen2.5-0.5B Q8_0 | 17.029 s | 172.244 s | 5.146 s | 4.811 s |
 
-All five native outputs per model matched the reference. The native column uses the offline, isolated benchmark. It checked every loaded USC program against compiler output generated in the same process. The check covered 10 distinct binaries for MNIST, 88 for Whisper and 75 for Qwen. The benchmark also checked that compute startup received only zero-filled context memory, with META master boot disabled. It blocked vendor firmware boot and management mailbox construction. The card powered up with its factory firmware still installed. The host did not upload proprietary code during these model runs. The board-management mailbox was unused.
+All five native outputs per model matched the reference. The native column uses the offline, isolated benchmark. It checked every loaded USC program against compiler output generated in the same process. The check covered 10 distinct binaries for MNIST, 88 for Whisper and 77 for Qwen. The benchmark also checked that compute startup received only zero-filled context memory, with META master boot disabled. It blocked vendor firmware boot and management mailbox construction. The card powered up with its factory firmware still installed. The host did not upload proprietary code during these model runs. The board-management mailbox was unused.
 
 ## November 20, 2026 — proprietary reference
 
@@ -349,3 +349,9 @@ A regression shader on the physical S30 loaded 80 floats before their first sum,
 ## November 20, 2026 — combine two independent matrix-vector reductions
 
 Qwen's gate and up projections each reduced a row of 896 elements. Profiling measured 168 launches of the combined kernel at 1.188 s per eight-token response. The compiler now gives two independent row-wise dot products with identical reduction bounds the same loop index before splitting it across the workgroup. A dedicated device test compared every output of two 256×192 projections against NumPy. The cold-cache Qwen run fell from 17.814 to 17.327 s and its warm median from 6.012 to 5.587 s. All fifteen model outputs matched, 17 applicable hardware tests passed, and the native compiler accepted all 165 saved inference graphs and 118 MNIST training graphs. The MUSA reference uses the previous measurement on this card.
+
+## November 20, 2026 — reduce repeated work in native projections
+
+Materializing the input to native S30 linear layers once lets sibling projections reuse the activation and keeps normalization out of the inner dot product. Warm Qwen took 5.232 s with that change alone, down from 5.587 s. A separate experiment also transposed the vocabulary projection and increased warm latency to 5.294 s even with the wider paired schedule.
+
+For the captured paired projection, distributing a group over 32 rows and four reduction lanes took 3.372 ms, compared with 4.579 ms for eight rows and eight reduction lanes. All 4,864 outputs matched a NumPy reference at both widths. The 32-row schedule applies to paired FP32 sums when the row count is divisible by 32. The resulting isolated Qwen benchmark measured 5.131 and 5.146 s warm in two fresh processes. Each produced the same eight tokens on all five calls.

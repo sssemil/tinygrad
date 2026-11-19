@@ -4,9 +4,9 @@ from tinygrad import Context, Device, Tensor, UOp, dtypes
 from tinygrad.helpers import all_int, prod
 from tinygrad.uop.ops import KernelInfo, Ops
 
-def is_s30(device:str|tuple[str, ...]|None) -> TypeGuard[str]:
+def is_s30(device:str|tuple[str, ...]|None, renderer:str|None=None) -> TypeGuard[str]:
   if not isinstance(device, str) or device.partition(":")[0] != "MT": return False
-  with Context(ALLOW_DEVICE_USAGE=1): return Device[device].arch == "mp_10"
+  with Context(ALLOW_DEVICE_USAGE=1): return (dev:=Device[device]).arch == "mp_10" and (renderer is None or dev.renderer.target.renderer == renderer)
 
 def s30_gemv(x:Tensor, weight:Tensor) -> Tensor|None:
   # The extra launch pays off on large FP16 projections. Limit the FP32 partials to 32 MiB.
