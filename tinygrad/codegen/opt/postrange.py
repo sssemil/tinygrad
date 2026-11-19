@@ -6,7 +6,7 @@ from tinygrad.uop.ops import Ops, GroupOp, UOp, KernelInfo, graph_rewrite, AxisT
 from tinygrad.uop.ops import axis_colors
 from tinygrad.device import Buffer
 from tinygrad.dtype import dtypes
-from tinygrad.helpers import colored, getenv, DEBUG, NOOPT, round_up, prod, get_single_element
+from tinygrad.helpers import colored, getenv, DEBUG, NOOPT, ceildiv, round_up, prod, get_single_element
 from tinygrad.helpers import ALLOW_TF32, count, Context
 from tinygrad.codegen.opt import Opt, OptOps, KernelOptError, check
 from tinygrad.codegen.simplify import pm_flatten_range
@@ -127,14 +127,16 @@ class Scheduler:
       check(ret is not None, "no tensor core available")
     elif opt.op is OptOps.PADTO:
       check(type(opt.arg) is int and opt.arg > 1, f"padto arg is a multiple > 1, not {opt.arg}")
-      check(rng.src[0].op is Ops.CONST, "only pad const axes")
+      extent = rng.src[0]
+      check(extent.op is Ops.CONST or (rng.axis_type is AxisType.GLOBAL and extent.is_variable), "only pad constant or symbolic global axes")
       # TODO: upcasted is only wrong for a range pinned in WMMA tc_upcast_axes
       check(rng.axis_type not in {AxisType.UPCAST, AxisType.WARP}, "cannot pad upcasted or warp")
-      new_sz = round_up(int(rng.vmax+1), cast(int, opt.arg))
+      multiple = cast(int, opt.arg)
+      new_sz = round_up(int(rng.vmax+1), multiple)
       check(rng.vmax+1 > new_sz//4, "pad adds more than quadruple the work")
-      replaced_rng = rng.replace(src=(rng.src[0].const_like(new_sz),))
+      replaced_rng = rng.replace(src=(extent.const_like(new_sz) if extent.op is Ops.CONST else (ceildiv(extent, multiple)*multiple).simplify(),))
       replaces = {rng:replaced_rng}
-      valid = replaced_rng < rng.vmax+1
+      valid = replaced_rng < extent
       def gate(b:UOp) -> UOp: return b.replace(src=(b.src[0], b.src[1].get_idx().valid(valid&b.src[1].get_valid())))
       for b in self.bufs:
         if rng in b.src[1].ranges: replaces[b] = gate(b)

@@ -4,13 +4,15 @@ from typing import Any
 from tinygrad.device import Compiled, Program, Allocator, BufferStorage, BufferSpec, Buffer
 from tinygrad.renderer import Compiler, TinyELF
 from tinygrad.renderer.cstyle import CUDARenderer, CStyleLanguage
+from tinygrad.renderer.llvmir import LLVMRenderer, base_rewrite, ldt, llvm_intrinsics
 from tinygrad.dtype import dtypes, AddrSpace
-from tinygrad.helpers import round_up, diskcache_get, diskcache_put
+from tinygrad.helpers import round_up, diskcache_get, diskcache_put, Target, unwrap
+from tinygrad.uop.ops import Ops, PatternMatcher, UOp, UPat
 from tinygrad.runtime.support.memory import TLSFAllocator
 from tinygrad.runtime.support.mt.mmu import MT_PTE_READ_WRITE
 from tinygrad.runtime.support.mt.mtdev import MTDev
 from tinygrad.runtime.support.mt.launch import MTLaunch, parse_mt_bundle, compress_mt_bundle, decompress_mt_bundle
-from tinygrad.runtime.support.mt.compiler import MTCompiler
+from tinygrad.runtime.support.mt.compiler import MTCompiler, MTLLVMCompiler
 from tinygrad.runtime.support.mt.elf import MTKernelImage
 from tinygrad.runtime.support.mt.s30 import DEFAULT_S30_FIRMWARE, MTS30Firmware, MTS30Program
 
@@ -52,7 +54,7 @@ def generate_mt_launch(source:str, name:str, args:list[str], global_size:tuple[i
 
 class MUSACompiler(Compiler):
   def __init__(self, arch:str="mp_21"):
-    super().__init__('mt' if arch == 'mp_21' else f'mt_{arch}')
+    super().__init__({'mp_21':'mt', 'mp_10':'mt_mp_10_no_const_calc'}.get(arch, f'mt_{arch}'))
     self.mt = MTCompiler(arch=arch)
   def compile(self, src:str) -> bytes:
     if self.mt.arch == "mp_10": return self.mt.compile_raw(src)
@@ -72,15 +74,65 @@ class MUSACompiler(Compiler):
     diskcache_put('mt_sources', key, src)
     return lib
 
+pm_s30_half = PatternMatcher([
+  (UPat((Ops.SQRT, Ops.RECIP, Ops.EXP2, Ops.LOG2, Ops.SIN, Ops.TRUNC), dtypes.half, (UPat.var("x"),), name="op"),
+   lambda op,x: x.cast(dtypes.float).alu(op.op).cast(dtypes.half)),
+])
+
 class MUSARenderer(CUDARenderer):
+  compiler:MUSACompiler
   kernel_typedef = 'extern "C" __global__ void'
   def __init__(self, target):
     CStyleLanguage.__init__(self, target)
     self.compiler, self.tensor_cores = MUSACompiler("mp_10" if target.arch == "sudi" else target.arch or "mp_21"), []
-    if self.compiler.mt.arch == "mp_10": self.has_shared, self.shared_max = False, 0
+    if self.compiler.mt.arch == "mp_10":
+      self.has_shared, self.shared_max = False, 0
+      self.type_map = {**self.type_map, dtypes.half:"mt_half", dtypes.float:"mt_float"}
+      self.extra_matcher += pm_s30_half
+  def render_vector_prefix(self, dt, count):
+    if self.compiler.mt.arch == "mp_10" and dt in (dtypes.float, dtypes.half) and count in (2, 4):
+      # Conditional loads of MUSA's vector structs spill to private memory on mp_10.
+      scalar = self.type_map[dt]
+      vec = f"{scalar}{count}"
+      return f"typedef {scalar} {vec} __attribute__((ext_vector_type({count})));\n#define make_{vec}(...) (({vec}){{__VA_ARGS__}})"
+    return super().render_vector_prefix(dt, count)
   def render_kernel(self, function_name, kernel, bufs, uops, prefix=None):
-    return super().render_kernel(function_name, kernel, bufs, uops, ['#include <musa.h>'] + (prefix or []))
+    src = super().render_kernel(function_name, kernel, bufs, uops, ['#include <musa.h>'] + (prefix or []))
+    if self.compiler.mt.arch != "mp_10": return src
+    vectors = [self.render_vector_prefix(dt, count) for dt,count in ((dtypes.half, 2), (dtypes.float, 2), (dtypes.float, 4))]
+    return "\n".join(["using mt_float = float; using mt_half = _Float16;", *vectors, src])
   def supported_dtypes(self): return set(dtypes.all) - {dtypes.double}
+
+def mt_sreg(axis:str) -> str:
+  return f"llvm.musa.read.ptx.sreg.{'ctaid' if axis[0] == 'g' else 'tid'}.{'xyz'[int(axis[-1])]}"
+
+mt_intrinsics = {**llvm_intrinsics, Ops.SIN:"sin", Ops.TRUNC:"trunc"}
+
+class MTLLVMRenderer(LLVMRenderer):
+  abi = "mtgpu_kernel"
+  has_shared, shared_max = False, 0
+  global_max, local_max = CUDARenderer.global_max, CUDARenderer.local_max
+  code_for_op = {**LLVMRenderer.code_for_op, **dict.fromkeys(mt_intrinsics, lambda: None)}
+  string_rewrite = PatternMatcher([
+    (UPat(Ops.SPECIAL, name="x"), lambda ctx,x: f"  {ctx[x]} = call i32 @{mt_sreg(x.arg)}()"),
+    # mcc uses this instruction for float division. Generic LLVM fdiv pulls in a device-library routine on mp_10.
+    (UPat(Ops.FDIV, dtypes.float, (UPat.var("a"), UPat.var("b")), name="x"), lambda ctx,x,a,b:
+     f"  {ctx[x]} = call float @llvm.musa.fast.fdivide.f(float {ctx[a]}, float {ctx[b]})"),
+    (UPat(tuple(mt_intrinsics), name="x"), lambda ctx,x:
+     f"  {ctx[x]} = call {ldt(x.dtype)} @llvm.{mt_intrinsics[x.op]}.f{x.dtype.itemsize*8}({ldt(x.dtype)} {ctx[x.src[0]]})"),
+  ]) + base_rewrite
+  def __init__(self, target:Target):
+    if target.arch != "mp_10": raise RuntimeError("MT LLVM requires the S30")
+    super().__init__(target)
+    self.extra_matcher = unwrap(self.extra_matcher) + pm_s30_half
+    self.compiler = MTLLVMCompiler(target.arch)
+  def render(self, uops:list[UOp]) -> str:
+    decls = {f"declare i32 @{mt_sreg(u.arg)}()" for u in uops if u.op is Ops.SPECIAL}
+    if any(u.op is Ops.FDIV and u.dtype == dtypes.float for u in uops): decls.add("declare float @llvm.musa.fast.fdivide.f(float, float)")
+    decls |= {f"declare {ldt(u.dtype)} @llvm.{mt_intrinsics[u.op]}.f{u.dtype.itemsize*8}({ldt(u.dtype)})" for u in uops if u.op in mt_intrinsics}
+    _, kernel = self._render_kernel(uops, sorted(decls))
+    return kernel
+  def supported_dtypes(self): return super().supported_dtypes() - {dtypes.double, *dtypes.fp8s}
 
 @dataclasses.dataclass(frozen=True)
 class MTBufferMeta:
@@ -174,7 +226,7 @@ class MTProgram(Program['MTDevice']):
     return result.run_time / 25_000_000 if wait else None
 
 class MTDevice(Compiled):
-  renderers = [MUSARenderer]
+  renderers = [MUSARenderer, MTLLVMRenderer]
   def __init__(self, device:str=''):
     dev_id = int(device.split(':')[1]) if ':' in device else 0
     self.mt = MTDev.open_usb(dev_id)

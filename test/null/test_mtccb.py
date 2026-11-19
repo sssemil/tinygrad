@@ -60,6 +60,17 @@ class TestMTCCB(unittest.TestCase):
     self.assertEqual(q.wait(0.01), response)
     self.assertEqual(struct.unpack_from('<I', mem, 0x24028)[0], 0)
 
+  def test_batched_response_credits(self):
+    mem = bytearray(0x30000)
+    q = MTCCB(_Dev(), mem, 0x10000, 0x20000, batch_responses=True)
+    for i in range(513):
+      q.submit(0x8000420000, 0x400, 0x30000000, token=i+1)
+      struct.pack_into('<IIQQQIIQ', mem, 0x21000+(i%256)*48, 0, i%3, i+1, 0, 0, 0, 0, 0)
+      struct.pack_into('<I', mem, 0x24020, (i+1)%256)
+      response = q.wait(0.01)
+      self.assertEqual((response.token, response.value, q.response_rd), (i+1, i%3, (i+1)%256))
+      self.assertEqual(struct.unpack_from('<I', mem, 0x24028)[0], ((i+1)%256)//16*16)
+
   def test_response_size(self):
     with self.assertRaises(ValueError): MTResponse.from_bytes(bytes(4))
 

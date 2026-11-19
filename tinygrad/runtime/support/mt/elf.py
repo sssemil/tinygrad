@@ -79,8 +79,10 @@ class MTKernelImage:
 
   @classmethod
   def from_elf(cls, blob:bytes) -> MTKernelImage:
-    _, sections, _ = elf_loader(blob)
+    _, sections, relocs = elf_loader(blob)
     text = next(s for s in sections if s.name == '.text')
+    if any(text.header.sh_addr <= off < text.header.sh_addr + len(text.content) for off,_,_ in relocs):
+      raise NotImplementedError("MT shader text needs relocation")
     note = next(s for s in sections if s.name == '.note')
     metadata = MTLaunchMetadata.from_note(note.content)
     return cls(int(text.header.sh_addr), text.content, dataclasses.replace(metadata, entry=int(text.header.sh_addr)))

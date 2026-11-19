@@ -142,9 +142,12 @@ class CustomASM24Controller:
     return self.pcie_request(fmt_type, address, value, size)
 
   def pcie_mem_write(self, address:int, data:bytes):
-    """Streaming PCIe memory write via 0xF0 mode 1 + bulk OUT. Data is little-endian dwords on the wire."""
+    """Write little-endian PCIe dwords, inlining a single aligned word in the control request."""
     if not data: return
     assert len(data) % 4 == 0, f"pcie_mem_write requires 4-byte aligned size, got {len(data)}"
+    if len(data) == 4 and address % 4 == 0:
+      self.pcie_request(0x40 if address < 1 << 32 else 0x60, address, int.from_bytes(data, 'little'))
+      return
     for off in range(0, len(data), STREAM):
       chunk = data[off:off+STREAM]
       self._f0_out(0x40 if address + off < 1 << 32 else 0x60, 0x0F, address + off, len(chunk) // 4, mode=1)

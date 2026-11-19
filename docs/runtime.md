@@ -18,6 +18,8 @@ tinygrad supports various runtimes, enabling your code to scale across a wide ra
 
 Select `DEV=MT` for a two-core S30 on a Chestnut USB bridge. The runtime uses MUSA 4.3.0 to compile for `mp_10` and loads `mtfw-gen1.bin` from the `mtgpu-s30` 3.1.0-6 package. Point `MUSA_PATH` at the toolkit root containing `bin/mcc`. Set `MT_FIRMWARE` if the firmware is outside `/lib/firmware/mthreads`.
 
+With `DEV=MT:LLVM`, tinygrad emits LLVM IR directly. Its compiler is the MTGPU-enabled `bin/clang-14` under `MUSA_PATH`. The compiler can also load helper routines from `mtgpu/bitcode/`. Both renderers upload the resulting shader to VRAM and submit commands to the S30 firmware over USB. Once kernels are cached, `ASSERT_COMPILE=1` runs them with the compiler offline and reports a cache miss if a new kernel is needed.
+
 Run the MNIST training and evaluation demo from the checkout.
 
 ```sh

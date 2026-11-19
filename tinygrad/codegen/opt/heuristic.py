@@ -1,5 +1,6 @@
 import itertools
 from tinygrad.codegen.opt import Opt, OptOps, KernelOptError
+from tinygrad.dtype import dtypes
 from tinygrad.helpers import getenv, DEBUG, prod, TC_OPT, TC_SELECT, TC_MIN_GLOBALS, USE_TC, IMAGE
 from tinygrad.uop.ops import Ops, UOp, resolve, AxisType
 from tinygrad.codegen.late.coalesce import image_valid_dims
@@ -107,6 +108,19 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
       if DEBUG >= 4: print(f"upcasting masked axis : {axis}")
       to_upcast.append(axis)
   for axis in to_upcast[::-1]: k.apply_opt(Opt(OptOps.SPLIT, axis, (0, AxisType.UPCAST)))
+
+  # Reuse each input across eight accumulators per row or column on the S30.
+  if k.ren.target.arch == "mp_10" and k.upcast_size() == 1 and len(reds:=k.reduceops) == 1:
+    red = reds[0]
+    if len(red.src) == 2 and red.dtype == dtypes.float and red.arg[0] is Ops.ADD and (mul:=red.src[0]).op is Ops.MUL:
+      lhs, rhs = (x.ranges for x in mul.src)
+      dims = [k.rngs[i] for i in k.upcastable_dims() if k.full_shape[i] >= 64 and k.full_shape[i]%8 == 0]
+      dims += [r for r in k.rngs if r.axis_type is AxisType.GLOBAL and r.src[0].is_variable and r.vmax+1 >= 16]
+      rows, cols = [r for r in dims if r in lhs and r not in rhs], [r for r in dims if r in rhs and r not in lhs]
+      if len(rows) == len(cols) == 1 and red.src[1] in lhs and red.src[1] in rhs:
+        for r in (rows[0], cols[0]):
+          if r.src[0].is_variable: r = k.apply_opt(Opt(OptOps.PADTO, k.rngs.index(r), 8))
+          k.apply_opt(Opt(OptOps.SPLIT, k.rngs.index(r), (8, AxisType.UPCAST)))
 
   # potentially do more upcasts of non reduce axes based on a heuristic
   is_dsp = k.ren.target.device == "DSP"

@@ -20,10 +20,10 @@ class MTResponse:
     return cls(*struct.unpack('<IIQQQIIQ', data))
 
 class MTCCB:
-  def __init__(self, dev:MTDev, mem, item_off:int, queue_off:int, ccb_type:int=3, meta_base:int=0x90000000):
+  def __init__(self, dev:MTDev, mem, item_off:int, queue_off:int, ccb_type:int=3, meta_base:int=0x90000000, *, batch_responses:bool=False):
     self.dev, self.mem, self.item_off, self.queue_off = dev, mem, item_off, queue_off
     self.ccb_type, self.wr_idx = ccb_type, 0
-    self.response_rd = 0
+    self.batch_responses, self.response_rd = batch_responses, 0
     self.pending_token = 0
     self.seq = 0
     # Synchronous submissions reuse one item for every slot in the request ring.
@@ -74,8 +74,9 @@ class MTCCB:
   def response_index(self) -> int:
     return struct.unpack('<I', self.mem[self.queue_off+0x4020:self.queue_off+0x4024])[0]
 
-  def wait(self, timeout:float=5.0) -> MTResponse:
-    deadline = time.monotonic() + timeout
+  def wait(self, timeout:float=5.0, *, spin_for:float=0.0) -> MTResponse:
+    start = time.monotonic()
+    deadline, spin_until = start + timeout, start + spin_for
     while time.monotonic() < deadline:
       if (wr := self.response_index()) != self.response_rd:
         off = self.queue_off + 0x1000 + ((wr - 1) % 256) * 0x30
@@ -84,7 +85,8 @@ class MTCCB:
           time.sleep(0.001)
           continue
         self.response_rd = wr
-        self.mem[self.queue_off+0x4028:self.queue_off+0x402c] = struct.pack('<I', wr)
+        # Return credits in groups on USB. Even at wraparound the 256-slot firmware ring has room for the next submission.
+        if not self.batch_responses or wr % 16 == 0: self.mem[self.queue_off+0x4028:self.queue_off+0x402c] = struct.pack('<I', wr)
         return response
-      time.sleep(0.001)
+      if time.monotonic() >= spin_until: time.sleep(0.0001 if spin_for else 0.001)
     raise TimeoutError(f"MT CCB {self.ccb_type} response timed out")

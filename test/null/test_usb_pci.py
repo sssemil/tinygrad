@@ -8,12 +8,17 @@ class TestUSBPCI(unittest.TestCase):
   def test_memory_request_header(self):
     ctrl = CustomASM24Controller.__new__(CustomASM24Controller)
     ctrl.usb = Mock()
-    for addr, read, write in ((0xfffffffc, 0x00, 0x40), (0x100000000, 0x20, 0x60)):
+    for addr, read, write in ((0xfffffff8, 0x00, 0x40), (0x100000000, 0x20, 0x60)):
       payload = struct.pack('<III', addr & 0xffffffff, addr >> 32, 1)
       ctrl.pcie_mem_read(addr, 4)
       ctrl.usb.control_write.assert_called_with(0xf0, 0xf00 | read, 2, payload, 5000)
-      ctrl.pcie_mem_write(addr, bytes(4))
-      ctrl.usb.control_write.assert_called_with(0xf0, 0xf00 | write, 1, payload, 5000)
+      ctrl.usb.reset_mock()
+      ctrl.pcie_mem_write(addr, struct.pack('<I', 0x89abcdef))
+      ctrl.usb.control_write.assert_called_once_with(0xf0, 0xf00 | write, 0, struct.pack('<III', addr & 0xffffffff, addr >> 32, 0x89abcdef), 5000)
+      ctrl.usb.bulk_write.assert_not_called()
+      ctrl.pcie_mem_write(addr, bytes(8))
+      ctrl.usb.control_write.assert_called_with(0xf0, 0xf00 | write, 1, struct.pack('<III', addr & 0xffffffff, addr >> 32, 2), 5000)
+      ctrl.usb.bulk_write.assert_called_once_with(bytes(8))
 
   def test_rebar_selection_and_rollback(self):
     for device_id, fail in ((0x01021ed5, False), (0x01021ed5, True), (0x02011ed5, False)):

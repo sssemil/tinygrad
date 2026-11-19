@@ -1,6 +1,6 @@
 import os, random, struct, unittest
 from pathlib import Path
-from tinygrad import Device, Tensor, TinyJit, Variable, dtypes
+from tinygrad import Context, Device, Tensor, TinyJit, Variable, dtypes
 from tinygrad.device import Buffer
 from tinygrad.helpers import DEV
 from tinygrad.runtime.support.mt.compiler import MTCompiler
@@ -10,7 +10,9 @@ from tinygrad.runtime.support.mt.s30 import DEFAULT_S30_FIRMWARE, PDS_BASE, USC_
 
 has_firmware = Path(os.getenv("MT_FIRMWARE", DEFAULT_S30_FIRMWARE)).is_file()
 requires_firmware = unittest.skipUnless(has_firmware, "requires mtgpu-s30 3.1.0-6 mtfw-gen1.bin")
-requires_compiler = unittest.skipUnless(has_firmware and (MTCompiler().bin/'mcc').is_file(), "requires S30 firmware and the MUSA toolkit")
+compiler_bin = 'clang-14' if DEV.renderer == "LLVM" else 'mcc'
+requires_compiler = unittest.skipUnless(has_firmware and (MTCompiler().bin/compiler_bin).is_file(),
+                                        f"requires S30 firmware and the renderer using {compiler_bin}")
 
 
 @unittest.skipUnless(DEV.device == "MT", "run explicitly with DEV=MT on a USB Chestnut with an S30")
@@ -99,6 +101,37 @@ class TestS30USB(unittest.TestCase):
         add = (gpu + 1).realize()
         self.assertEqual(add.to("CPU").tolist(), (cpu + 1).tolist())
         self.assertEqual((add * gpu).to("CPU").tolist(), ((cpu + 1) * cpu).tolist())
+
+  @requires_compiler
+  def test_batched_matmul(self):
+    import numpy as np
+    rng = np.random.default_rng(30)
+    for rows in (64, 65):
+      with self.subTest(rows=rows):
+        a = rng.integers(-4, 5, (2, rows, 128)).astype(np.float32)
+        b = rng.integers(-4, 5, (2, 96, 128)).astype(np.float16)
+        result = Tensor(a, device="MT") @ Tensor(b, device="MT").float().transpose(-1, -2)
+        np.testing.assert_array_equal(result.numpy(), a @ b.transpose(0, 2, 1))
+
+  @requires_compiler
+  def test_symbolic_matmul(self):
+    import numpy as np
+    rng = np.random.default_rng(30)
+    a = rng.integers(-3, 4, (33, 256)).astype(np.float32)
+    b = rng.integers(-3, 4, (128, 256)).astype(np.float16)
+    x, w = Tensor(a, device="MT").realize(), Tensor(b, device="MT").realize()
+    @TinyJit
+    def run(x, w, n): return (x[:n] @ w.T).contiguous().realize().pad_to((33, 128)).contiguous().realize()
+    rows = Variable("rows", 1, 33)
+    for n in (33, 1, 8, 9, 31, 32, 7):
+      np.testing.assert_array_equal(run(x, w, rows.bind(n)).numpy(), np.pad(a[:n] @ b.T, ((0, 33-n), (0, 0))))
+
+  @requires_compiler
+  def test_half_math(self):
+    x = Tensor([0.25, 0.5, 1.0, 2.0], device="MT", dtype=dtypes.half)
+    for op in (Tensor.sqrt, Tensor.reciprocal, Tensor.exp2, Tensor.log2, Tensor.sin, Tensor.trunc):
+      with self.subTest(op=op.__name__):
+        self.assertEqual(op(x).tolist(), op(x.to("CPU").float()).half().tolist())
 
   @requires_compiler
   def test_resident_programs_after_restart(self):
