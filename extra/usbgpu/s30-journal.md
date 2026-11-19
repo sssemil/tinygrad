@@ -8,11 +8,11 @@ Measured on the same Chestnut S30 with compiler caching disabled. The cold colum
 
 | Workload | Native cold | MUSA cold | Native warm | MUSA warm |
 | --- | ---: | ---: | ---: | ---: |
-| MNIST, batch of 16 | 0.852 s | 3.506 s | 26.62 ms | 13.82 ms |
-| Whisper tiny.en, test.wav | 11.546 s | 50.836 s | 5.688 s | 2.595 s |
-| Qwen2.5-0.5B Q8_0 | 18.514 s | 172.244 s | 6.801 s | 4.811 s |
+| MNIST, batch of 16 | 0.848 s | 3.506 s | 27.32 ms | 13.82 ms |
+| Whisper tiny.en, test.wav | 11.083 s | 50.836 s | 5.172 s | 2.595 s |
+| Qwen2.5-0.5B Q8_0 | 17.814 s | 172.244 s | 6.012 s | 4.811 s |
 
-All five native outputs per model matched the reference. The native column uses the offline, isolated benchmark. It checked every loaded USC program against compiler output generated in the same process. The check covered 10 distinct binaries for MNIST, 88 for Whisper and 75 for Qwen. The benchmark also disabled vendor firmware boot and management mailbox construction. The card powered up with its factory firmware still installed. The host did not upload proprietary code during these model runs. The board-management mailbox was unused.
+All five native outputs per model matched the reference. The native column uses the offline, isolated benchmark. It checked every loaded USC program against compiler output generated in the same process. The check covered 10 distinct binaries for MNIST, 88 for Whisper and 75 for Qwen. The benchmark also checked that compute startup received only zero-filled context memory, with META master boot disabled. It blocked vendor firmware boot and management mailbox construction. The card powered up with its factory firmware still installed. The host did not upload proprietary code during these model runs. The board-management mailbox was unused.
 
 ## November 20, 2026 — proprietary reference
 
@@ -309,3 +309,9 @@ Rechecking the transposed Qwen block projections on MUSA produced the same eight
 ## November 20, 2026 — wider workgroups for tiled matrix products
 
 The native scheduler now allows tiled matrix products to use up to 128 work items along an output axis. This keeps the existing per-thread tile and reduction order. For a 32×896 input times 4,864 packed projection rows, a 128-wide limit took 15.46 ms, compared with 23.73 ms at 64 and 21.10 ms at 256. All matrix elements matched NumPy. A full Qwen run took 6.001 s warm at 128 and 6.592 s at 256, compared with 6.801 s previously. Whisper took 5.172 s at 128, compared with 5.688 s previously. The filter schedule still distributes at most 64 lanes along each convolution axis. All 165 captured inference graphs and 118 training graphs compiled. All 15 applicable hardware tests passed without vendor tools.
+
+## November 20, 2026 — verify the direct GPU boot input
+
+The isolated runner now checks the bytes passed into the common GPU boot routine. It rejects nonzero image data, enabling META master boot and requesting a management domain reset. Each of those three negative cases failed before accessing hardware. All three end-to-end model runs passed that check and the shader provenance check on this S30. All fifteen predictions matched the references. The table above reports cold latency and the median of calls three through five with both checks enabled.
+
+A separate read-only management query identified this card's Sudi board type as 10. Its 104-byte capability record had the expected 0xee marker, 4 GiB DDR capacity and two enabled memory channels. The capacity and PCI IDs agreed with the independently read BAR size and PCI configuration. These observations constrain a future open board initializer. The record describes the running configuration and supplies no DDR training sequence or code for power-on.

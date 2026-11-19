@@ -7,7 +7,7 @@ from tinygrad.runtime.support.mt.mtdev import MTSMC
 from tinygrad.runtime.support.mt.s30 import MTS30Firmware, MTS30Program
 
 if __name__ == "__main__":
-  render, load = MTUSCRenderer.render, MTS30Program.__init__
+  render, load, boot = MTUSCRenderer.render, MTS30Program.__init__, MTS30Firmware._boot
   emitted:set[bytes] = set()
   loaded:set[bytes] = set()
 
@@ -21,8 +21,12 @@ if __name__ == "__main__":
     loaded.add(obj.lib)
     load(self, dev, obj, links)
 
+  def direct_boot(self, image, *, master=True, reset_domains=True):
+    if master or reset_domains or any(image): raise RuntimeError("expected zeroed GPU context with META master boot disabled")
+    return boot(self, image, master=master, reset_domains=reset_domains)
+
   with patch.object(MTUSCRenderer, "render", render_shader), patch.object(MTS30Program, "__init__", load_shader), \
-       patch.object(MTS30Firmware, "boot", side_effect=RuntimeError("vendor firmware boot")), \
+       patch.object(MTS30Firmware, "_boot", direct_boot), patch.object(MTS30Firmware, "boot", side_effect=RuntimeError("vendor firmware boot")), \
        patch.object(MTSMC, "__init__", side_effect=RuntimeError("management firmware IPC")):
     runpy.run_path(str(Path(__file__).resolve().parents[1]/"bench_s30.py"), run_name="__main__")
   if not loaded: raise RuntimeError("benchmark loaded zero S30 shaders")
