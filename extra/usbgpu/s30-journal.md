@@ -369,3 +369,13 @@ As a negative control, the isolated MNIST runner received a copy of the checkpoi
 ```sh
 extra/usbgpu/s30/bench_isolated.sh mnist ../.s30-tools/mnist-s30.safetensors --check-reference
 ```
+
+## November 20, 2026 — reproduce the pre-link capture window
+
+The staged trace command takes the same exclusive lock as the S30 runtime, identifies the S30 and controls downstream slot power. It provides distinct edges for an external board probe. Run from the checkout with the card idle:
+
+```sh
+PYTHONPATH=. python extra/usbgpu/s30/trace_power.py --hold 0.5
+```
+
+This run read 13 mA with slot power off, 203 mA with the rail enabled, 192 mA with the bridge PERST control released and 729 mA after normal link training. LTSSM stayed at 0 until training completed at 0x78. The next isolated process built all 10 MNIST shaders from source and classified all 16 digits correctly on five calls. In simulated interrupted and power-fault runs, the command restored normal power after an interruption and turned it off following a reported power fault. Capturing the downstream board's own boot transactions still requires a probe or an independently accessible trace.
