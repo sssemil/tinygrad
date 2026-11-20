@@ -37,6 +37,18 @@ class TestMTCompiler(unittest.TestCase):
                              ("ld", (0,), 0), ("fmul", (5,5), 0), ("fma", (5,5,6), 0), ("st", (0,7), 0)]
     self.assertEqual([op for op,_,_ in _schedule_fmas(ins) if op in ("ld","st")], ["ld","st","ld","st"])
 
+  def test_usc_dot_burst_bounds(self):
+    from tinygrad.renderer.usc import _burst_dots, Instruction
+    # One output from two arrays, with a shared 4-byte stride and a register accumulator.
+    constants = [0, 64, 1, 4]
+    ins:list[Instruction] = [("imm", (), 6), ("slot", (), 0), ("assign", (1,0), 0), ("imm", (), 7), ("range", (0,), 64),
+                             ("imul", (~9,4), 0), ("ld", (5,), 2), ("ld", (5,), 4), ("fma", (6,7,1), 0), ("assign", (1,8), 0),
+                             ("iadd", (4,~8), 0), ("assign", (4,10), 0), ("ilt", (4,3), 0), ("back", (4,12), 0), ("st", (0,1), 0)]
+    self.assertIsNotNone(_burst_dots(ins, constants.copy(), 6))
+    for i,change in [(4, ("range", (0,), 65)), (5, ("imul", (~8,4), 0)), (14, ("st", (0,7), 0))]:
+      self.assertIsNone(_burst_dots(ins[:i]+[change]+ins[i+1:], constants, 6))
+    self.assertEqual(constants, [0,64,1,4])
+
   def test_default_renderer(self):
     from tinygrad.device import select_renderer
     from tinygrad.helpers import Target

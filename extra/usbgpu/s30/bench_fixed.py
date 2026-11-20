@@ -20,16 +20,20 @@ def kernels():
     a, b = data(n), data(n)
     i = axis(n)
     yield f"add_{n}", (a, b), a+b, buf(a, 0)[i].store(buf(a, 1)[i]+buf(b, 2)[i])
-  a, b = data(2048, 512), data(512)
-  i, k = axis(len(a)), UOp.range(len(b), 0, AxisType.LOOP)
-  expected = a@b
-  yield "matvec", (a, b), expected, buf(expected, 0)[i].store((buf(a, 1)[i*len(b)+k]*buf(b, 2)[k]).reduce(k, arg=Ops.ADD))
+  def matvec(width):
+    a, b = data(2048, width), data(width)
+    i, k = axis(len(a)), UOp.range(width, 0, AxisType.LOOP)
+    expected = a@b
+    dot = (buf(a, 1)[i*width+k]*buf(b, 2)[k]).reduce(k, arg=Ops.ADD)
+    return (a, b), expected, buf(expected, 0)[i].store(dot)
+  yield "matvec", *matvec(512)
   a, b = data(128, 128), data(128, 128)
   i, k = axis(a.size), UOp.range(128, 0, AxisType.LOOP)
   dot = (buf(a, 1)[i//128*128+k]*buf(b, 2)[k*128+i%128]).reduce(k, arg=Ops.ADD)
   yield "matmul", (a, b), a@b, buf(a, 0)[i].store(dot)
+  yield "matvec_2048", *matvec(2048)
 
-def measure(compiler):
+def measure(compiler, meta_batch=0):
   dev = Device["MT"]
   assert dev.mt.s30
   # Firmware comparisons use the same board management request as the stock driver. Device finalization restores P12.
@@ -45,14 +49,20 @@ def measure(compiler):
     assert prg.src[1] is fixed.src[1]
     obj = TinyELF.from_program(prg)
     run = MTS30Program(dev, obj, {}, direct=dev.renderer.target.renderer == "USC")
+    if meta_batch:
+      if not run.direct or not dev.s30_fw.meta_enabled: raise RuntimeError("batched comparison requires source-built META")
+      run.split = 0  # give each compiler one CDM and the same unsplit grid
     buffers = [Buffer("MT", x.nbytes, initial_value=x.tobytes()) for x in (np.full_like(expected, np.nan), *inputs)]
     pointers = [buffers[j].meta.va for j in info.globals]
     groups, local = info.launch_dims({})
     times = []
     for _ in range(13):
       start = time.perf_counter_ns()
-      run(*pointers, global_size=groups, local_size=local, wait=True)
-      times.append((time.perf_counter_ns()-start)/1e6)
+      if meta_batch:
+        for _ in range(meta_batch): run(*pointers, global_size=groups, local_size=local)
+        dev.s30_fw.flush_meta()
+      else: run(*pointers, global_size=groups, local_size=local, wait=True)
+      times.append((time.perf_counter_ns()-start)/1e6/(meta_batch or 1))
     np.testing.assert_array_equal(np.frombuffer(buffers[0].as_memoryview(), np.float32).reshape(expected.shape), expected)
     rows[name] = {"work":[fixed.src[1].key.hex(), groups, local], "shader":hashlib.sha256(s30_shader(obj)[0]).hexdigest(),
                   "ms":statistics.median(times[2:])}
@@ -106,7 +116,10 @@ def main():
   mode.add_argument("--compare-model", nargs=argparse.REMAINDER, help="run the model on all three stacks and require matching work fingerprints")
   p.add_argument("--musa-schedule", action="store_true", help="use the MUSA scheduler for the selected model")
   mode.add_argument("--compiler", choices=["USC", "MUSA", "LLVM"], help="measure one compiler with the firmware selected by DEV")
+  p.add_argument("--meta-batch", type=int, metavar="N", help="compare compilers on one CDM with N launches per META completion")
   args = p.parse_args()
+  if args.meta_batch is not None and (not 1 <= args.meta_batch <= 64 or args.model is not None or args.compare_model is not None):
+    p.error("--meta-batch requires 1 to 64 launches of the fixed kernels")
   if args.compare_model:
     model_args = list(args.compare_model)
     if model_args[0] != "train-mnist" and "--check-reference" not in model_args: model_args.append("--check-reference")
@@ -125,20 +138,23 @@ def main():
   if args.model: return model_benchmark(args.model, args.musa_schedule)
   if args.musa_schedule or args.model == [] or args.compare_model == []: p.error("--model needs a bench_s30 workload and its arguments")
   if args.compiler:
-    print(json.dumps(measure(args.compiler)))
+    print(json.dumps(measure(args.compiler, args.meta_batch)))
     return
   # Run one compiler/firmware pair per process, in opposite orders and then rotated.
-  pairs = [(fw,cc) for fw in ("MUSA", "USC") for cc in ("USC", "MUSA", "LLVM")]
+  pairs = [(fw,cc) for fw in (("USC",) if args.meta_batch else ("MUSA", "USC")) for cc in ("USC", "MUSA", "LLVM")]
   work, shaders, times = {}, {}, {}
-  for order in (pairs, pairs[::-1], pairs[3:]+pairs[:3]):
+  child_args = ["--meta-batch", str(args.meta_batch)] if args.meta_batch else []
+  shift = max(1, len(pairs)//2)
+  for order in (pairs, pairs[::-1], pairs[shift:]+pairs[:shift]):
     for fw,cc in order:
       env = dict(os.environ, DEV="MT:"+fw, MT_META=str(int(fw == "USC")), CACHELEVEL="0", PARALLEL="0")
       if fw == cc == "USC": env.update(MUSA_PATH="/nonexistent", MT_FIRMWARE="/nonexistent")
-      results = json.loads(subprocess.check_output([sys.executable, __file__, "--compiler", cc], env=env))
+      results = json.loads(subprocess.check_output([sys.executable, __file__, "--compiler", cc, *child_args], env=env))
       for name,row in results.items():
         if row["work"] != work.setdefault(name, row["work"]): raise RuntimeError(f"{name}: different kernel or launch dimensions")
         if row["shader"] != shaders.setdefault((cc,name), row["shader"]): raise RuntimeError(f"{cc} {name}: different shader text")
         times.setdefault((fw,cc,name), []).append(row["ms"])
+  if args.meta_batch: print(f"One CDM, {args.meta_batch} launches per batch, milliseconds per launch")
   print("firmware   compiler  "+" ".join(f"{name:>12}" for name in work)+"  (ms)")
   for fw,cc in pairs:
     print(f"{'MTFW' if fw == 'MUSA' else 'open META':10} {cc:8}  "+" ".join(f"{statistics.median(times[fw,cc,name]):12.4f}" for name in work))

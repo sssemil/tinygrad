@@ -2,7 +2,26 @@
 
 Hardware used for these measurements is the 4 GiB MTT S30 on Chestnut over USB. The host runs tinygrad. Model checkpoints are inputs. The shader cache starts empty for native acceptance runs.
 
-## Fixed-work GPU stack comparisons
+## Native FP32 dot products on one command processor
+
+The native USC compiler combines eight consecutive FP32 reads per input into one 32-byte GPU memory instruction. It overlaps the two input reads and emits eight scalar fused multiply-adds in their original order. This applies to fixed-trip, unit-stride dot products with a trip count divisible by eight. Other loop bodies and kernels without enough consecutive registers retain scalar loads.
+
+Chestnut negotiated a 480 Mb/s USB link for this run. To amortize the host round trip, each measurement submits 32 identical launches to source-built META on a single CDM and waits once. Every compiler receives identical ordered UOps, FP32 inputs and launch dimensions. Both matvecs have 64 workgroups of 32 lanes. The benchmark requests P0 and checks every output element against the CPU. The clock frequency was not sampled. Each process discards two warm-up batches and reports the median of eleven timed batches divided by 32. Each table entry is the median across three fresh processes. Times include host batch construction, submission and completion.
+
+| FP32 matrix × vector | Native before (fb99a28c7) | Native with eight-word loads | MUSA | Vendor LLVM |
+| --- | ---: | ---: | ---: | ---: |
+| 2,048 × 512 | 1.312 ms | 0.531 ms | 0.531 ms | 0.531 ms |
+| 2,048 × 2,048 | 4.281 ms | 1.156 ms | 1.156 ms | 1.156 ms |
+
+The native before/after comparison uses the same benchmark and alternates the two renderers across six processes. The measurements resolve a large improvement over scalar USC. All three current compilers finished within the timing resolution of this setup on these two shapes. A hardware regression checks the accumulation order with a dword-offset input spanning a page boundary and checks the scalar path for a 65-element reduction. These timings describe kernel throughput with a shared completion. Separate empty-cache runs produced all five reference outputs for each model. The native verifier regenerated 10 MNIST, 94 Whisper and 73 Qwen shaders and checked completion on the source-built META firmware.
+
+Run from the tinygrad checkout with the reference compilers and GNU META tools available.
+
+```sh
+PYTHONPATH=. python -m extra.usbgpu.s30.bench_fixed --meta-batch 32
+```
+
+## Fixed-work GPU stack comparisons before eight-word loads
 
 The four FP32 kernels below run on the same 4 GiB S30 over Chestnut USB. Each compiler receives the same ordered scalar UOps, input bytes, grid and block size. The benchmark checks the UOp and grid fingerprints across processes, switches submission paths independently of the compiler, and checks that each compiler's shader text has the same SHA-256 on both paths. All results must equal the CPU result element by element. Inputs are small integers exactly representable in FP32.
 

@@ -105,8 +105,66 @@ def _forward_slot_reads(ins:list[Instruction]) -> list[Instruction]:
       out.append((op, tuple(idx[v] if v >= 0 else v for v in src), imm))
   return out
 
-def assemble(ins:list[Instruction]) -> tuple[bytes, int]:
+def _burst_dots(ins:list[Instruction], constants:list[int], shared_base:int) -> tuple[bytes,int]|None:
+  # Read eight consecutive FP32 words per DMA and keep the original FMA order.
+  if 4 not in constants: return None
+  scale = shared_base+constants.index(4)
+  increment = shared_base+(constants.index(8) if 8 in constants else len(constants))
+  if increment >= 64: return None  # direct shared operand in iadd
+  users:dict[int,list[int]] = defaultdict(list)
+  for i,(_,args,_) in enumerate(ins):
+    for v in args: users[v].append(i)
+  bursts, dots, steps = set[int](), set[int](), set[int]()
+  for end,(op,src,_) in enumerate(ins):
+    if op != "back": continue
+    counter, pred = src
+    step = end-3
+    # Only the fixed-trip loop emitted by render, with a single accumulator write before the counter increment.
+    if ins[counter][2] < 8 or ins[counter][2]%8 or pred != end-1 or ins[end-2][:2] != ("assign", (counter,step)): continue
+    if ins[step][0] != "iadd" or ins[step][1][0] != counter: continue
+    body = range(counter+1, step)
+    if any(users[i] and users[i][-1] > end for i in body): continue
+    effects = [i for i in body if ins[i][0] not in ("imm", "iadd", "imul")]
+    if [ins[i][0] for i in effects] != ["ld", "ld", "fma", "assign"]: continue
+    load_a, load_b, dot, assign = effects
+    a,b,acc = ins[dot][1]
+    if {a,b} != {load_a,load_b} or ins[dot][2] or acc < 0 or acc >= counter or ins[acc][0] != "slot": continue
+    if ins[assign][1] != (acc,dot) or users[dot] != [assign]: continue
+    def consecutive(load:int) -> bool:
+      addr, = ins[load][1]
+      if users[load] != [dot] or ins[addr][0] != "imul" or ins[addr][1][0] != ~scale: return False
+      idx = ins[addr][1][1]
+      if idx == counter: return True
+      if idx <= counter or ins[idx][0] != "iadd": return False
+      x,y = sorted(ins[idx][1])
+      return y == counter and x < counter and x != acc  # invariant base + loop counter
+    if consecutive(a) and consecutive(b):
+      bursts.update((a,b))
+      dots.add(dot)
+      steps.add(step)
+  if not dots: return None
+  out:list[Instruction] = []
+  remap:dict[int,int] = {}
+  for i,(op,src,imm) in enumerate(ins):
+    args = tuple(remap[v] if v >= 0 else v for v in src)
+    remap[i] = len(out)
+    if i in bursts:
+      out.append(("ldx8", args, imm))
+      out.extend(("component", (), j) for j in range(1,8))
+    elif i in dots:
+      a,b,acc = args
+      for j in range(8):
+        out.append(("fma", (a+j,b+j,acc), 0))
+        acc = len(out)-1
+      remap[i] = acc
+    elif i in steps: out.append(("iadd", (args[0],~increment), 0))
+    else: out.append((op,args,imm))
+  if (ret:=_assemble(out)) is not None and 8 not in constants: constants.append(8)
+  return ret
+
+def assemble(ins:list[Instruction], constants:list[int]|None=None, shared_base:int=0) -> tuple[bytes, int]:
   ins = _forward_slot_reads(ins)
+  if constants is not None and (ret:=_burst_dots(ins, constants, shared_base)) is not None: return ret
   if (ret:=_assemble(ins) or _assemble(_delay_loads(ins)) or _assemble(_rematerialize_inputs(ins))) is not None: return ret
   if (ret:=_assemble(_schedule_fmas(ins))) is not None: return ret
   raise NotImplementedError("S30 USC needs more than 64 live temporaries")
@@ -135,9 +193,11 @@ def _assemble(ins:list[Instruction]) -> tuple[bytes, int]|None:
   second:set[int] = set()
   pending:int|None = None
   for i,(op,src,_) in enumerate(ins):
-    if pending is not None and (pending in src or op not in ("ld", "ld8", "ld16", "imm", "imul", "imad", "iadd", "lsr", "lsl", "asr",
-                                                             "and", "or", "xor", "group", "lane")): pending = None
-    if op in ("ld", "ld8", "ld16"):
+    if pending is not None:
+      loaded = range(pending, pending+(8 if ins[pending][0] == "ldx8" else 1))
+      if any(v in loaded for v in src) or op not in ("ld", "ldx8", "component", "ld8", "ld16", "imm", "imul", "imad", "iadd", "lsr", "lsl", "asr",
+                                                     "and", "or", "xor", "group", "lane"): pending = None
+    if op in ("ld", "ldx8", "ld8", "ld16"):
       if pending is not None and last.get(pending, pending) > i:
         first.add(pending)
         second.add(i)
@@ -152,12 +212,19 @@ def _assemble(ins:list[Instruction]) -> tuple[bytes, int]|None:
   code = bytearray()
   fence:int|None = None
   for i,(op,src,imm) in enumerate(ins):
-    if op in ("imm", "half_to_float") and i not in last: continue
+    if op == "component" or (op in ("imm", "half_to_float") and i not in last): continue
     operands = tuple(regs[targets.get(v,v)] if v >= 0 else ~v for v in src)
     for v in expires[i]:
       if v not in targets: free.add(regs.pop(v))
     if op == "assign" and src[1] in targets: continue
-    if i in targets: dst = regs[targets[i]]
+    if op == "ldx8":
+      # The burst writes an aligned register block. Each component has its own last use.
+      if (dst:=next((r for r in range(0,64,8) if all(r+j in free for j in range(8))), -1)) < 0: return None
+      for j in range(8):
+        free.remove(dst+j)
+        regs[i+j] = dst+j
+      peak = max(peak, dst+8)
+    elif i in targets: dst = regs[targets[i]]
     elif op not in ("st", "st8", "st16", "assign", "back", "cndst", "cndend", "lmst", "barrier"):
       if not free: return None
       dst = min(free)
@@ -236,14 +303,15 @@ def _assemble(ins:list[Instruction]) -> tuple[bytes, int]|None:
       word |= _field(dest,(9,10,23,24,47,56,59,61)) | _field(source,(18,22,21,25,39,50,58,60)) | _field(operands[0],(27,26,28,32,34,38,40,46))
       wait, signal = (20,29), None
     elif op == "barrier": word, wait, signal = 0x8a355ce8, (9,26), None  # increment LM4, wait for all tasks, reinitialize
-    elif op in ("ld", "ld8", "ld16", "st", "st8", "st16"):
+    elif op in ("ld", "ldx8", "ld8", "ld16", "st", "st8", "st16"):
       addr = _field(imm,(45,17,22,30,36)) | _field(operands[0],(20,14,26,27,34,40))  # [shared pointer pair + byte offset in rN]
       if op.startswith("ld"): word, signal = 0xc00004000001858e | addr | _field(dst,(29,35,37,41,47,53)), None
       else: word, signal = 0xc000008000012a4e | addr | _field(operands[1],(25,23,28,32,38,44)), 15
       if i in first: word ^= 1<<42  # set dfc0 and continue
       if i in second: word ^= 1<<15 | 1<<21 | 1<<46  # set dfc1 and wait for dfc0 and dfc1
+      if op == "ldx8": word ^= (1<<16) | (1<<56)  # eight consecutive dwords
       if op.endswith("16"): word ^= 0x0004000000010000
-      if op.endswith("8"): word ^= 0x0010000000010000
+      if op in ("ld8", "st8"): word ^= 0x0010000000010000
       wait = (18,19)
     else: raise ValueError(op)
 
@@ -452,7 +520,7 @@ class MTUSCRenderer(Renderer):
         if u.src[0].vmin < 1 or u.src[0].vmax >= 1<<31: raise NotImplementedError("S30 USC requires a positive loop bound")
         # A bound held across a short loop costs a live temporary for little saved work.
         if u.src[0].vmin >= 64: bounds[u] = reg(u.src[0])
-        regs[u] = emit("range", literal(0))
+        regs[u] = emit("range", literal(0), imm=int(u.src[0].vmin) if u.src[0].vmin == u.src[0].vmax else 0)
       elif u.op is Ops.END:
         idx = u.src[1]
         counter = regs[idx]
@@ -505,7 +573,7 @@ class MTUSCRenderer(Renderer):
       elif u.op not in (Ops.PARAM, Ops.BUFFER, Ops.CONST, Ops.CAST, Ops.INDEX, Ops.SPECIAL, Ops.CMPEQ, Ops.CMPLT, Ops.WHERE,
                         Ops.AND, Ops.OR, Ops.XOR, Ops.BITCAST, Ops.TRUNCDIV, Ops.TRUNCMOD, *self.code_for_op, Ops.STACK, Ops.AFTER, Ops.SINK):
         raise NotImplementedError(f"S30 USC cannot lower {u.op}")
-    code, temps = assemble(ins)
+    code, temps = assemble(ins, constants if has_loop else None, 2*len(params)+int(bool(split)))
     # Shared registers hold pointer pairs followed by the shader's literal words.
     if split: constants.insert(0, 0)
     return (struct.pack(f'<HHHBx{len(constants)}I', temps, local_words, len(constants), split, *constants) + code).hex()

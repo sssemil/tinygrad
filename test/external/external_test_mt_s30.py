@@ -328,6 +328,29 @@ class TestS30USB(unittest.TestCase):
       prg(dst.meta.va, src.meta.va, wait=True)
       self.assertEqual(struct.unpack("<f", dst.as_memoryview())[0], sum(vals))
 
+  def test_native_dot_burst(self):
+    import numpy as np
+    from tinygrad.codegen import to_program
+    from tinygrad.renderer import TinyELF
+    from tinygrad.uop.ops import AxisType, KernelInfo, Ops, UOp
+    # Offset one input by a dword. Some bursts cross page boundaries. The values distinguish ordered and reassociated sums.
+    rng = np.random.default_rng(30)
+    dev = Device["MT"]
+    with Context(DEV="MT:USC", CACHELEVEL=0):
+      for width in (64, 65, 72):
+        a = rng.integers(-16, 17, 64*width+1).astype(np.float32)
+        a[1::8], a[3::8] = 2**26, -2**26
+        b = rng.integers(-4, 5, width).astype(np.float32)
+        expected = np.zeros(64, dtype=np.float32)
+        for k in range(width): expected += a[1+k::width]*b[k]
+        out, x, y = (UOp.placeholder((n,), dtypes.float, slot=i) for i,n in enumerate((64,64*width,width)))
+        row, k = UOp.special(2, "gidx0")*32+UOp.special(32, "lidx0"), UOp.range(width, 0, AxisType.LOOP)
+        dot = (x[row*width+k]*y[k]).reduce(k, arg=Ops.ADD)
+        obj = TinyELF.from_program(to_program(out[row].store(dot).sink(arg=KernelInfo(name="dot_offset", optimized=True)), dev.renderer))
+        dst, lhs, rhs = (Buffer("MT", v.nbytes, initial_value=v.tobytes()) for v in (np.full_like(expected, np.nan), a, b))
+        dev.runtime(obj)(dst.meta.va, lhs.meta.va+4, rhs.meta.va, global_size=(2,1,1), local_size=(32,1,1), wait=True)
+        np.testing.assert_array_equal(np.frombuffer(dst.as_memoryview(), np.float32), expected)
+
   def test_native_interleaved_dots(self):
     import numpy as np
     from tinygrad.uop.ops import KernelInfo, UOp
