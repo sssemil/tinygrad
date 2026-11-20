@@ -167,6 +167,37 @@ class TestS30USB(unittest.TestCase):
       prg(buf.meta.va, global_size=(9,1,1), local_size=(32,1,1), wait=True)
       self.assertEqual(list(buf.as_memoryview().cast("i")), [8]+[v+2 for v in values[1:]])
 
+  def test_meta_resident_replay(self):
+    from unittest.mock import patch
+    from tinygrad.runtime.support.usb import HALF, SLOT
+    dev = Device["MT"]
+    fw = dev.s30_fw
+    if not fw.meta_enabled: self.skipTest("requires native META dispatch")
+    prg = increment(dev)
+    bufs = [Buffer("MT", 9*32*4, initial_value=bytes(9*32*4)) for _ in range(2)]
+    expected = [[0]*(9*32) for _ in bufs]
+    with patch.object(fw.bridge, "scsi_write", wraps=fw.bridge.scsi_write) as write:
+      def run(last:int, groups:int):
+        write.reset_mock()
+        for which, count in [(0,9)]*23+[(last,groups)]:
+          prg(bufs[which].meta.va, global_size=(count,1,1), local_size=(32,1,1))
+          for j in range(count*32): expected[which][j] += 1
+        dev.synchronize()
+        for buf, vals in zip(bufs, expected): self.assertEqual(list(buf.as_memoryview().cast("i")), vals)
+        return [(len(args[0]), kw["slot_start"]) for args,kw in write.call_args_list]
+
+      cold, = run(0, 9)
+      self.assertGreater(cold[0], SLOT)
+      self.assertEqual(cold[1], HALF//SLOT)
+      self.assertEqual(run(0, 9), [])
+      for last, groups in ((1,9), (1,5), (0,1)):
+        (patch_size, slot), = run(last, groups)
+        self.assertLess(patch_size, cold[0])
+        self.assertGreater(slot, cold[1])
+        self.assertEqual(run(last, groups), [])
+      fw.session.close()
+      self.assertEqual(run(0, 1), [cold])
+
   def test_native_workgroup_exchange(self):
     import numpy as np
     from tinygrad.dtype import AddrSpace

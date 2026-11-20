@@ -44,6 +44,7 @@ class MTS30Firmware(MTComputeRegisters):
     self.meta_args:set[int] = set()
     self.meta_data = bytearray()
     self.meta_pending:list[tuple[int, MTS30Program]] = []
+    self.meta_resident = b""
     self.meta_sequence = 0
     self.meta_flushing = False
     self.direct = False
@@ -126,6 +127,7 @@ class MTS30Firmware(MTComputeRegisters):
         self.meta_args.clear()
         self.meta_pending.clear()
         self.meta_data.clear()
+        self.meta_resident = b""
         self.direct = False
         self._write(0x24e0, route, 4)
 
@@ -162,7 +164,16 @@ class MTS30Firmware(MTComputeRegisters):
       try:
         self.upload_mmu()
         struct.pack_into('<I', self.meta_data, self.meta_pending[-1][0], 0)
-        unwrap(self.bridge).scsi_write(bytes(self.meta_data), slot_start=HALF//SLOT)
+        if self.meta_data != self.meta_resident:
+          data = bytes(self.meta_data)
+          # The bridge addresses SRAM by slot, and transfers whole 512-byte blocks.
+          start, end = 0, len(data)
+          if len(data) == len(self.meta_resident):
+            while data[start:start+SLOT] == self.meta_resident[start:start+SLOT]: start += SLOT
+            end = round_up(end, 512)
+            while data[end-512:end] == self.meta_resident[end-512:end]: end -= 512
+          unwrap(self.bridge).scsi_write(data[start:end], slot_start=(HALF+start)//SLOT)
+          self.meta_resident = data
         self.kick_direct(5.0*len(self.meta_pending) if timeout is None else timeout, readback)
       except BaseException:
         self.session.close()
@@ -313,7 +324,8 @@ class MTS30Program(Program['MTDevice']):
       src, fmt = self.args[1]
       for i in range(nprog): struct.pack_into(fmt, params, i*len(self.launch)+src, S30_STAGE_VA+off+size)
     entry = bytearray(stride)
-    struct.pack_into('<I4xQQ', entry, 0, stride, base+controls, base+controls+2*CDM_CONTROL_SIZE)
+    struct.pack_into('<IIQQI', entry, 0, stride, controls, base+controls, base+controls+2*CDM_CONTROL_SIZE,
+                     struct.unpack_from('<I', stream, CDM_CONTROL_SIZE+8)[0])
     for i in range(nprog):
       entry[32+i*16:32+(i+1)*16] = self.meta_dma
       struct.pack_into('<Q', entry, 32+i*16, base+param_offset+i*len(self.launch))
