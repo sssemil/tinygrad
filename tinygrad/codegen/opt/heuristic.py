@@ -84,7 +84,7 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
           if r.src[0].divides(n) is not None:
             k.apply_opt(Opt(OptOps.SPLIT, k.rngs.index(r), (n, AxisType.UPCAST)))
             tiled = True
-    if spatial and dot is not None:
+    if spatial and dot is not None and len(k.reduceops) == 1:
       lhs, rhs = (x.ranges for x in dot.src)
       axes = [k.rngs[i] for i in k.upcastable_dims()]
       rows, channels = [r for r in axes if r in lhs and r not in rhs], [r for r in axes if r in rhs and r not in lhs]
@@ -109,7 +109,8 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
       lhs, rhs = (x.ranges for x in dot.src)
       if (a:=next((i for i in k.upcastable_dims() if k.full_shape[i]%2 == 0 and (k.rngs[i] in lhs) != (k.rngs[i] in rhs)), None)) is not None:
         k.apply_opt(Opt(OptOps.SPLIT, a, (2, AxisType.UPCAST)))
-    if axes:=k.upcastable_dims(reduce=True):
+    # Fused spatial reductions already keep multiple accumulators live on each lane.
+    if (not spatial or len(k.reduceops) == 1) and (axes:=k.upcastable_dims(reduce=True)):
       i = axes[-1]
       if k.rngs[i].src[0].op is Ops.CONST:
         n = k.full_shape[i]
