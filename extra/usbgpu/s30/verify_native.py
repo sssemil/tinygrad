@@ -33,9 +33,11 @@ if __name__ == "__main__":
     expected_meta = assemble(Path(runtime.__file__).with_name("dispatch.s"))
     if not 0 < len(expected_meta) <= 0x1000: raise RuntimeError("invalid META source build")
 
+  meta_runs = []
   def direct_boot(self, image, *, master=True, reset_domains=True):
     if master or reset_domains or (image != expected_meta.ljust(len(image), b"\0") if meta else any(image)):
       raise RuntimeError("unexpected initial S30 compute context")
+    if meta: meta_runs.append(self)
     return boot(self, image, master=master, reset_domains=reset_domains)
 
   with patch.object(MTUSCRenderer, "render", render_shader), patch.object(MTS30Program, "__init__", load_shader), \
@@ -86,5 +88,9 @@ if __name__ == "__main__":
            patch.object(System, "pci_setup_usb_bars", side_effect=RuntimeError("generic PCI enumeration")), patch.object(sram, "s30_shader", sram_shader):
         runpy.run_module(f"extra.usbgpu.s30.{module}", run_name="__main__")
     else: runpy.run_path(str(Path(__file__).resolve().parents[1]/"bench_s30.py"), run_name="__main__")
+  if meta:
+    if not meta_runs or not meta_runs[-1].meta_sequence: raise RuntimeError("no META dispatches during benchmark")
+    if int.from_bytes(meta_runs[-1].v[0x1004:0x1008], "little") != meta_runs[-1].meta_sequence: raise RuntimeError("META completion mismatch")
+    print(f"META acknowledged sequence {meta_runs[-1].meta_sequence} on the last of {len(meta_runs)} source-built boots.")
   if not loaded: raise RuntimeError("benchmark loaded zero S30 shaders")
   print(f"Verified {len(loaded)} distinct S30 shader binaries generated from UOps in this process.")

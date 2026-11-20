@@ -232,6 +232,36 @@ class TestS30USB(unittest.TestCase):
           for j in range(groups*32): expected[j] += 1
           self.assertEqual(list(buf.as_memoryview().cast("i")), expected)
 
+  @unittest.skipUnless(os.getenv("MT_META") == "1" and not reference, "requires native META dispatch")
+  def test_meta_batch_and_restart(self):
+    from unittest.mock import patch
+    from extra.usbgpu.s30.bench_dispatch import increment
+    dev = Device["MT"]
+    fw, prg = dev.s30_fw, increment(dev)
+    rng = random.Random(31)
+    for _ in range(2):
+      fw.session.close()
+      values = [rng.randrange(10000) for _ in range(9*32)]
+      buf = Buffer("MT", 4*len(values), initial_value=struct.pack(f"<{len(values)}i", *values))
+      for n in (1, 8, 64, 65):
+        seq = fw.meta_sequence if fw.direct else 0
+        for i in range(n):
+          groups = 9 if i%2 == 0 else 1
+          prg(buf.meta.va, global_size=(groups,1,1), local_size=(32,1,1))
+          for j in range(groups*32): values[j] += 1
+        self.assertEqual(list(buf.as_memoryview().cast("i")), values)
+        self.assertEqual(fw.meta_sequence-seq, ceildiv(n,64))
+      prg(buf.meta.va, global_size=(9,1,1), local_size=(32,1,1))
+      buf.host[:4] = struct.pack("<i", 7)
+      self.assertEqual(list(buf.as_memoryview().cast("i")), [7]+[v+1 for v in values[1:]])
+      prg(buf.meta.va, global_size=(9,1,1), local_size=(32,1,1))
+      with patch.object(fw, "start_direct", lambda: setattr(fw, "meta_sequence", fw.meta_sequence+1)), self.assertRaisesRegex(TimeoutError, "completed"):
+        fw.flush_meta(0.01)
+      self.assertFalse(fw.direct)
+      self.assertFalse(fw.meta_pending)
+      prg(buf.meta.va, global_size=(9,1,1), local_size=(32,1,1), wait=True)
+      self.assertEqual(list(buf.as_memoryview().cast("i")), [8]+[v+2 for v in values[1:]])
+
   def test_native_workgroup_exchange(self):
     import numpy as np
     from tinygrad.dtype import AddrSpace

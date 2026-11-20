@@ -23,12 +23,12 @@ class MetaPort:
     self.fw._read(0xa10, 4)
     self.fw._write(0xa08, value, 4)
     self.fw._read(0xa08, 4)
-  def start(self):
+  def start(self, mailbox_size:int=0x1000):
     self.write(0x04830030, 4)  # select the control port for thread register access
     # META segment 1 covers 0x20000000..0x3fffffff. Its global alias at 0xb0000000 bypasses META's data cache.
     # Set the SLC uncached bit in the output address so the USB BAR and META see each other's writes.
     mailbox = FW_DEVVA + 0x1000 | 1<<40
-    for i, word in enumerate((0x30000f02, 0, mailbox & 0xffffffff, mailbox >> 32)): self.write(0x04850010+i*4, word)
+    for i, word in enumerate((0x30000f02, mailbox_size-0x1000, mailbox & 0xffffffff, mailbox >> 32)): self.write(0x04850010+i*4, word)
     self.write(0x0480fff0, 0xc0000000)  # boot segment in the global address range
     self.write(0x0480fff8, 5)  # transfer to thread 0 PC
     deadline = time.monotonic()+1

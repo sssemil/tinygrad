@@ -158,6 +158,7 @@ class S30VRAMView(USBMMIOInterface):
   def __getitem__(self, index):
     offset, size = self._off_from_index(index)
     with self.dev.s30_fw.lock:
+      self.dev.s30_fw.flush_meta()
       if not self._can_stage(index, offset, size):
         data = super().__getitem__(index)
         return memoryview(bytes(data)) if isinstance(data, memoryview) else data  # the next USB transfer reuses the bulk buffer
@@ -165,7 +166,7 @@ class S30VRAMView(USBMMIOInterface):
       copy, signal = self.dev.s30_copy, self.dev.s30_read_signal
       for off in range(0, n, HALF):
         chunk = dest[off:min(off+HALF, n)]
-        copy(S30_READ_VA, self.va+offset+off, global_size=(len(chunk)//128,1,1), local_size=(32,1,1))
+        copy(S30_READ_VA, self.va+offset+off, global_size=(len(chunk)//128,1,1), local_size=(32,1,1), wait=self.dev.s30_fw.meta_enabled)
         signal(S30_COMPLETION_VA, readback=chunk)
       if n < size: dest[n:] = super().__getitem__(slice(offset+n, offset+size))
       return dest
@@ -173,6 +174,7 @@ class S30VRAMView(USBMMIOInterface):
   def __setitem__(self, index, data):
     offset, _ = self._off_from_index(index)
     with self.dev.s30_fw.lock:
+      self.dev.s30_fw.flush_meta()
       if not isinstance(data, (bytes, bytearray, memoryview)) or not self._can_stage(index, offset, memoryview(data).nbytes):
         return super().__setitem__(index, data)
       src = bytes(data)
@@ -182,7 +184,7 @@ class S30VRAMView(USBMMIOInterface):
       for off in range(0, n, S30_UPLOAD_SIZE):
         chunk = src[off:min(off+S30_UPLOAD_SIZE, n)]
         self.usb.scsi_write(chunk, slot_start=HALF//SLOT)
-        copy(self.va+offset+off, S30_STAGE_VA, global_size=(len(chunk)//128,1,1), local_size=(32,1,1))
+        copy(self.va+offset+off, S30_STAGE_VA, global_size=(len(chunk)//128,1,1), local_size=(32,1,1), wait=self.dev.s30_fw.meta_enabled)
       if n < len(src): super().__setitem__(slice(offset+n, offset+len(src)), src[n:])
 
 class MTAllocator(Allocator['MTDevice']):
@@ -350,6 +352,10 @@ class MTDevice(Compiled):
     for base, (view, meta) in self.views.items():
       if base <= va < base + meta.size: return view, meta
     raise RuntimeError(f'Unknown MT buffer address {va:#x}')
+
+  def synchronize(self, timeout:int|None=None):
+    if self.mt.s30: self.s30_fw.flush_meta(None if timeout is None else timeout/1000)
+    super().synchronize(timeout)
 
   def finalize(self):
     try:
