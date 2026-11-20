@@ -3,6 +3,8 @@
 set -eu
 if [[ ${1:-} == sram-mnist ]]; then
   if [[ $# != 2 && ( $# != 4 || $3 != --index ) ]]; then echo "usage: $0 sram-mnist WEIGHTS [--index N]" >&2; exit 2; fi
+elif [[ ${1:-} == sram-whisper ]]; then
+  if [[ $# != 2 ]]; then echo "usage: $0 sram-whisper AUDIO" >&2; exit 2; fi
 elif [[ $# != 2 && ( $# != 3 || ${3:-} != --check-reference ) ]]; then
   echo "usage: $0 {mnist|whisper|qwen} INPUT [--check-reference]" >&2; exit 2
 fi
@@ -37,14 +39,14 @@ elif [[ $base != /usr ]]; then opts+=(--ro-bind "$base" "$base"); fi
 # tinygrad names downloads by the MD5 of the upstream URL. These are the four IDX files, tiny.en weights and GPT-2 tokenizer.
 case "$1" in
   mnist|sram-mnist) assets=(e8e6ed0857e9bb000985bfea8283b0b3.gunzip 684fe191a76d9107981692e6f0d3842f.gunzip 40a9ec2164c7887e8a5f1225de927907.gunzip 7b1e157ab43d54d0946f76d1bb6df574.gunzip) ;;
-  whisper) assets=(3a2cae277fcec4464349df535729caaf 5386a662f5b1245493601b29a5e61f40) ;;
+  whisper|sram-whisper) assets=(3a2cae277fcec4464349df535729caaf 5386a662f5b1245493601b29a5e61f40) ;;
   qwen) assets=() ;;
   *) echo "unknown model $1" >&2; exit 2 ;;
 esac
 for asset in "${assets[@]}"; do
   opts+=(--ro-bind "$downloads/$asset" "/home/bench/.cache/tinygrad/downloads/$asset")
 done
-if [[ $1 == sram-mnist ]]; then
-  for file in sram.py sram_mnist.py; do opts+=(--ro-bind "$repo/extra/usbgpu/s30/$file" "/src/extra/usbgpu/s30/$file"); done
+if [[ $1 == sram-mnist || $1 == sram-whisper ]]; then
+  for file in sram.py "${1/-/_}.py"; do opts+=(--ro-bind "$repo/extra/usbgpu/s30/$file" "/src/extra/usbgpu/s30/$file"); done
 fi
 exec bwrap "${opts[@]}" -- /venv/bin/python s30/verify_native.py "$1" /input "${@:3}"

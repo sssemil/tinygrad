@@ -1,5 +1,5 @@
 """Run a freshly compiled S30 shader with all GPU mappings in Chestnut SRAM. --cold cycles the downstream slot."""
-import argparse, secrets, struct, time
+import argparse, functools, secrets, struct, time
 from tinygrad import Context, UOp, dtypes
 from tinygrad.codegen import do_to_program
 from tinygrad.helpers import Target, ceildiv, round_up
@@ -44,13 +44,34 @@ class ChestnutBoot(MTS30Firmware):
     grid = s30_grid(program.arg.global_size, program.arg.local_size, shared+ceildiv(local, 16))
     return params, s30_cdm_stream(s30_dispatch(pds, shared, attrs)+grid)
 
-  def launch(self, data:bytes|bytearray, params:bytearray, stream:bytearray):
-    if len(data) > INPUT_SIZE: raise MemoryError("S30 input exceeds Chestnut SRAM")
-    if data: self.dev.pci_dev.usb.scsi_write(data)
+  def stage(self, params:bytearray, stream:bytearray):
     self.mem[0x3000:0x3000+len(params)] = params
     self.mem[DIRECT_CDM:DIRECT_CDM+len(stream)] = stream
     self.upload_mmu()
+
+  def launch(self, data:bytes|bytearray, params:bytearray, stream:bytearray):
+    if len(data) > INPUT_SIZE: raise MemoryError("S30 input exceeds Chestnut SRAM")
+    if data: self.dev.pci_dev.usb.scsi_write(data)
+    self.stage(params, stream)
     self.kick_direct(0.5)
+
+  @functools.cached_property
+  def read_signal(self):
+    cq = UOp.placeholder((4,), dtypes.uint, slot=0)
+    # A PCIe completion entry with the phase bit set releases the bridge's pending bulk IN.
+    shader = cq[3].store(1<<16).sink(arg=KernelInfo(name="release_sram", opts_to_apply=()))
+    return self.prepare(do_to_program(shader, MTUSCRenderer(Target("MT","USC","mp_10"))), [RESULT])
+
+  def read_output(self, size:int) -> bytes:
+    if not 0 < size <= HALF: raise ValueError("readback must fit in the lower SRAM half")
+    self.stage(*self.read_signal)
+    usb, wire = self.dev.pci_dev.usb.usb, round_up(size, 512)
+    usb.control_write(0xf2, value=0x8000 | wire//512, index=ceildiv(wire, SLOT)<<8)
+    self.start_direct()
+    # Drain the payload before polling core events, which also uses the bulk IN endpoint.
+    data = bytes(usb.bulk_read(wire, timeout=2000)[:size])
+    self.wait_direct(0.5)
+    return data
 
   def result(self) -> int: return int.from_bytes(self.dev.pci_dev.usb.read(0xb800, 4), "little")
 

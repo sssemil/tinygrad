@@ -33,9 +33,9 @@ if __name__ == "__main__":
   with patch.object(MTUSCRenderer, "render", render_shader), patch.object(MTS30Program, "__init__", load_shader), \
        patch.object(MTS30Firmware, "_boot", direct_boot), patch.object(MTS30Firmware, "boot", side_effect=RuntimeError("vendor firmware boot")), \
        patch.object(MTSMC, "__init__", side_effect=RuntimeError("management firmware IPC")):
-    if sys.argv[1] == "sram-mnist":
+    if sys.argv[1] in ("sram-mnist", "sram-whisper"):
       from extra.usbgpu.s30 import sram
-      del sys.argv[1]
+      module = sys.argv.pop(1).replace("-", "_")
       map_bar, f0_out, shader = USBPCIDevice.map_bar, CustomASM24Controller._f0_out, sram.s30_shader
 
       def register_bar(self, bar, *args, **kwargs):
@@ -52,7 +52,7 @@ if __name__ == "__main__":
 
       with patch.object(USBPCIDevice, "map_bar", register_bar), patch.object(CustomASM24Controller, "_f0_out", register_request), \
            patch.object(sram, "s30_shader", sram_shader):
-        runpy.run_module("extra.usbgpu.s30.sram_mnist", run_name="__main__")
+        runpy.run_module(f"extra.usbgpu.s30.{module}", run_name="__main__")
     else: runpy.run_path(str(Path(__file__).resolve().parents[1]/"bench_s30.py"), run_name="__main__")
   if not loaded: raise RuntimeError("benchmark loaded zero S30 shaders")
   print(f"Verified {len(loaded)} distinct S30 shader binaries generated from UOps in this process.")

@@ -437,3 +437,13 @@ The bridge-SRAM commands construct the direct compute context without a firmware
 A separate early-slot run kept all ten pre-argmax scores in Chestnut SRAM and used a freshly compiled GPU copy kernel to return each score through the same completion word. For the first 16 images, each in a separate slot cycle, the largest absolute difference across all 160 logits versus an independent FP32 CPU process was 0.00000620. All 16 classifications matched. The normal SRAM diagnostic also runs argmax on the GPU.
 
 Fresh MUSA processes with compiler caching disabled passed all 15 reference checks across the three workloads. The table at the top uses these measurements. For a possible launch-latency improvement, three trials comparing 200 four-byte reads of the compute ID returned a median of 80.46–80.47 µs with bulk input and 81.93–82.41 µs with a control transfer. Both returned the same ID. The runtime retains bulk reads.
+
+## November 20, 2026 — stream Whisper's convolutional frontend through Chestnut SRAM
+
+The trained tiny.en encoder ran both convolutions and both GELUs on the S30. The first layer used 64 output channels and 64 frames per tile, the second used 64 channels and 32 frames per tile. Adjacent tiles included the input halo for the three-tap filter. The host assembled each result for the next layer. Both compute shaders and a third shader that releases the USB bulk read came from tinygrad UOps compiled after rail enable. A host XDATA write to the completion phase byte timed out. A GPU store to the completion entry released a byte-exact bulk read from slot zero. This lets the host read a full activation tile.
+
+Three isolated runs compared all 1,152,000 first-layer activations and all 576,000 second-layer activations for test.wav with the CPU model. Maximum absolute errors were 0.00000334 and 0.00000834 respectively. The first layer finished at 563–568 ms with the management rings uninitialized. The second finished at about 1.4 s with the rings ready. The verifier prohibited management IPC and card VRAM transactions for the entire run. This check ends before the encoder's positional embedding and attention. The full transcription benchmark at the top uses card VRAM.
+
+```sh
+extra/usbgpu/s30/bench_isolated.sh sram-whisper test/models/whisper/test.wav
+```

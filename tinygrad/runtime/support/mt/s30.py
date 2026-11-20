@@ -175,9 +175,11 @@ class MTS30Firmware(MTFirmwareBoot):
         self.direct = False
         self._write(0x24e0, route, 4)
 
-  def kick_direct(self, timeout:float) -> None:
+  def start_direct(self) -> None:
     for reg,value in ((0x138, 4), (0x478, 1)):
       for core in (MT_CORE_STRIDE, 0): self._write(core+reg, value, 4)
+
+  def wait_direct(self, timeout:float) -> None:
     deadline = time.monotonic()+timeout
     for core in (0, MT_CORE_STRIDE):
       while not self._read(core+0x130, 4) & 4:
@@ -185,6 +187,10 @@ class MTS30Firmware(MTFirmwareBoot):
           fault = self._read(core+0xe160)
           for offset in (MT_CORE_STRIDE, 0): self._reset(offset)
           raise TimeoutError(f"S30 compute timed out on core {core//MT_CORE_STRIDE}, MMU fault {fault:#x}")
+
+  def kick_direct(self, timeout:float) -> None:
+    self.start_direct()
+    self.wait_direct(timeout)
 
   def submit(self, token:int|None, command:int, size:int, data:bytearray, timeout:float, signal:tuple[int,int]|None=None,
              resident:Buffer|None=None, offset:int=0) -> MTResponse:
