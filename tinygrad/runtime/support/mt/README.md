@@ -6,6 +6,8 @@ The MT userspace driver supports the MTT S30 and S80 over USB/PCI. `DEV=MT` sele
 
 tinygrad compiles kernels to native USC instructions and submits them to both compute cores. With GNU `metag-elf-as` and `metag-elf-objcopy` on `PATH`, tinygrad assembles [dispatch.s](dispatch.s) at startup and runs the queue on META. Set `MT_META=1` to require this path, or `MT_META=0` to submit directly from the host. Both paths run without the MUSA toolkit or Moore Threads compute firmware.
 
+With open META, `DEBUG=2` reports the on-card interval from the first compute kick through completion on both cores. `VIZ=1` records each kernel in a batch. Use a host timer around the workload and `Device["MT"].synchronize()` to include USB submission and completion polling.
+
 With the Chestnut accessible to your user, run the hardware tests from the repository root:
 
 ```sh

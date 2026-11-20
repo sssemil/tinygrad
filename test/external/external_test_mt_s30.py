@@ -159,7 +159,7 @@ class TestS30USB(unittest.TestCase):
       buf.host[:4] = struct.pack("<i", 7)
       self.assertEqual(list(buf.as_memoryview().cast("i")), [7]+[v+1 for v in values[1:]])
       prg(buf.meta.va, global_size=(9,1,1), local_size=(32,1,1))
-      def missed_doorbell(): fw.meta_sequence += 1
+      def missed_doorbell(timestamps): fw.meta_sequence += 1
       with patch.object(fw, "start_direct", missed_doorbell), self.assertRaisesRegex(TimeoutError, "completed"):
         fw.flush_meta(0.01)
       self.assertFalse(fw.direct)
@@ -197,6 +197,30 @@ class TestS30USB(unittest.TestCase):
         self.assertEqual(run(last, groups), [])
       fw.session.close()
       self.assertEqual(run(0, 1), [cold])
+
+  def test_meta_timestamps(self):
+    from unittest.mock import patch
+    from tinygrad.helpers import perf_counter_us
+    dev = Device["MT"]
+    fw = dev.s30_fw
+    if not fw.meta_enabled: self.skipTest("requires native META dispatch")
+    prg = increment(dev)
+    buf = Buffer("MT", 9*32*4, initial_value=bytes(9*32*4))
+    for count in (4, 8):
+      fw.session.close()
+      with Context(PROFILE=1), patch.object(dev, "profile_events", []) as events:
+        before = perf_counter_us()
+        for _ in range(3): self.assertIsNone(prg(buf.meta.va, global_size=(9,1,1), local_size=(32,1,1)))
+        elapsed = prg(buf.meta.va, global_size=(9,1,1), local_size=(32,1,1), wait=True)
+        after = perf_counter_us()
+        self.assertEqual([(e.name, e.device, e.profile_key) for e in events], [(prg.name, dev.device, prg.profile_key)]*4)
+        for e in events:
+          self.assertLessEqual(before, e.st)
+          self.assertLess(e.st, e.en)
+          before = e.en
+        self.assertLessEqual(before, after)
+        self.assertAlmostEqual(elapsed, float(events[-1].en-events[-1].st)*1e-6, places=12)
+      self.assertEqual(list(buf.as_memoryview().cast("i")), [count]*(9*32))
 
   def test_native_workgroup_exchange(self):
     import numpy as np

@@ -2,11 +2,12 @@ from __future__ import annotations
 import functools, struct, threading, time
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager, ExitStack
+from decimal import Decimal
 from pathlib import Path
 from typing import TYPE_CHECKING
 from tinygrad.device import Buffer, Program
 from tinygrad.dtype import AddrSpace, dtypes
-from tinygrad.helpers import ceildiv, getenv, round_up, unwrap
+from tinygrad.helpers import PROFILE, ProfileRangeEvent, ceildiv, getenv, perf_counter_us, round_up, unwrap
 from tinygrad.renderer import TinyELF
 from tinygrad.uop.ops import UOp, KernelInfo
 from tinygrad.runtime.support.mt.compute import MTComputeRegisters, FW_BASE, FW_DEVVA, ROOT_BASE
@@ -19,6 +20,7 @@ if TYPE_CHECKING: from tinygrad.runtime.ops_mt import MTDevice
 
 CDM_CONTROL_SIZE, CDM_RING_SIZE = 128, 0x800
 DIRECT_CDM = 0x4000  # shared ring controls in the direct context, below the compute state at 0x6000
+TIMER_MASK = (1<<48)-1  # bit 63 of CR_TIMER mirrors bit 31
 META_BATCH = 0x8000
 META_BATCH_PDS = 0xf0000000  # above the S30 allocator's 2 GiB range
 S30_STAGE_VA, S30_UPLOAD_SIZE = 0x7000000000, HALF-2*SLOT
@@ -80,6 +82,11 @@ class MTS30Firmware(MTComputeRegisters):
     if not 0 < len(code) <= 0x1000: raise ValueError("S30 META scheduler exceeds its code page")
     return code
 
+  def _sample_timer(self) -> tuple[int, float]:
+    start = time.perf_counter()
+    ticks = self._read(0x160, 4)
+    return ticks, (time.perf_counter()+start)/2
+
   @contextmanager
   def boot_direct(self) -> Iterator[None]:
     # Enable both compute cores and route the workgroups across them.
@@ -119,7 +126,11 @@ class MTS30Firmware(MTComputeRegisters):
           self._write(core+0x24c0, 3, 4)
         if self.meta_enabled:
           self.meta_sequence = 0
+          # CR_TIMER counts GPU clocks divided by 256. Calibrate across the port setup at the current S30 clock.
+          t0, host0 = self._sample_timer()
           MetaPort(self).start(META_BATCH+HALF-0x1000)
+          t1, host1 = self._sample_timer()
+          self.tick_seconds = (host1-host0)/((t1-t0) & 0xffffffff)
         self.direct = True
         try: yield
         finally: self.flush_meta()
@@ -131,35 +142,38 @@ class MTS30Firmware(MTComputeRegisters):
         self.direct = False
         self._write(0x24e0, route, 4)
 
-  def start_direct(self) -> None:
+  def start_direct(self, timestamps:bool=False) -> None:
     if self.meta_enabled:
-      self.meta_sequence = self.meta_sequence % 0xffffffff + 1
-      self.v[0x1000:0x1004] = struct.pack("<I", self.meta_sequence)
+      self.meta_sequence = self.meta_sequence % 0x7fffffff + 1
+      self.v[0x1000:0x1004] = struct.pack("<I", self.meta_sequence | timestamps<<31)
       return
     for reg,value in ((0x138, 4), (0x478, 1)):
       for core in (MT_CORE_STRIDE, 0): self._write(core+reg, value, 4)
 
-  def wait_direct(self, timeout:float) -> None:
+  def wait_direct(self, timeout:float, timestamps:bool=False) -> memoryview|None:
     deadline = time.monotonic()+timeout
     if self.meta_enabled:
-      while (completed:=int.from_bytes(self.v[0x1004:0x1008], "little")) != self.meta_sequence:
+      end = 0x1010+16*len(self.meta_pending) if timestamps else 0x1008
+      request = self.meta_sequence | timestamps<<31
+      while (completed:=int.from_bytes((reply:=self.v[0x1004:end])[:4], "little")) != request:
         if time.monotonic() >= deadline:
           events = [self._read(core+0x130, 4) for core in (0, MT_CORE_STRIDE)]
           faults = [hex(self._read(core+0xe150)) for core in (0, MT_CORE_STRIDE)]
           kernels = [(off, program.name) for off,program in self.meta_pending]
           for offset in (MT_CORE_STRIDE, 0): self._reset(offset)
           raise TimeoutError(f"S30 META sequence {self.meta_sequence}, completed {completed}, events {events}, faults {faults}, pending {kernels}")
-      return
+      return memoryview(reply)[12:] if timestamps else None
     for core in (0, MT_CORE_STRIDE):
       while not self._read(core+0x130, 4) & 4:
         if time.monotonic() >= deadline:
           fault = self._read(core+0xe160)
           for offset in (MT_CORE_STRIDE, 0): self._reset(offset)
           raise TimeoutError(f"S30 compute timed out on core {core//MT_CORE_STRIDE}, MMU fault {fault:#x}")
+    return None
 
-  def flush_meta(self, timeout:float|None=None, readback:memoryview|None=None):
+  def flush_meta(self, timeout:float|None=None, readback:memoryview|None=None, wait:bool=False) -> float|None:
     with self.lock:
-      if self.meta_flushing or not self.meta_pending: return
+      if self.meta_flushing or not self.meta_pending: return None
       self.meta_flushing = True  # buffer finalizers may read the timeline during submission
       try:
         self.upload_mmu()
@@ -174,7 +188,18 @@ class MTS30Firmware(MTComputeRegisters):
             while data[end-512:end] == self.meta_resident[end-512:end]: end -= 512
           unwrap(self.bridge).scsi_write(data[start:end], slot_start=(HALF+start)//SLOT)
           self.meta_resident = data
-        self.kick_direct(5.0*len(self.meta_pending) if timeout is None else timeout, readback)
+        host_start = perf_counter_us() if PROFILE else None
+        if (raw:=self.kick_direct(5.0*len(self.meta_pending) if timeout is None else timeout, readback, wait or bool(PROFILE))) is not None:
+          pairs = list(struct.iter_unpack('<QQ', raw))
+          if host_start is not None:
+            # Center the device interval between the host doorbell and completion, keeping the hardware durations and gaps.
+            first, last = pairs[0][0], pairs[-1][1]
+            us_per_tick = Decimal(self.tick_seconds*1e6)
+            base = (host_start+perf_counter_us()-((last-first)&TIMER_MASK)*us_per_tick)/2
+            for (_,prg), (st,en) in zip(self.meta_pending, pairs, strict=True):
+              prg.dev.profile_events.append(ProfileRangeEvent(prg.dev.device, prg.name, base+((st-first)&TIMER_MASK)*us_per_tick,
+                                                              base+((en-first)&TIMER_MASK)*us_per_tick, prg.profile_key))
+          if wait: return ((pairs[-1][1]-pairs[-1][0]) & TIMER_MASK)*self.tick_seconds
       except BaseException:
         self.session.close()
         raise
@@ -183,11 +208,12 @@ class MTS30Firmware(MTComputeRegisters):
         self.meta_data.clear()
         self.meta_pending.clear()
         self.meta_flushing = False
+    return None
 
-  def kick_direct(self, timeout:float, readback:memoryview|None=None) -> None:
-    if readback is None: self.start_direct()
-    else: unwrap(self.bridge).scsi_read(readback, self.start_direct)
-    self.wait_direct(timeout)
+  def kick_direct(self, timeout:float, readback:memoryview|None=None, timestamps:bool=False) -> memoryview|None:
+    if readback is None: self.start_direct(timestamps)
+    else: unwrap(self.bridge).scsi_read(readback, lambda: self.start_direct(timestamps))
+    return self.wait_direct(timeout, timestamps)
 
 def s30_dispatch(pds_off:int, shared:int, attrs:int) -> tuple[int, ...]:
   return (2, pds_off | 2, pds_off+16, 0, 0, 0, 0x02000000 | shared, 0, 0x100085 | attrs<<12, pds_off+32, pds_off+64)
@@ -349,20 +375,20 @@ class MTS30Program(Program['MTDevice']):
       elif not fw.meta_enabled: fw.upload_mmu()
       try:
         if fw.meta_enabled and (wait or timeout is not None): fw.flush_meta()
-        start = time.perf_counter()
         wait_seconds = 5.0 if timeout is None else timeout/1000
         if fw.meta_enabled:
           self.enqueue_meta(fw, global_size, local_size, upload)
           fw.meta_args.update(args)
-          if wait or readback is not None or timeout is not None: fw.flush_meta(wait_seconds, readback)
-        else:
-          params, stream = s30_direct_stream(self.dispatches, global_size, local_size, self.shared, self.split, self.launch, 8*len(self.args))
-          data = params+stream
-          if fw.bridge is not None:
-            slot, pad = divmod(S30_RING_OFFSET+self.param_offset-DIRECT_CDM, SLOT)
-            fw.bridge.scsi_write(bytes(pad)+data, slot_start=slot)
-          else: fw.v[self.param_offset:self.param_offset+len(data)] = data
-          fw.kick_direct(wait_seconds, readback)
+          if wait or readback is not None or timeout is not None: return fw.flush_meta(wait_seconds, readback, wait)
+          return None
+        start = time.perf_counter()
+        params, stream = s30_direct_stream(self.dispatches, global_size, local_size, self.shared, self.split, self.launch, 8*len(self.args))
+        data = params+stream
+        if fw.bridge is not None:
+          slot, pad = divmod(S30_RING_OFFSET+self.param_offset-DIRECT_CDM, SLOT)
+          fw.bridge.scsi_write(bytes(pad)+data, slot_start=slot)
+        else: fw.v[self.param_offset:self.param_offset+len(data)] = data
+        fw.kick_direct(wait_seconds, readback)
         return time.perf_counter()-start if wait else None
       except BaseException:
         fw.session.close()
