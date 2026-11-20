@@ -8,9 +8,9 @@ Measured on the same Chestnut S30 with compiler caching disabled. The cold colum
 
 | Workload | Native cold | MUSA cold | Native warm | MUSA warm |
 | --- | ---: | ---: | ---: | ---: |
-| MNIST, batch of 16 | 0.865 s | 3.533 s | 15.24 ms | 14.39 ms |
-| Whisper tiny.en, test.wav | 8.297 s | 51.173 s | 2.520 s | 2.289 s |
-| Qwen2.5-0.5B Q8_0 | 15.564 s | 172.234 s | 3.262 s | 4.811 s |
+| MNIST, batch of 16 | 0.837 s | 3.499 s | 13.45 ms | 14.04 ms |
+| Whisper tiny.en, test.wav | 8.374 s | 51.173 s | 2.526 s | 2.289 s |
+| Qwen2.5-0.5B Q8_0 | 15.518 s | 172.234 s | 3.262 s | 4.811 s |
 
 The benchmark checked all five outputs against the recorded reference for each model on each backend. The native column uses the offline, isolated benchmark. It checked every loaded USC program against compiler output generated in the same process. The check covered 10 distinct binaries for MNIST, 94 for Whisper and 73 for Qwen. The benchmark also checked that compute startup received only zero-filled context memory, with META master boot disabled. It blocked vendor firmware boot and management mailbox construction. The card powered up with its factory firmware still installed. The host did not upload proprietary code during these model runs. The board-management mailbox was unused.
 
@@ -619,3 +619,11 @@ After the probes, ordinary isolated native MNIST correctly classified all 16 dig
 One MaxPool candidate exceeded the device timeout that beam search had requested for it. The S30 recovered both command processors, but the timeout ended the whole search. Timed candidates that exceed that explicit limit now get an infinite timing. A timeout during an unbounded measurement still propagates. The search regression tests exercise both cases.
 
 With `BEAM=1`, the offline MNIST runner generated and loaded 830 distinct USC programs in one process, including tuning candidates. All 16 labels matched on each of five calls. Time to first output was 123.359 s and warm median was 14.69 ms. A separate run outside the sandbox measured 126.653 s and 13.89 ms. The default native path gave 0.869 s and 15.41 ms in a fresh isolated run. The prior default MUSA measurement was 3.533 s and 14.39 ms. The optional native search trades over two minutes of startup for a small warm reduction on this batch.
+
+## November 20, 2026 — reuse filters across two filter widths
+
+Examining the measured schedule for the 20-column convolution showed that one thread computed ten neighboring outputs with the same five-tap filter. The native scheduler now uses two filter widths when a batched convolution has a compatible output width. It groups work along output channels and scanlines. Reusing the wider tile with the previous lane order gave 18.35–18.63 ms on batch-16 MNIST. Grouping channels and scanlines with up to 128 lanes brought that to 13.61–13.65 ms in three exploratory runs.
+
+Two fresh offline processes using the default scheduler and empty caches measured 13.49 and 13.45 ms warm. A fresh MUSA run between them measured 14.04 ms. All five batches matched on each run. The table uses the second isolated native run and that MUSA run for MNIST. The isolated Whisper and Qwen results are also fresh. Their MUSA columns carry forward the previous same-card controls.
+
+All 165 archived inference graphs compiled. All 23 applicable native hardware tests passed, including exact convolution comparisons with NumPy at five output widths. A batch-16 training step agreed with the CPU on the loss and all 20 updated tensors. The separate SRAM-only MNIST runner produced class 7 in 362.98 ms from rail enable with nine freshly generated programs and both management rings unready.

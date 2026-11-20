@@ -84,21 +84,28 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
           if r.src[0].divides(n) is not None:
             k.apply_opt(Opt(OptOps.SPLIT, k.rngs.index(r), (n, AxisType.UPCAST)))
             tiled = True
+    local_axes = None
     if spatial and dot is not None and len(k.reduceops) == 1:
       lhs, rhs = (x.ranges for x in dot.src)
       axes = [k.rngs[i] for i in k.upcastable_dims()]
       rows, channels = [r for r in axes if r in lhs and r not in rhs], [r for r in axes if r in rhs and r not in lhs]
       if len(rows) == 1: rows, channels = channels, rows
-      if len(rows) > 1 and len(channels) == 1:
+      taps = k.full_shape[k.upcastable_dims(reduce=True)[-1]]
+      if (len(rows) == len(k.reduce_ranges) == 3 and len(channels) == 1 and all(r.axis_type is AxisType.GLOBAL for r in rows+channels)
+          and 2 <= taps <= 5 and rows[-1].src[0].divides(2*taps) is not None):
+        # Sweep adjacent output pixels in registers while neighboring lanes compute other filters and scanlines.
+        k.apply_opt(Opt(OptOps.SPLIT, k.rngs.index(rows[-1]), (2*taps, AxisType.UPCAST)))
+        local_axes = [channels[0], rows[-2]]
+      elif len(rows) > 1 and len(channels) == 1:
         # Reuse each input window across channels and each filter across adjacent output positions.
         for r,sizes in ((channels[0], (2,)), (rows[-1], (4, 3))):
           if tile:=next((n for n in sizes if r.src[0].divides(n) is not None), 0):
             k.apply_opt(Opt(OptOps.SPLIT, k.rngs.index(r), (tile, AxisType.UPCAST)))
       elif (a:=next((i for i in reversed(k.upcastable_dims()) if k.full_shape[i]%4 == 0), None)) is not None:
         k.apply_opt(Opt(OptOps.SPLIT, a, (4, AxisType.UPCAST)))
-    globals_ = [k.rngs[a] for a in k.axes_of(AxisType.GLOBAL, AxisType.WEAK, reduce=False)]
-    width = 128 if spatial or tiled else 64 if red is not None and len(globals_) > 1 else 32
-    for r in globals_[::-1]:
+    if local_axes is None: local_axes = [k.rngs[a] for a in reversed(k.axes_of(AxisType.GLOBAL, AxisType.WEAK, reduce=False))]
+    width = 128 if spatial or tiled else 64 if red is not None and len(local_axes) > 1 else 32
+    for r in local_axes:
       if r.src[0].op is not Ops.CONST: continue
       size = next((n for n in range(min(64, width) if spatial else width, 1, -1) if r.src[0].val%n == 0), 1)
       if size > 1:
