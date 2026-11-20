@@ -174,6 +174,7 @@ def xsin(d:UOp, fast:bool=False, switch_over:float=30.0) -> UOp:
   - switch_over is the threshold for switching to payne_hanek_reduction.
   """
   assert d.dtype in TRANSCENDENTAL_DTYPES
+  if d.dtype == dtypes.float16: return xsin(d.cast(dtypes.float32), fast, switch_over).cast(d.dtype)
   # mask +-inf/nan as zero
   x = _lazy_map_numbers(d, d.const_like(0.0), d.const_like(0.0), d.const_like(0.0), d)
   # x_sign = sign(x)

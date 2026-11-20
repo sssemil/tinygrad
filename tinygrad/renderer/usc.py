@@ -3,7 +3,7 @@ from collections import Counter, defaultdict
 from tinygrad.dtype import AddrSpace, DType, dtypes
 from tinygrad.helpers import Target
 from tinygrad.renderer import Compiler, Renderer
-from tinygrad.uop.ops import Ops, UOp
+from tinygrad.uop.ops import Ops, PatternMatcher, UOp, UPat
 
 def _field(value:int, bits:tuple[int, ...]) -> int:
   if not 0 <= value < 1<<len(bits): raise NotImplementedError(f"S30 USC operand {value} exceeds {len(bits)} bits")
@@ -191,11 +191,20 @@ def _assemble(ins:list[Instruction]) -> tuple[bytes, int]|None:
   code.extend(struct.pack('<I', 0x8000031c | (0 if fence is None else 0x400<<fence)))  # wait and end
   return bytes(code), peak
 
+def _trunc(x:UOp) -> UOp:
+  exp, mant = dtypes.finfo(x.dtype)
+  uint = dtypes.ushort if x.dtype == dtypes.half else dtypes.uint
+  bits = x.bitcast(uint).cast(dtypes.uint)
+  power = ((bits >> mant) & ((1<<exp)-1)).cast(dtypes.int) - ((1<<(exp-1))-1)
+  shift = (mant-power).maximum(0).minimum(mant).cast(dtypes.uint)
+  return (power < 0).where(bits & (1<<(exp+mant)), (bits >> shift) << shift).cast(uint).bitcast(x.dtype)
+
 class USCCompiler(Compiler):
   def compile(self, src:str) -> bytes: return bytes.fromhex(src)
 
 class MTUSCRenderer(Renderer):
   compiler = USCCompiler()
+  extra_matcher = PatternMatcher([(UPat(Ops.TRUNC, (dtypes.float, dtypes.half), src=(UPat.var("x"),)), _trunc)])
   supports_float4 = False
   shared_max = 2048  # bytes guaranteed even for narrow elements, each occupying one local dword
   global_max, local_max = (0x7fffffff,65535,65535), (1024,1024,64)

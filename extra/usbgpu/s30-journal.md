@@ -665,3 +665,11 @@ Each cycle showed two states. Initially the header fields failed the operating s
 The 3.1.0 driver's separate 4 KiB management event log is allocated on the host. In the event-log initialization path, a zeroed 0x1010-byte allocation holds four header words and 0x1000 bytes for events. The driver registers an IPC report handler to receive events. Reading that host log requires the driver to have initialized it. It cannot independently trace the board before the first PCIe configuration read.
 
 The physical USB inventory for this run contained the Chestnut and no external logic analyzer or debug serial adapter. Board startup before link-up and the bridge on-chip ROM remain unverified.
+
+## November 20, 2026 — run the general S30 hardware tests without vendor code
+
+Eight tensor and dispatch tests formerly required the vendor compiler, even for the native renderer. They now exercise the selected renderer. An explicit reference renderer selects the board-version query and the two vendor compute-firmware tests. On the default MT backend, 32 hardware tests passed with both compiler entry points, firmware boot and management IPC set to raise immediately. The three reference-only tests skipped. Selecting MUSA passed all 35 tests on the same card.
+
+The extra coverage exposed a missing USC lowering for truncation. The new lowering clears fractional mantissa bits and keeps the sign when a fraction truncates to zero. On hardware, all 65,536 half-precision bit patterns and 60,008 single-precision inputs agreed with NumPy, including signed zeros, infinities and NaN classification. The hardware suite also keeps a small edge-case regression for both types.
+
+Half-precision sine of 1.0 had rounded to 0.841796875. Computing the emulated range reduction and polynomial at single precision before rounding once gave 0.84130859375. Over all half-precision encodings, finite results differed from double-precision NumPy rounded to half in 14 cases, each by one ULP. Both zero signs were preserved and every nonfinite input returned NaN. The CPU transcendental and rewrite tests passed.

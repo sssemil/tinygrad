@@ -8,11 +8,13 @@ from tinygrad.runtime.support.mt.compute import FW_DEVVA, META_BASE
 from tinygrad.runtime.support.mt.mmu import MT_PTE_READ_WRITE
 from tinygrad.runtime.support.mt.s30 import DEFAULT_S30_FIRMWARE, PDS_BASE, USC_BASE, s30_pds
 
-has_firmware = Path(os.getenv("MT_FIRMWARE", DEFAULT_S30_FIRMWARE)).is_file()
-requires_firmware = unittest.skipUnless(has_firmware, "requires mtgpu-s30 3.1.0-6 mtfw-gen1.bin")
-compiler_bin = 'clang-14' if DEV.target("MT").renderer == "LLVM" else 'mcc'
-requires_compiler = unittest.skipUnless(has_firmware and DEV.target("MT").renderer in ("MUSA", "LLVM") and (MTCompiler().bin/compiler_bin).is_file(),
-                                        f"requires S30 firmware and the renderer using {compiler_bin}")
+renderer = DEV.target("MT").renderer
+reference = renderer in ("MUSA", "LLVM")
+has_firmware = reference and Path(os.getenv("MT_FIRMWARE", DEFAULT_S30_FIRMWARE)).is_file()
+requires_firmware = unittest.skipUnless(has_firmware, "select a reference renderer with mtfw-gen1.bin for the firmware tests")
+compiler_bin = 'clang-14' if renderer == "LLVM" else 'mcc'
+requires_renderer = unittest.skipUnless(not reference or (has_firmware and (MTCompiler().bin/compiler_bin).is_file()),
+                                        f"selected reference renderer requires S30 firmware and {compiler_bin}")
 
 
 @unittest.skipUnless(DEV.device == "MT", "run explicitly with DEV=MT on a USB Chestnut with an S30")
@@ -23,10 +25,14 @@ class TestS30USB(unittest.TestCase):
 
   def setUp(self): Device["MT"].s30_fw.session.close()
 
+  def test_core_ids(self):
+    cores = Device["MT"].mt.core_ids
+    self.assertEqual(len(cores), 2)
+    self.assertTrue(all(cores))
+
+  @unittest.skipUnless(reference, "select a reference renderer to query the board management firmware")
   def test_firmware(self):
     mt = Device["MT"].mt
-    self.assertEqual(len(mt.core_ids), 2)
-    self.assertTrue(all(mt.core_ids))
     for _ in range(12): self.assertEqual(mt.smc.rtos_version(), mt.fw_versions)
 
   @requires_firmware
@@ -373,7 +379,7 @@ class TestS30USB(unittest.TestCase):
         np.testing.assert_array_equal((((x*y)>>y) ^ (x<<y)).numpy(), ((a*b)>>b) ^ (a<<b))
         np.testing.assert_array_equal(x.float().numpy(), a.astype(np.float32))
 
-  @requires_compiler
+  @requires_renderer
   def test_tensor_compute(self):
     for n,dt in ((4, dtypes.int32), (257, dtypes.int32), (4099, dtypes.float32)):
       with self.subTest(n=n, dtype=dt):
@@ -384,7 +390,7 @@ class TestS30USB(unittest.TestCase):
         self.assertEqual(add.to("CPU").tolist(), (cpu + 1).tolist())
         self.assertEqual((add * gpu).to("CPU").tolist(), ((cpu + 1) * cpu).tolist())
 
-  @requires_compiler
+  @requires_renderer
   def test_batched_matmul(self):
     import numpy as np
     rng = np.random.default_rng(30)
@@ -395,7 +401,7 @@ class TestS30USB(unittest.TestCase):
         result = Tensor(a, device="MT") @ Tensor(b, device="MT").float().transpose(-1, -2)
         np.testing.assert_array_equal(result.numpy(), a @ b.transpose(0, 2, 1))
 
-  @requires_compiler
+  @requires_renderer
   def test_llm_decode_attention(self):
     import numpy as np
     from tinygrad.llm.kernels.mt import s30_decode_attention
@@ -413,7 +419,7 @@ class TestS30USB(unittest.TestCase):
       result = run(Tensor(q, device="MT"), Tensor(cache, device="MT"), pos.bind(p))
       np.testing.assert_allclose(result.numpy(), (exp / exp.sum(axis=-1, keepdims=True)) @ values, atol=2e-5, rtol=2e-5)
 
-  @requires_compiler
+  @requires_renderer
   def test_llm_gemv(self):
     import numpy as np
     from tinygrad.llm.kernels.amd import Linear
@@ -428,7 +434,7 @@ class TestS30USB(unittest.TestCase):
       x = rng.integers(-4, 5, (1, 1, k)).astype(np.float32)
       np.testing.assert_array_equal(run(Tensor(x, device="MT")).numpy(), x @ w.astype(np.float32).T + bias)
 
-  @requires_compiler
+  @requires_renderer
   def test_symbolic_matmul(self):
     import numpy as np
     rng = np.random.default_rng(30)
@@ -441,14 +447,24 @@ class TestS30USB(unittest.TestCase):
     for n in (33, 1, 8, 9, 31, 32, 7):
       np.testing.assert_array_equal(run(x, w, rows.bind(n)).numpy(), np.pad(a[:n] @ b.T, ((0, 33-n), (0, 0))))
 
-  @requires_compiler
+  @requires_renderer
   def test_half_math(self):
     x = Tensor([0.25, 0.5, 1.0, 2.0], device="MT", dtype=dtypes.half)
     for op in (Tensor.sqrt, Tensor.reciprocal, Tensor.exp2, Tensor.log2, Tensor.sin, Tensor.trunc):
       with self.subTest(op=op.__name__):
         self.assertEqual(op(x).tolist(), op(x.to("CPU").float()).half().tolist())
 
-  @requires_compiler
+  def test_native_trunc(self):
+    import numpy as np
+    with Context(DEV="MT:USC", CACHELEVEL=0):
+      for dtype, uint in ((np.float16, np.uint16), (np.float32, np.uint32)):
+        limit = 2**np.finfo(dtype).nmant
+        values = np.array([0., -0., -0.5, 0.5, -3.75, limit-0.5, -(limit-0.5), limit, np.inf, -np.inf, np.nan], dtype=dtype)
+        got = Tensor(values, device="MT").trunc().numpy()
+        np.testing.assert_array_equal(got[:-1].view(uint), np.trunc(values[:-1]).view(uint))
+        self.assertTrue(np.isnan(got[-1]))
+
+  @requires_renderer
   def test_resident_programs_after_restart(self):
     @TinyJit
     def run(x, n): return (x[:n]+3).realize().pad(((0, 512-n),)).contiguous().realize()
@@ -458,7 +474,7 @@ class TestS30USB(unittest.TestCase):
       values = list(range(i, i+512))
       self.assertEqual(run(Tensor(values, device="MT"), count.bind(n)).tolist(), [x+3 for x in values[:n]] + [0]*(512-n))
 
-  @requires_compiler
+  @requires_renderer
   def test_grid(self):
     def run(device):
       x = Tensor(list(range(7*16*12)), device=device).reshape(7,16,12)
