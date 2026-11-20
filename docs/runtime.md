@@ -14,6 +14,44 @@ tinygrad supports various runtimes, enabling your code to scale across a wide ra
 | [WEBGPU](https://github.com/tinygrad/tinygrad/tree/master/tinygrad/runtime/ops_webgpu.py) | Runs on GPU using the Dawn WebGPU engine (used in Google Chrome) | - | Dawn library installed and discoverable. Binaries: [pydawn v0.3.0](https://github.com/wpmed92/pydawn/releases/tag/v0.3.0) |
 
 
+## MTT S30 on USB Chestnut
+
+On a two-core S30, `DEV=MT` selects tinygrad’s native USC renderer. Use `DEV=MT:USC` to require it explicitly. Tinygrad generates USC shader instructions and the PDS launch program, maps them into VRAM, and submits work directly to both compute cores. This path requires the Chestnut USB bridge and access to its USB device. The S30 can still run factory firmware at power-on. Direct host dispatch uses neither the management mailbox nor a host-supplied firmware image.
+
+Tinygrad uses the S30's META processor for dispatch when the GNU META toolchain is available. Set `MT_META=1` to require this path. At startup tinygrad assembles `tinygrad/runtime/support/mt/dispatch.s` and uploads the result to volatile GPU memory. META starts both compute engines and acknowledges each batch after both finish. This path uses GNU binutils built with `--target=metag-elf`. Put `metag-elf-as` and `metag-elf-objcopy` on PATH, or set `META_AS` and `META_OBJCOPY` to their paths. Use `MT_META=0` for direct host dispatch.
+
+Run a model five times from the checkout with the normal Python dependencies for that example. Set `CACHELEVEL=0` to compile from source in a fresh process. The benchmark reports time to the first output and median warm latency. Whisper uses the repository audio fixture. Qwen processes the same prompt each time.
+
+```sh
+export DEV=MT:USC CACHELEVEL=0 PYTHONPATH=.
+python extra/usbgpu/bench_s30.py mnist /path/to/mnist-s30.safetensors
+python extra/usbgpu/bench_s30.py whisper test/models/whisper/test.wav
+python extra/usbgpu/bench_s30.py qwen /path/to/Qwen2.5-0.5B-Instruct-Q8_0.gguf
+```
+
+On a Linux host with the toolkit outside the system libraries, the offline benchmark can also isolate the filesystem. Activate the Python virtualenv for the example, prefetch its model and dataset, and install Bubblewrap and usbutils. The script exposes the selected input and cached model data, creates a fresh home and temporary directory, and opens the Chestnut through the same device lock as the host.
+
+```sh
+extra/usbgpu/s30/bench_isolated.sh mnist /path/to/mnist-s30.safetensors
+extra/usbgpu/s30/bench_isolated.sh whisper test/models/whisper/test.wav
+extra/usbgpu/s30/bench_isolated.sh qwen /path/to/Qwen2.5-0.5B-Instruct-Q8_0.gguf
+```
+
+For the vendor reference, select `DEV=MT:MUSA`. Point `MUSA_PATH` at the MUSA 4.3.0 toolkit containing `bin/mcc`. Both that renderer and `DEV=MT:LLVM`, which uses the toolkit's MTGPU `bin/clang-14`, load `mtfw-gen1.bin` from the `mtgpu-s30` 3.1.0-6 package. Set `MT_FIRMWARE` if the file is outside `/lib/firmware/mthreads`. [Hardware measurements and bring-up journal](../extra/usbgpu/s30-journal.md)
+
+For a short native training check, run three Adam updates on the S30. The ten-step evaluation interval in this example exceeds the length of the check.
+
+```sh
+DEV=MT:USC CACHELEVEL=0 PYTHONPATH=. BS=2 STEPS=3 python3 examples/beautiful_mnist.py
+```
+
+Run the full MNIST training and evaluation demo on the vendor reference from the checkout.
+
+```sh
+DEV=MT:MUSA MUSA_PATH=/path/to/musa MT_FIRMWARE=/path/to/mtfw-gen1.bin \
+  PYTHONPATH=. TARGET_EVAL_ACC_PCT=96 python3 examples/beautiful_mnist.py
+```
+
 ## Interoperability
 
 tinygrad provides interoperability with OpenCL and PyTorch, allowing efficient tensor data sharing between frameworks through the `Tensor.from_blob` API. This enables zero-copy operations by working directly with external memory pointers.

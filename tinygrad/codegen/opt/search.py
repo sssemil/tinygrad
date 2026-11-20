@@ -43,6 +43,9 @@ def _time_program(prg:UOp, var_vals:dict[str, int], buf_uops:list[UOp], early_st
   for _ in range(cnt):
     try: tms.append(next(timer) * factor)
     except AssertionError: return [math.inf] * cnt
+    except TimeoutError:
+      if timeout is None: raise
+      return [math.inf] * cnt
     if early_stop is not None and early_stop < min(tms): break
   return tms
 

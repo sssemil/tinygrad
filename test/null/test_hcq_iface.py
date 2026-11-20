@@ -101,6 +101,16 @@ class TestUSBMMIOInterface(unittest.TestCase):
     self.assertEqual(list(raw), values)
     self.assertEqual(list(usb3.mem[4:8]), values)
 
+  def test_unaligned_pci_view(self):
+    from unittest.mock import patch
+    view = USBMMIOInterface(self.usb, 0, self.size, 'B').view(3)
+    with patch.object(self.usb, 'pcie_mem_write', wraps=self.usb.pcie_mem_write) as write, \
+         patch.object(self.usb, 'pcie_mem_read', wraps=self.usb.pcie_mem_read) as read:
+      view[:4] = b'ABCD'
+      write.assert_called_once_with(0, b'\0\0\0ABCD\0')
+      self.assertEqual(bytes(view[:4]), b'ABCD')
+      read.assert_called_with(0, 8)
+
   def test_pcimem_view(self):
     usb3 = MockUSB(bytearray(self.size))
     mmio_pci = USBMMIOInterface(usb3, 0, self.size, fmt='B', pcimem=True)

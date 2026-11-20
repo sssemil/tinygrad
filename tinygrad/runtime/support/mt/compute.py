@@ -1,8 +1,8 @@
 from __future__ import annotations
 import os, struct, time
 from tinygrad.runtime.autogen import mtfw
-from tinygrad.runtime.support.mt.mtdev import MTDev, MT_SOCIF_OFFSET
-from tinygrad.runtime.support.mt.mmu import MTMMU4
+from tinygrad.runtime.support.mt.mtdev import MTDev
+from tinygrad.runtime.support.mt.mmu import MTMMU4, MT_PAGE_SIZE
 
 FW_BASE, ROOT_BASE, INIT_SIZE, FW_DEVVA = 0x20000000, 0x30000000, 0x2000000, 0xe1c0000000
 FWIF_OFF, META_BASE = 0xc0000, 0x90000000
@@ -24,12 +24,72 @@ class MTFirmwareLayout:
     self.watchdog = self.gpu + 0x4c0
     self.ccb = FWIF_OFF + 0x40ee0
 
-class MTFirmware:
+class MTFirmwareBoot:
+  def __init__(self, dev:MTDev, size:int):
+    self.dev = dev
+    self.v, self.mmu = self._map_context(size)
+
+  def _map_context(self, size:int):
+    # The data, PDS and USC heaps can each span the 2 GiB S30 allocation pool and need 4 MiB of leaf tables.
+    return self.dev.pci_dev.map_bar(2, off=FW_BASE, size=size, fmt='B'), MTMMU4(ROOT_BASE, size=0x1000000 if self.dev.s30 else 0x400000)
+
+  def _write(self, off:int, value:int, size:int=8) -> None: self.dev.regs._write(self.dev.socif + off, value.to_bytes(size, 'little'))
+  def _read(self, off:int, size:int=8) -> int: return int.from_bytes(self.dev.regs._read(self.dev.socif + off, size), 'little')
+
+  def upload_mmu(self, full:bool=False) -> None:
+    if full: ranges = [(0, self.mmu.next)]
+    elif self.dev.s30: ranges = sorted(self.mmu.dirty_ranges.values())
+    else: ranges = [(p, p+MT_PAGE_SIZE) for p in sorted(self.mmu.dirty_ranges)]
+    for start,end in ranges:
+      self.dev.pci_dev.map_bar(2, off=ROOT_BASE+start, size=end-start, fmt='B')[:] = self.mmu.root[start:end]
+    self.mmu.dirty_ranges.clear()
+
+  def _reset(self, core_offset:int=0) -> None:
+    self._write(core_offset+0xa100, 0, 4)
+    self._read(core_offset+0xa100, 4)
+    for value in [0x1249249249249249,0x36db6db6db6db6db,0x7fffffffffffffff]:
+      self._write(core_offset+0x630, value)
+      self._read(core_offset+0x630)
+    for off in [0x650,0x640]:
+      self._write(core_offset+off, 0xffffffff, 4)
+      self._read(core_offset+off, 4)
+    for value in [0x386000000800,0x3860000088f2,0x20000080f2,0x2000000000]:
+      self._write(core_offset+0x100, value)
+      self._read(core_offset+0x100)
+    for off in [0x640,0x650]:
+      self._write(core_offset+off, 0, 4)
+      self._read(core_offset+off, 4)
+    for value in [0x36db6db6db6db6db,0x1249249249249249,0]:
+      self._write(core_offset+0x630, value)
+      self._read(core_offset+0x630)
+    self._read(core_offset+0x100)
+    self._write(core_offset+0xbf8, 1, 4)
+    self._write(core_offset+0xb50, 0)
+
+  def _setup_mmu(self, core_offset:int=0) -> None:
+    self._write(core_offset+0xe140, 0, 4)
+    self._read(core_offset+0xe140, 4)
+    self._write(core_offset+0xe148, self.mmu.root_pa >> 12, 4)
+    for off,value in [(0xe350,0),(0xe358,0xfff80800),(0xe360,0),(0xe368,0xfff80000)]: self._write(core_offset+off, value)
+    self._write(core_offset+0xe328, 0x0202020202020202)
+    self._write(core_offset+0xe320, 0x78ff2)
+
+  def _wait_started(self, fwif:int, timeout:float) -> None:
+    deadline = time.monotonic() + timeout
+    while True:
+      started = struct.unpack('<I', self.v[fwif+4:fwif+8])[0]
+      if started & 0xff == 0x4d:
+        self.started, self.build = started, bytes(self.v[fwif+8:fwif+16]).rstrip(b'\0')
+        return
+      if time.monotonic() > deadline: raise TimeoutError(f"MT firmware start timed out: {started:#x}, fault={self._read(0xe160):#x}")
+      time.sleep(0.01)
+
+class MTFirmware(MTFirmwareBoot):
   def __init__(self, dev:MTDev, path:str|None=None, core_count:int=8, prepare:bool=True):
-    self.dev, self.path, self.core_count = dev, path or os.environ.get('MT_FIRMWARE', DEFAULT_FIRMWARE), core_count
+    if dev.s30: raise ValueError("Use MTS30Firmware for the S30")
+    super().__init__(dev, INIT_SIZE)
+    self.path, self.core_count = path or os.environ.get('MT_FIRMWARE', DEFAULT_FIRMWARE), core_count
     self.layout = MTFirmwareLayout(core_count)
-    self.v = self.dev.pci_dev.map_bar(2, off=FW_BASE, size=INIT_SIZE, fmt='B')
-    self.mmu = MTMMU4(ROOT_BASE)
     if prepare: self._prepare()
 
   def _prepare(self) -> None:
@@ -75,37 +135,9 @@ class MTFirmware:
     self.v[lay.regcfg:lay.regcfg+16] = rc
     self.mmu.map_range(FW_DEVVA, FW_BASE, INIT_SIZE)
 
-  def _write(self, off:int, value:int, size:int=8) -> None: self.dev.smc._write(MT_SOCIF_OFFSET + off, value.to_bytes(size, 'little'))
-  def _read(self, off:int, size:int=8) -> int: return int.from_bytes(self.dev.smc._read(MT_SOCIF_OFFSET + off, size), 'little')
-
-  def upload_mmu(self) -> None:
-    for off in sorted(self.mmu.dirty_pages):
-      rv = self.dev.pci_dev.map_bar(2, off=ROOT_BASE+off, size=0x1000, fmt='B')
-      rv[:] = self.mmu.root[off:off+0x1000]
-    self.mmu.dirty_pages.clear()
-
   def start(self, timeout:float=10.0) -> None:
     self.upload_mmu()
-    self._write(0xa100, 0, 4)
-    self._read(0xa100, 4)
-    for value in [0x1249249249249249,0x36db6db6db6db6db,0x7fffffffffffffff]:
-      self._write(0x630, value)
-      self._read(0x630)
-    for off in [0x650,0x640]:
-      self._write(off, 0xffffffff, 4)
-      self._read(off, 4)
-    for value in [0x386000000800,0x3860000088f2,0x20000080f2,0x2000000000]:
-      self._write(0x100, value)
-      self._read(0x100)
-    for off in [0x640,0x650]:
-      self._write(off, 0, 4)
-      self._read(off, 4)
-    for value in [0x36db6db6db6db6db,0x1249249249249249,0]:
-      self._write(0x630, value)
-      self._read(0x630)
-    self._read(0x100)
-    self._write(0xbf8, 1, 4)
-    self._write(0xb50, 0)
+    self._reset()
     self._write(0, 0x5545010155151101)
     self._write(0x80, 0x5554151555455555)
     self._write(0x1158, 0xff, 4)
@@ -118,12 +150,7 @@ class MTFirmware:
     self._write(0x7080, 0x1000000000000000 | FW_BASE)
     self._write(0x7048, 0x3000000000000000 | (FW_BASE + 0x100000))
     self._write(0xb50, 0)
-    self._write(0xe140, 0, 4)
-    self._read(0xe140, 4)
-    self._write(0xe148, ROOT_BASE >> 12, 4)
-    for off,value in [(0xe350,0),(0xe358,0xfff80800),(0xe360,0),(0xe368,0xfff80000)]: self._write(off, value)
-    self._write(0xe328, 0x0202020202020202)
-    self._write(0xe320, 0x78ff2)
+    self._setup_mmu()
     self._write(0, (self._read(0) & 0xfcfffffff3fffcff) | 0x100000004000100)
     self._write(0x80, (self._read(0x80) & 0xffffffffcf3fffff) | 0x10400000)
     time.sleep(3e-6)
@@ -132,11 +159,4 @@ class MTFirmware:
     time.sleep(3e-6)
     self._write(0x93c0, 1, 4)
     self._write(0x70c0, 1, 4)
-    deadline = time.monotonic() + timeout
-    while True:
-      started = struct.unpack('<I', self.v[FWIF_OFF+4:FWIF_OFF+8])[0]
-      if started & 0xff == 0x4d:
-        self.started, self.build = started, bytes(self.v[FWIF_OFF+8:FWIF_OFF+16]).rstrip(b'\0')
-        return
-      if time.monotonic() > deadline: raise TimeoutError(f"MT firmware start timed out: {started:#x}, fault={self._read(0xe160):#x}")
-      time.sleep(0.01)
+    self._wait_started(FWIF_OFF, timeout)

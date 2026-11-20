@@ -11,31 +11,42 @@ class MTMMU4:
     self.pd:dict[int,int] = {}
     self.pt:dict[tuple[int,int],int] = {}
     self.pages:dict[int,int] = {}
-    self.dirty_pages:set[int] = set()
+    self.dirty_ranges:dict[int,tuple[int,int]] = {0:(0, MT_PAGE_SIZE)}
 
   def _alloc(self) -> int:
     if self.next + MT_PAGE_SIZE > len(self.root): raise MemoryError("MT MMU root allocation exhausted")
     pa = self.next
     self.next += MT_PAGE_SIZE
+    self.dirty_ranges[pa] = (pa, self.next)  # clear unused entries in a new page table
     return self.root_pa + pa
+
+  def _write_entry(self, off:int, value:int, size:int) -> None:
+    self.root[off:off+size] = value.to_bytes(size, 'little')
+    page = off & -MT_PAGE_SIZE
+    lo, hi = self.dirty_ranges.get(page, (off, off+size))
+    self.dirty_ranges[page] = (min(off, lo), max(off+size, hi))
+
+  def _directory(self, pci:int) -> int:
+    if pci not in self.pd:
+      self.pd[pci] = self._alloc()
+      self._write_entry(pci*4, ((self.pd[pci] >> 12) << 4) | 1, 4)
+    return self.pd[pci]
+
+  def reserve_directories(self, va:int, size:int):
+    if size <= 0: return
+    for pci in range(va >> 30, ((va+size-1) >> 30)+1): self._directory(pci & 0x3ff)
 
   def map(self, va:int, pa:int, flags:int=MT_PTE_READ_ONLY) -> None:
     if va % MT_PAGE_SIZE or pa % MT_PAGE_SIZE: raise ValueError("MT MMU mappings must be 4 KiB aligned")
     if flags & 1 != 1: raise ValueError("MT MMU mapping must be present")
-    self.pages[va] = pa
     pci, pdi, pti = (va >> 30) & 0x3ff, (va >> 21) & 0x1ff, (va >> 12) & 0x1ff
-    if pci not in self.pd:
-      self.pd[pci] = self._alloc()
-      self.root[pci*4:pci*4+4] = (((self.pd[pci] >> 12) << 4) | 1).to_bytes(4, 'little')
-      self.dirty_pages.add((pci*4) & ~0xfff)
     if (pci, pdi) not in self.pt:
+      off = self._directory(pci) - self.root_pa + pdi * 8
       self.pt[pci,pdi] = self._alloc()
-      off = self.pd[pci] - self.root_pa + pdi * 8
-      self.root[off:off+8] = (self.pt[pci,pdi] | 1).to_bytes(8, 'little')
-      self.dirty_pages.add(off & ~0xfff)
+      self._write_entry(off, self.pt[pci,pdi] | 1, 8)
     off = self.pt[pci,pdi] - self.root_pa + pti * 8
-    self.root[off:off+8] = ((pa & 0xfffffffff000) | flags).to_bytes(8, 'little')
-    self.dirty_pages.add(off & ~0xfff)
+    self._write_entry(off, (pa & 0xfffffffff000) | flags, 8)
+    self.pages[va] = pa
 
   def map_range(self, va:int, pa:int, size:int, flags:int=MT_PTE_READ_ONLY) -> None:
     if size % MT_PAGE_SIZE: raise ValueError("MT MMU range size must be 4 KiB aligned")

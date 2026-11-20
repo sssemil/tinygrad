@@ -1,5 +1,6 @@
 import itertools
 from tinygrad.codegen.opt import Opt, OptOps, KernelOptError
+from tinygrad.dtype import dtypes
 from tinygrad.helpers import getenv, DEBUG, prod, TC_OPT, TC_SELECT, TC_MIN_GLOBALS, USE_TC, IMAGE
 from tinygrad.uop.ops import Ops, UOp, resolve, AxisType
 from tinygrad.codegen.late.coalesce import image_valid_dims
@@ -45,6 +46,110 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
 
   # make a copy so it does not mutate the input
   k = k.copy()
+
+  # Keep S30 reductions within the scalar register file. Spatial filters can share a workgroup across output axes.
+  if k.ren.target.renderer == "USC":
+    red = k.reduceop
+    dot = red.src[0] if red is not None and red.arg[0] is Ops.ADD and red.src[0].op is Ops.MUL else None
+    # Split each row reduction across lanes, then combine their partial sums in local memory.
+    if dot is not None and red is not None and len(red.src) == 2 and len(outs:=k.axes_of(AxisType.GLOBAL)) == 1:
+      row, inner = k.rngs[outs[0]], red.src[1]
+      if (row.src[0].op is Ops.CONST and row.src[0].val >= 128 and row.src[0].val%8 == 0 and inner.src[0].op is Ops.CONST and
+          inner.src[0].val >= 128 and inner.src[0].val%32 == 0):
+        # Independent row-wise dot products of equal length can use the same reduction loop and workgroup.
+        others = k.reduceops[1:]
+        if len(others) <= 1 and all(len(r.src) == 2 and r.arg == red.arg and r.src[0].op is Ops.MUL and r.dtype == red.dtype == dtypes.float and
+                                    r.src[1].src == inner.src and r.src[1].axis_type == inner.axis_type and r.src[1].dtype == inner.dtype and
+                                    set(dot.ranges) == {row, inner} and set(r.src[0].ranges) == {row, r.src[1]} and
+                                    r not in dot.backward_slice and red not in r.src[0].backward_slice for r in others):
+          if others: k.ast = k.ast.substitute({r:r.substitute({r.src[1]:inner}) for r in others})
+          row_lanes, sum_lanes = (32, 4) if others and row.src[0].val%32 == 0 else (8, 8)
+          if not others and row.src[0].val%64 == 0 and inner.src[0].val >= 2*row.src[0].val: row_lanes, sum_lanes = 64, 2
+          k.apply_opt(Opt(OptOps.SPLIT, k.rngs.index(inner), (sum_lanes, AxisType.LOCAL)))
+          k.apply_opt(Opt(OptOps.SPLIT, k.rngs.index(row), (row_lanes, AxisType.LOCAL)))
+          k.apply_opt(Opt(OptOps.SPLIT, k.upcastable_dims(reduce=True)[-1], (4, AxisType.UPCAST)))
+          return k
+    # Give each output its own workgroup when a long reduction has too few outputs to fill the cores.
+    if (red is not None and len(k.reduceops) == 1 and len(red.src) > 2 and len(outs:=k.axes_of(AxisType.GLOBAL)) == 1
+        and k.rngs[outs[0]].vmax < 64 and (inner:=red.src[-1]).src[0].op is Ops.CONST and inner.vmax >= 127):
+      if lanes:=next((n for n in range(128, 15, -1) if (inner.vmax+1)%n == 0), 0):
+        loop, _ = k.apply_opt(Opt(OptOps.SPLIT, k.rngs.index(inner), (lanes, AxisType.LOCAL)))
+        if loop in k.rngs and loop.src[0].divides(4) is not None: k.apply_opt(Opt(OptOps.SPLIT, k.rngs.index(loop), (4, AxisType.UPCAST)))
+        return k
+    spatial = dot is not None and sum(1 < k.full_shape[i] <= 5 for i in k.upcastable_dims(reduce=True)) >= 2
+    local_axes = None
+    # Convolution gradients with independent channel axes reuse both operands across a tile of output elements.
+    if dot is not None and red is not None and red.dtype == dtypes.float and len(k.reduceops) == 1 and not spatial:
+      axes = [k.rngs[i] for i in k.axes_of(AxisType.GLOBAL)]
+      lhs, rhs = (x.ranges for x in dot.src)
+      left, right = [r for r in axes if r in lhs and r not in rhs], [r for r in axes if r in rhs and r not in lhs]
+      if len(axes) == len(left)+len(right) == 4 and left and right and (len(red.src) > 2 or len(left) == len(right) == 2):
+        row_axis, col_axis = (max(rs, key=lambda r:r.vmax) for rs in (right, left))
+        if min(row_axis.vmax, col_axis.vmax) >= 15 and row_axis.src[0].divides(4) is not None and col_axis.src[0].divides(2) is not None:
+          row, _ = k.apply_opt(Opt(OptOps.SPLIT, k.rngs.index(row_axis), (4, AxisType.UPCAST)))
+          k.apply_opt(Opt(OptOps.SPLIT, k.rngs.index(col_axis), (2, AxisType.UPCAST)))
+          local_axes = [row]+[k.rngs[i] for i in k.axes_of(AxisType.GLOBAL) if k.rngs[i] is not row]
+    channel_tile = local_axes is not None
+    tiled = wide_cols = False
+    if not channel_tile and dot is not None and red is not None and red.dtype == dtypes.float and len(red.src) == 2:
+      lhs, rhs = (x.ranges for x in dot.src)
+      dims = [r for r in k.rngs if r.axis_type is AxisType.GLOBAL and (r.src[0].op is Ops.CONST or r.src[0].is_variable) and r.vmax+1 >= 16]
+      rows, cols = [r for r in dims if r in lhs and r not in rhs], [r for r in dims if r in rhs and r not in lhs]
+      if len(rows) == len(cols) == 1 and red.src[1] in lhs and red.src[1] in rhs:
+        # For long, fixed reductions, move two accumulators from the reduction axis to the output columns.
+        wide_cols = (not rows[0].src[0].is_variable and cols[0].src[0].op == red.src[1].src[0].op == Ops.CONST and
+                     red.src[1].src[0].val >= 2*cols[0].src[0].val and len(k.reduceops) == 1 and len(dot.ranges) == 3)
+        for r,n in ((rows[0], 2 if rows[0].src[0].is_variable else 4), (cols[0], 4 if wide_cols else 2)):
+          if r.src[0].is_variable: r = k.apply_opt(Opt(OptOps.PADTO, k.rngs.index(r), n))
+          if r.src[0].divides(n) is not None:
+            k.apply_opt(Opt(OptOps.SPLIT, k.rngs.index(r), (n, AxisType.UPCAST)))
+            tiled = True
+    if spatial and dot is not None and len(k.reduceops) == 1:
+      lhs, rhs = (x.ranges for x in dot.src)
+      axes = [k.rngs[i] for i in k.upcastable_dims()]
+      rows, channels = [r for r in axes if r in lhs and r not in rhs], [r for r in axes if r in rhs and r not in lhs]
+      if len(rows) == 1: rows, channels = channels, rows
+      taps = k.full_shape[k.upcastable_dims(reduce=True)[-1]]
+      if (len(rows) == len(k.reduce_ranges) == 3 and len(channels) == 1 and all(r.axis_type is AxisType.GLOBAL for r in rows+channels)
+          and 2 <= taps <= 5 and rows[-1].src[0].divides(2*taps) is not None):
+        # Sweep adjacent output pixels in registers while neighboring lanes compute other filters and scanlines.
+        k.apply_opt(Opt(OptOps.SPLIT, k.rngs.index(rows[-1]), (2*taps, AxisType.UPCAST)))
+        local_axes = [channels[0], rows[-2]]
+      elif len(rows) > 1 and len(channels) == 1:
+        # Reuse each input window across channels and each filter across adjacent output positions.
+        for r,sizes in ((channels[0], (2,)), (rows[-1], (4, 3))):
+          if tile:=next((n for n in sizes if r.src[0].divides(n) is not None), 0):
+            k.apply_opt(Opt(OptOps.SPLIT, k.rngs.index(r), (tile, AxisType.UPCAST)))
+      elif (a:=next((i for i in reversed(k.upcastable_dims()) if k.full_shape[i]%4 == 0), None)) is not None:
+        k.apply_opt(Opt(OptOps.SPLIT, a, (4, AxisType.UPCAST)))
+    if local_axes is None: local_axes = [k.rngs[a] for a in reversed(k.axes_of(AxisType.GLOBAL, AxisType.WEAK, reduce=False))]
+    # Weight gradients reduce over images and positions. Distribute channels before the small filter axes.
+    filter_grad = (dot is not None and red is not None and len(k.reduceops) == 1 and len(red.src) >= 3 and
+                   not spatial and sum(1 < r.vmax+1 <= 5 for r in local_axes) >= 2)
+    if filter_grad and not channel_tile: local_axes.sort(key=lambda r: r.vmax+1 <= 5)
+    width = 128 if spatial or tiled else 64 if red is not None and len(local_axes) > 1 else 32
+    # Avoid folding a small matrix into a single workgroup on the two-core S30.
+    multidim = channel_tile or spatial or filter_grad or (tiled and prod(r.vmax+1 for r in local_axes) >= 2*width)
+    for r in local_axes:
+      if r.src[0].op is not Ops.CONST: continue
+      size = next((n for n in range(min(64, width) if spatial else width, 1, -1) if r.src[0].val%n == 0), 1)
+      if size > 1:
+        k.apply_opt(Opt(OptOps.SPLIT, k.rngs.index(r), (size, AxisType.LOCAL)))
+        width //= size
+        if not multidim or width == 1 or len(k.axes_of(AxisType.LOCAL)) == 3: break
+    if channel_tile: return k
+    if not spatial and not tiled and dot is not None:
+      lhs, rhs = (x.ranges for x in dot.src)
+      if (a:=next((i for i in k.upcastable_dims() if k.full_shape[i]%2 == 0 and (k.rngs[i] in lhs) != (k.rngs[i] in rhs)), None)) is not None:
+        k.apply_opt(Opt(OptOps.SPLIT, a, (2, AxisType.UPCAST)))
+    # Fused spatial reductions already keep multiple accumulators live on each lane.
+    if (not spatial or len(k.reduceops) == 1) and (axes:=k.upcastable_dims(reduce=True)):
+      i = axes[-1]
+      if k.rngs[i].src[0].op is Ops.CONST:
+        n = k.full_shape[i]
+        if 2 <= n <= 5: k.apply_opt(Opt(OptOps.SPLIT, i, (0, AxisType.UPCAST)))
+        elif n%4 == 0: k.apply_opt(Opt(OptOps.SPLIT, i, (2 if wide_cols else 4, AxisType.UPCAST)))
+    return k
 
   # upcast float4 images, this must be early so we don't accidentally add locals before the upcast
   if IMAGE:
@@ -107,6 +212,19 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
       if DEBUG >= 4: print(f"upcasting masked axis : {axis}")
       to_upcast.append(axis)
   for axis in to_upcast[::-1]: k.apply_opt(Opt(OptOps.SPLIT, axis, (0, AxisType.UPCAST)))
+
+  # Reuse each input across eight accumulators per row or column on the S30.
+  if k.ren.target.arch == "mp_10" and k.upcast_size() == 1 and len(reds:=k.reduceops) == 1:
+    red = reds[0]
+    if len(red.src) == 2 and red.dtype == dtypes.float and red.arg[0] is Ops.ADD and (mul:=red.src[0]).op is Ops.MUL:
+      lhs, rhs = (x.ranges for x in mul.src)
+      dims = [k.rngs[i] for i in k.upcastable_dims() if k.full_shape[i] >= 64 and k.full_shape[i]%8 == 0]
+      dims += [r for r in k.rngs if r.axis_type is AxisType.GLOBAL and r.src[0].is_variable and r.vmax+1 >= 16]
+      rows, cols = [r for r in dims if r in lhs and r not in rhs], [r for r in dims if r in rhs and r not in lhs]
+      if len(rows) == len(cols) == 1 and red.src[1] in lhs and red.src[1] in rhs:
+        for r in (rows[0], cols[0]):
+          if r.src[0].is_variable: r = k.apply_opt(Opt(OptOps.PADTO, k.rngs.index(r), 8))
+          k.apply_opt(Opt(OptOps.SPLIT, k.rngs.index(r), (8, AxisType.UPCAST)))
 
   # potentially do more upcasts of non reduce axes based on a heuristic
   is_dsp = k.ren.target.device == "DSP"

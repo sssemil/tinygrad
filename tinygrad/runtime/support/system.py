@@ -145,7 +145,8 @@ class _System:
     except IndexError: raise RuntimeError(f"{device}:{dev_id} does not exist ({pluralize('device', len(ds))} available)")
     return cl(device[:2], pcibus)
 
-  def pci_setup_usb_bars(self, usb:CustomASM24Controller, gpu_bus:int, mem_base:int, pref_mem_base:int) -> dict[int, tuple[int, int]]:
+  def pci_setup_usb_bars(self, usb:CustomASM24Controller, gpu_bus:int, mem_base:int, pref_mem_base:int,
+                         vram_bars:dict[int, int]|None=None) -> dict[int, tuple[int, int]]:
     for bus in range(gpu_bus):
       # All 3 values must be written at the same time.
       buses = (0 << 0) | ((bus+1) << 8) | ((gpu_bus) << 16)
@@ -160,39 +161,69 @@ class _System:
 
       usb.pcie_cfg_req(pci.PCI_COMMAND, bus=bus, dev=0, fn=0, value=pci.PCI_COMMAND_IO | pci.PCI_COMMAND_MEMORY | pci.PCI_COMMAND_MASTER, size=1)
 
-    # resize bar 0
-    cap_ptr = 0x100
-    while cap_ptr:
-      if pci.PCI_EXT_CAP_ID(hdr:=usb.pcie_cfg_req(cap_ptr, bus=gpu_bus, dev=0, fn=0, size=4)) == pci.PCI_EXT_CAP_ID_REBAR:
-        cap = usb.pcie_cfg_req(cap_ptr + 0x04, bus=gpu_bus, dev=0, fn=0, size=4)
-        new_ctrl = (usb.pcie_cfg_req(cap_ptr + 0x08, bus=gpu_bus, dev=0, fn=0, size=4) & ~0x1F00) | ((int(cap >> 4).bit_length() - 1) << 8)
-        usb.pcie_cfg_req(cap_ptr + 0x08, bus=gpu_bus, dev=0, fn=0, value=new_ctrl, size=4)
+    cfg = functools.partial(usb.pcie_cfg_req, bus=gpu_bus)
+    bar = vram_bars.get(cfg(0)) if vram_bars else None
+    rebar = self._usb_rebar_entry(cfg, bar)
+    command = cfg(pci.PCI_COMMAND, size=2)
+    saved = {off:cfg(off) for off in range(pci.PCI_BASE_ADDRESS_0, pci.PCI_BASE_ADDRESS_5+4, 4)}
+    try:
+      cfg(pci.PCI_COMMAND, value=command & ~pci.PCI_COMMAND_MEMORY, size=2)
+      if rebar is not None:
+        off, ctrl, sizes = rebar
+        value = (ctrl & ~pci.PCI_REBAR_CTRL_BAR_SIZE) | ((sizes.bit_length() - 1) << pci.PCI_REBAR_CTRL_BAR_SHIFT)
+        if sizes and ctrl != value:
+          cfg(off, value=value)
+          if cfg(off) != value: raise RuntimeError("PCI resize rejected")
+      bars = self._assign_usb_bars(cfg, mem_base, pref_mem_base)
+      cfg(pci.PCI_COMMAND, value=command | pci.PCI_COMMAND_IO | pci.PCI_COMMAND_MEMORY | pci.PCI_COMMAND_MASTER, size=2)
+    except Exception:
+      cfg(pci.PCI_COMMAND, value=command & ~pci.PCI_COMMAND_MEMORY, size=2)
+      if rebar is not None: cfg(rebar[0], value=rebar[1])
+      for off, value in saved.items(): cfg(off, value=value)
+      cfg(pci.PCI_COMMAND, value=command, size=2)
+      raise
+    return bars
 
-      cap_ptr = pci.PCI_EXT_CAP_NEXT(hdr)
+  def _usb_rebar_entry(self, cfg, bar:int|None) -> tuple[int, int, int]|None:
+    cap = 0x100
+    while cap:
+      hdr = cfg(cap)
+      if pci.PCI_EXT_CAP_ID(hdr) == pci.PCI_EXT_CAP_ID_REBAR:
+        first = cfg(cap + pci.PCI_REBAR_CTRL)
+        count = (first & pci.PCI_REBAR_CTRL_NBAR_MASK) >> pci.PCI_REBAR_CTRL_NBAR_SHIFT
+        for i in range(max(1, count)):
+          off = cap + i * 8
+          ctrl = cfg(off + pci.PCI_REBAR_CTRL) if i else first
+          if bar is None or ctrl & pci.PCI_REBAR_CTRL_BAR_IDX == bar:
+            return off + pci.PCI_REBAR_CTRL, ctrl, cfg(off + pci.PCI_REBAR_CAP) >> 4
+        break
+      cap = pci.PCI_EXT_CAP_NEXT(hdr)
+    return None
 
+  def _assign_usb_bars(self, config, mem_base:int, pref_mem_base:int) -> dict[int, tuple[int, int]]:
     mem_space_addr, bar_off, bars = [mem_base, pref_mem_base], 0, {}
     while bar_off < 24:
-      cfg = usb.pcie_cfg_req(pci.PCI_BASE_ADDRESS_0 + bar_off, bus=gpu_bus, dev=0, fn=0, size=4)
+      cfg = config(pci.PCI_BASE_ADDRESS_0 + bar_off)
       bar_mem, bar_64 = bool(cfg & pci.PCI_BASE_ADDRESS_MEM_PREFETCH), cfg & pci.PCI_BASE_ADDRESS_MEM_TYPE_64
 
       if (cfg & pci.PCI_BASE_ADDRESS_SPACE) == pci.PCI_BASE_ADDRESS_SPACE_MEMORY:
-        usb.pcie_cfg_req(pci.PCI_BASE_ADDRESS_0 + bar_off, bus=gpu_bus, dev=0, fn=0, value=0xffffffff, size=4)
-        lo = (usb.pcie_cfg_req(pci.PCI_BASE_ADDRESS_0 + bar_off, bus=gpu_bus, dev=0, fn=0, size=4) & 0xfffffff0)
+        config(pci.PCI_BASE_ADDRESS_0 + bar_off, value=0xffffffff)
+        lo = (config(pci.PCI_BASE_ADDRESS_0 + bar_off) & 0xfffffff0)
 
-        if bar_64: usb.pcie_cfg_req(pci.PCI_BASE_ADDRESS_0 + bar_off + 4, bus=gpu_bus, dev=0, fn=0, value=0xffffffff, size=4)
-        hi = (usb.pcie_cfg_req(pci.PCI_BASE_ADDRESS_0 + bar_off + 4, bus=gpu_bus, dev=0, fn=0, size=4) if bar_64 else 0)
+        if bar_64: config(pci.PCI_BASE_ADDRESS_0 + bar_off + 4, value=0xffffffff)
+        hi = (config(pci.PCI_BASE_ADDRESS_0 + bar_off + 4) if bar_64 else 0)
 
         bar_size = ((~(((hi << 32) | lo) & ~0xf)) + 1) & (0xffffffffffffffff if bar_64 else 0xffffffff)
 
-        usb.pcie_cfg_req(pci.PCI_BASE_ADDRESS_0 + bar_off, bus=gpu_bus, dev=0, fn=0, value=mem_space_addr[bar_mem] & 0xffffffff, size=4)
-        if bar_64: usb.pcie_cfg_req(pci.PCI_BASE_ADDRESS_0 + bar_off + 4, bus=gpu_bus, dev=0, fn=0, value=mem_space_addr[bar_mem] >> 32, size=4)
+        if bar_size: mem_space_addr[bar_mem] = round_up(mem_space_addr[bar_mem], bar_size)
+        config(pci.PCI_BASE_ADDRESS_0 + bar_off, value=mem_space_addr[bar_mem] & 0xffffffff)
+        if bar_64: config(pci.PCI_BASE_ADDRESS_0 + bar_off + 4, value=mem_space_addr[bar_mem] >> 32)
 
         bars[bar_off // 4] = (mem_space_addr[bar_mem], bar_size)
         mem_space_addr[bar_mem] += round_up(bar_size, 2 << 20)
 
       bar_off += 8 if bar_64 else 4
 
-    usb.pcie_cfg_req(pci.PCI_COMMAND, bus=gpu_bus, dev=0, fn=0, value=pci.PCI_COMMAND_IO | pci.PCI_COMMAND_MEMORY | pci.PCI_COMMAND_MASTER, size=1)
     return bars
 
   def flock_acquire(self, name:str) -> int:
@@ -278,21 +309,25 @@ class PCIDevice:
     except OSError as e: raise RuntimeError(f"Cannot resize BAR {bar_idx}: {e}. Ensure the resizable BAR option is enabled.") from e
 
 class USBPCIDevice(PCIDevice):
-  def __init__(self, devpref:str, dev, pcibus, gpu_bus=4):
+  def __init__(self, devpref:str, dev, pcibus, gpu_bus=4, vram_bars:dict[int, int]|None=None):
+    self.gpu_bus = gpu_bus
     self.pcibus, self.peer_group = pcibus, f"USBPCIDevice_{pcibus}"
     self.lock_fd = System.flock_acquire(f"{devpref.lower()}_{pcibus.lower()}.lock")
     usb = USB3(dev)
     if DEBUG >= 1: print(f"{devpref.lower()} {self.pcibus}: product string: {usb.product!r}")
-    self.usb: CustomASM24Controller = CustomASM24Controller(usb)
-    self._bar_info = System.pci_setup_usb_bars(self.usb, gpu_bus=gpu_bus, mem_base=0x10000000, pref_mem_base=(32 << 30))
+    self._setup_pcie(usb, vram_bars)
     self.sram = BumpAllocator(size=0x80000, wrap=False) # asm24 controller sram
+
+  def _setup_pcie(self, usb:USB3, vram_bars:dict[int, int]|None):
+    self.usb = CustomASM24Controller(usb)
+    self._bar_info = System.pci_setup_usb_bars(self.usb, gpu_bus=self.gpu_bus, mem_base=0x10000000, pref_mem_base=(32 << 30), vram_bars=vram_bars)
 
   def dma_view(self, ctrl_addr, size): return USBMMIOInterface(self.usb, ctrl_addr, size, fmt='B', pcimem=False)
   def alloc_sysmem(self, size:int, vaddr:int=0, contiguous:bool=False) -> tuple[MMIOInterface, list[int]]:
     return self.dma_view(0xf000 + (off:=self.sram.alloc(size)), size), [0x200000 + off]
 
-  def read_config(self, offset:int, size:int): return self.usb.pcie_cfg_req(offset, bus=4, dev=0, fn=0, size=size)
-  def write_config(self, offset:int, value:int, size:int): self.usb.pcie_cfg_req(offset, bus=4, dev=0, fn=0, value=value, size=size)
+  def read_config(self, offset:int, size:int): return self.usb.pcie_cfg_req(offset, bus=self.gpu_bus, dev=0, fn=0, size=size)
+  def write_config(self, offset:int, value:int, size:int): self.usb.pcie_cfg_req(offset, bus=self.gpu_bus, dev=0, fn=0, value=value, size=size)
 
   def bar_info(self, bar_idx:int) -> tuple[int, int]: return self._bar_info[bar_idx]  # type: ignore[override]
   def map_bar(self, bar, off=0, addr=0, size=None, fmt='B'):

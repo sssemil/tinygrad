@@ -1,15 +1,23 @@
 from __future__ import annotations
-import dataclasses, os, pathlib, re, subprocess, tempfile, hashlib
+import dataclasses, os, pathlib, re, subprocess, tempfile, hashlib, functools
 from typing import Any
 from tinygrad.device import Compiled, Program, Allocator, BufferStorage, BufferSpec, Buffer
 from tinygrad.renderer import Compiler, TinyELF
 from tinygrad.renderer.cstyle import CUDARenderer, CStyleLanguage
+from tinygrad.renderer.usc import MTUSCRenderer
+from tinygrad.renderer.llvmir import LLVMRenderer, base_rewrite, ldt, llvm_intrinsics
 from tinygrad.dtype import dtypes, AddrSpace
-from tinygrad.helpers import round_up, diskcache_get, diskcache_put
-from tinygrad.runtime.support.mt.mtdev import MTDev
+from tinygrad.helpers import round_up, diskcache_get, diskcache_put, DEV, Target, unwrap
+from tinygrad.uop.ops import KernelInfo, Ops, PatternMatcher, UOp, UPat
+from tinygrad.runtime.support.memory import TLSFAllocator
+from tinygrad.runtime.support.usb import USBMMIOInterface, HALF, SLOT
+from tinygrad.runtime.support.mt.mmu import MT_PTE_READ_WRITE
+from tinygrad.runtime.support.mt.mtdev import MT_BUFFER_PA, MT_BUFFER_VA, MTDev
 from tinygrad.runtime.support.mt.launch import MTLaunch, parse_mt_bundle, compress_mt_bundle, decompress_mt_bundle
-from tinygrad.runtime.support.mt.compiler import MTCompiler
+from tinygrad.runtime.support.mt.compiler import MTCompiler, MTLLVMCompiler
 from tinygrad.runtime.support.mt.elf import MTKernelImage
+from tinygrad.runtime.support.mt.s30 import DEFAULT_S30_FIRMWARE, S30_STAGE_VA, S30_UPLOAD_SIZE, S30_READ_VA, S30_COMPLETION_VA
+from tinygrad.runtime.support.mt.s30 import MTS30Firmware, MTS30Program, s30_read_signal
 
 MUSA_SOURCES:dict[str,str] = {}
 
@@ -48,10 +56,11 @@ def generate_mt_launch(source:str, name:str, args:list[str], global_size:tuple[i
 
 
 class MUSACompiler(Compiler):
-  def __init__(self):
-    super().__init__('mt')
-    self.mt = MTCompiler()
+  def __init__(self, arch:str="mp_21"):
+    super().__init__({'mp_21':'mt', 'mp_10':'mt_mp_10_no_const_calc'}.get(arch, f'mt_{arch}'))
+    self.mt = MTCompiler(arch=arch)
   def compile(self, src:str) -> bytes:
+    if self.mt.arch == "mp_10": return self.mt.compile_raw(src)
     if os.environ.get('MT_GENERATE','1') == '0': lib = self.mt.compile_raw(src)
     else:
       match = re.search(r'extern "C" __global__ void\s+(\w+)\s*\(([^)]*)\)',src)
@@ -68,14 +77,65 @@ class MUSACompiler(Compiler):
     diskcache_put('mt_sources', key, src)
     return lib
 
+pm_s30_half = PatternMatcher([
+  (UPat((Ops.SQRT, Ops.RECIP, Ops.EXP2, Ops.LOG2, Ops.SIN, Ops.TRUNC), dtypes.half, (UPat.var("x"),), name="op"),
+   lambda op,x: x.cast(dtypes.float).alu(op.op).cast(dtypes.half)),
+])
+
 class MUSARenderer(CUDARenderer):
+  compiler:MUSACompiler
   kernel_typedef = 'extern "C" __global__ void'
   def __init__(self, target):
     CStyleLanguage.__init__(self, target)
-    self.compiler, self.tensor_cores = MUSACompiler(), []
+    self.compiler, self.tensor_cores = MUSACompiler("mp_10" if target.arch == "sudi" else target.arch or "mp_21"), []
+    if self.compiler.mt.arch == "mp_10":
+      self.has_shared, self.shared_max = False, 0
+      self.type_map = {**self.type_map, dtypes.half:"mt_half", dtypes.float:"mt_float"}
+      self.extra_matcher += pm_s30_half
+  def render_vector_prefix(self, dt, count):
+    if self.compiler.mt.arch == "mp_10" and dt in (dtypes.float, dtypes.half) and count in (2, 4):
+      # Conditional loads of MUSA's vector structs spill to private memory on mp_10.
+      scalar = self.type_map[dt]
+      vec = f"{scalar}{count}"
+      return f"typedef {scalar} {vec} __attribute__((ext_vector_type({count})));\n#define make_{vec}(...) (({vec}){{__VA_ARGS__}})"
+    return super().render_vector_prefix(dt, count)
   def render_kernel(self, function_name, kernel, bufs, uops, prefix=None):
-    return super().render_kernel(function_name, kernel, bufs, uops, ['#include <musa.h>'] + (prefix or []))
+    src = super().render_kernel(function_name, kernel, bufs, uops, ['#include <musa.h>'] + (prefix or []))
+    if self.compiler.mt.arch != "mp_10": return src
+    vectors = [self.render_vector_prefix(dt, count) for dt,count in ((dtypes.half, 2), (dtypes.float, 2), (dtypes.float, 4))]
+    return "\n".join(["using mt_float = float; using mt_half = _Float16;", *vectors, src])
   def supported_dtypes(self): return set(dtypes.all) - {dtypes.double}
+
+def mt_sreg(axis:str) -> str:
+  return f"llvm.musa.read.ptx.sreg.{'ctaid' if axis[0] == 'g' else 'tid'}.{'xyz'[int(axis[-1])]}"
+
+mt_intrinsics = {**llvm_intrinsics, Ops.SIN:"sin", Ops.TRUNC:"trunc"}
+
+class MTLLVMRenderer(LLVMRenderer):
+  abi = "mtgpu_kernel"
+  has_shared, shared_max = False, 0
+  global_max, local_max = CUDARenderer.global_max, CUDARenderer.local_max
+  code_for_op = {**LLVMRenderer.code_for_op, **dict.fromkeys(mt_intrinsics, lambda: None)}
+  string_rewrite = PatternMatcher([
+    (UPat(Ops.SPECIAL, name="x"), lambda ctx,x: f"  {ctx[x]} = call i32 @{mt_sreg(x.arg)}()"),
+    # mcc uses this instruction for float division. Generic LLVM fdiv pulls in a device-library routine on mp_10.
+    (UPat(Ops.FDIV, dtypes.float, (UPat.var("a"), UPat.var("b")), name="x"), lambda ctx,x,a,b:
+     f"  {ctx[x]} = call float @llvm.musa.fast.fdivide.f(float {ctx[a]}, float {ctx[b]})"),
+    (UPat(tuple(mt_intrinsics), name="x"), lambda ctx,x:
+     f"  {ctx[x]} = call {ldt(x.dtype)} @llvm.{mt_intrinsics[x.op]}.f{x.dtype.itemsize*8}({ldt(x.dtype)} {ctx[x.src[0]]})"),
+  ]) + base_rewrite
+  def __init__(self, target:Target):
+    if target.arch != "mp_10": raise RuntimeError("MT LLVM requires the S30")
+    super().__init__(target)
+    self.extra_matcher = unwrap(self.extra_matcher) + pm_s30_half
+    self.compiler = MTLLVMCompiler(target.arch)
+  def render(self, uops:list[UOp]) -> str:
+    decls = {f"declare i32 @{mt_sreg(u.arg)}()" for u in uops if u.op is Ops.SPECIAL}
+    if any(u.op is Ops.FDIV and u.dtype == dtypes.float for u in uops): decls.add("declare float @llvm.musa.fast.fdivide.f(float, float)")
+    decls |= {f"declare {ldt(u.dtype)} @llvm.{mt_intrinsics[u.op]}.f{u.dtype.itemsize*8}({ldt(u.dtype)})" for u in uops if u.op in mt_intrinsics}
+    _, kernel = self._render_kernel(uops, sorted(decls))
+    return kernel
+  def supported_dtypes(self): return super().supported_dtypes() - {dtypes.double, *dtypes.fp8s}
 
 @dataclasses.dataclass(frozen=True)
 class MTBufferMeta:
@@ -83,24 +143,70 @@ class MTBufferMeta:
   pa: int
   size: int
 
+class S30VRAMView(USBMMIOInterface):
+  def __init__(self, view:USBMMIOInterface, dev:MTDevice, va:int, bounds:tuple[int,int]|None=None):
+    super().__init__(view.usb, view.addr, view.nbytes, view.fmt)
+    self.dev, self.va = dev, va
+    self.bounds = bounds or (va, va+view.nbytes)
+
+  def view(self, offset:int=0, size:int|None=None, fmt=None):
+    return S30VRAMView(super().view(offset, size, fmt), self.dev, self.va+offset, self.bounds)
+
+  def _can_stage(self, index, offset:int, size:int) -> bool:
+    return (self.fmt == 'B' and isinstance(index, slice) and index.step in (None, 1) and offset >= 0 and SLOT <= size <= self.nbytes-offset and
+            (self.va+offset)%4 == 0 and self.dev.renderer.target.renderer == "USC")
+
+  def __getitem__(self, index):
+    offset, size = self._off_from_index(index)
+    with self.dev.s30_fw.lock:
+      self.dev.s30_fw.flush_meta()
+      if not self._can_stage(index, offset, size):
+        data = super().__getitem__(index)
+        return memoryview(bytes(data)) if isinstance(data, memoryview) else data  # the next USB transfer reuses the bulk buffer
+      dest, n = memoryview(bytearray(size)), size//128*128
+      copy, signal = self.dev.s30_copy, self.dev.s30_read_signal
+      for off in range(0, n, HALF):
+        chunk = dest[off:min(off+HALF, n)]
+        copy(S30_READ_VA, self.va+offset+off, global_size=(len(chunk)//128,1,1), local_size=(32,1,1), wait=self.dev.s30_fw.meta_enabled)
+        signal(S30_COMPLETION_VA, readback=chunk)
+      if n < size: dest[n:] = super().__getitem__(slice(offset+n, offset+size))
+      return dest
+
+  def __setitem__(self, index, data):
+    offset, _ = self._off_from_index(index)
+    with self.dev.s30_fw.lock:
+      if any(self.bounds[0] <= addr < self.bounds[1] for addr in self.dev.s30_fw.meta_args): self.dev.s30_fw.flush_meta()
+      if not isinstance(data, (bytes, bytearray, memoryview)) or not self._can_stage(index, offset, memoryview(data).nbytes):
+        return super().__setitem__(index, data)
+      src = bytes(data)
+      n = len(src)//128*128
+      # The upper SRAM half survives the bridge's ordinary F0 traffic for command packets and page tables.
+      copy = self.dev.s30_copy
+      step = self.dev.s30_fw.upload_size
+      for off in range(0, n, step):
+        chunk = src[off:min(off+step, n)]
+        self.usb.scsi_write(chunk, slot_start=HALF//SLOT)
+        copy(self.va+offset+off, S30_STAGE_VA, global_size=(len(chunk)//128,1,1), local_size=(32,1,1), wait=self.dev.s30_fw.meta_enabled)
+      if n < len(src): super().__setitem__(slice(offset+n, offset+len(src)), src[n:])
+
 class MTAllocator(Allocator['MTDevice']):
   def __init__(self, dev):
     super().__init__(dev)
-    self.next_va, self.next_pa = 0x8001000000, 0x80000000
-    self.dev.views = {}
-    self.free_blocks:list[tuple[int,int,int]] = []
+    self.vram = TLSFAllocator(max(0, dev.mt.vram_size - MT_BUFFER_PA), base=MT_BUFFER_PA, block_size=0x1000)
 
   def _alloc(self, size:int, options:BufferSpec) -> BufferStorage:
     size = round_up(size, 0x1000)
-    if self.free_blocks and self.free_blocks[-1][2] == size:
-      va, pa, size = self.free_blocks.pop()
-    else:
-      va, pa = self.next_va, self.next_pa
-      self.next_va += size
-      self.next_pa += size
-    view = self.dev.mt.pci_dev.map_bar(2, off=pa, size=size, fmt='B')
+    pa = self.vram.alloc(size)
+    va = MT_BUFFER_VA + (pa - self.vram.base)
+    try:
+      view = self.dev.mt.pci_dev.map_bar(2, off=pa, size=size, fmt='B')
+      self.dev.map_buffer(va, pa, size)
+      if self.dev.mt.s30 and isinstance(view, USBMMIOInterface) and view.usb.usb.product.startswith("custom"):
+        view = S30VRAMView(view, self.dev, va)
+    except Exception:
+      self.vram.free(pa)
+      raise
     meta = MTBufferMeta(va, pa, size)
-    self.dev.map_buffer(va, pa, size)
     self.dev.views[va] = (view, meta)
     return BufferStorage(va, meta, view)
 
@@ -108,17 +214,12 @@ class MTAllocator(Allocator['MTDevice']):
     self.dev.synchronize()
     meta = storage.meta
     self.dev.views.pop(meta.va, None)
-    self.free_blocks.append((meta.va, meta.pa, meta.size))
+    self.vram.free(meta.pa)
 
   def _copyin(self, dest:int, src:memoryview):
     view, meta = self.dev._view(dest)
     off = dest-meta.va
-    if off % 4 == 0 and src.nbytes % 4 == 0: view[off:off+src.nbytes] = src.cast('B')
-    else:
-      start, end = off & ~3, round_up(off+src.nbytes,4)
-      data = bytearray(view[start:end])
-      data[off-start:off-start+src.nbytes] = src.cast('B')
-      view[start:end] = data
+    view[off:off+src.nbytes] = src.cast('B')
 
   def _copyout(self, dest:memoryview, src:int):
     view, meta = self.dev._view(src)
@@ -171,10 +272,15 @@ class MTProgram(Program['MTDevice']):
     return result.run_time / 25_000_000 if wait else None
 
 class MTDevice(Compiled):
-  renderers = [MUSARenderer]
+  renderers = [MTUSCRenderer, MUSARenderer, MTLLVMRenderer]
   def __init__(self, device:str=''):
     dev_id = int(device.split(':')[1]) if ':' in device else 0
-    self.mt = MTDev.open_usb(dev_id)
+    self.mt = MTDev.open_usb(dev_id, manage_power=DEV.target("MT").renderer in ("MUSA", "LLVM"))
+    self.views:dict[int,tuple[Any,MTBufferMeta]] = {}
+    super().__init__(device, MTAllocator(self), MTS30Program if self.mt.s30 else MTProgram, arch='mp_10' if self.mt.s30 else 'mp_21')
+    if self.mt.s30:
+      self.s30_fw = MTS30Firmware(self.mt, os.getenv('MT_FIRMWARE', DEFAULT_S30_FIRMWARE), bridge_sram=True)
+      return
     bundle = os.environ.get('MT_LAUNCH_BUNDLE', '/tmp/mt-research/argfresh')
     packet = os.environ.get('MT_LAUNCH_PACKET', '/tmp/mt-research/real-submission-direct.bin')
     self.launch = None if os.environ.get('MT_GENERATE','1') != '0' else MTLaunch(self.mt, bundle, packet)
@@ -184,11 +290,22 @@ class MTDevice(Compiled):
     self.buffer_maps:list[tuple[int,int,int]] = []
     self.current_launch:MTLaunch|None = None
     self.started = False
-    self.views:dict[int,tuple[Any,MTBufferMeta]] = {}
-    super().__init__(device, MTAllocator(self), MTProgram, arch='mp_21')
 
   @property
   def has_copy_queue(self) -> bool: return False
+
+  @functools.cached_property
+  def s30_copy(self) -> MTS30Program:
+    from tinygrad.codegen import to_program
+    dst, src = (UOp.placeholder((S30_UPLOAD_SIZE//4,), dtypes.uint, slot=i) for i in range(2))
+    idx = UOp.special(S30_UPLOAD_SIZE//128, "gidx0")*32+UOp.special(32, "lidx0")
+    copy = dst[idx].store(src[idx]).sink(arg=KernelInfo(name="s30_copy", optimized=True))
+    return MTS30Program(self, TinyELF.from_program(to_program(copy, self.renderer)), {})
+
+  @functools.cached_property
+  def s30_read_signal(self) -> MTS30Program:
+    from tinygrad.codegen import to_program
+    return MTS30Program(self, TinyELF.from_program(to_program(s30_read_signal(), self.renderer)), {})
 
   def get_launch(self, obj:TinyELF, global_size:tuple[int,int,int]=(1,1,1), local_size:tuple[int,int,int]=(1,1,1)) -> MTLaunch:
     if os.environ.get('MT_GENERATE','1') == '0':
@@ -216,6 +333,9 @@ class MTDevice(Compiled):
     return self.launch_cache[key]
 
   def map_buffer(self, va:int, pa:int, size:int):
+    if self.mt.s30:
+      with self.s30_fw.lock: self.s30_fw.mmu.map_range(va, pa, size, MT_PTE_READ_WRITE)
+      return
     self.buffer_maps.append((va,pa,size))
     for launch in self.launches: launch.map_buffer(va,pa,size)
 
@@ -230,6 +350,12 @@ class MTDevice(Compiled):
       if base <= va < base + meta.size: return view, meta
     raise RuntimeError(f'Unknown MT buffer address {va:#x}')
 
+  def synchronize(self, timeout:int|None=None):
+    if self.mt.s30: self.s30_fw.flush_meta(None if timeout is None else timeout/1000)
+    super().synchronize(timeout)
+
   def finalize(self):
-    super().finalize()
-    self.mt.close()
+    try:
+      super().finalize()
+      if self.mt.s30: self.s30_fw.session.close()
+    finally: self.mt.close()

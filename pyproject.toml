@@ -40,6 +40,7 @@ packages = [
   'tinygrad.runtime.autogen.nv_regs',
   'tinygrad.runtime.support',
   'tinygrad.runtime.support.am',
+  'tinygrad.runtime.support.mt',
   'tinygrad.runtime.support.rdma',
   'tinygrad.runtime.support.nv',
   'tinygrad.uop',
@@ -49,6 +50,7 @@ packages = [
 [tool.setuptools.package-data]
 tinygrad = ["py.typed"]
 "tinygrad.llm" = ["chat.html"]
+"tinygrad.runtime.support.mt" = ["dispatch.s", "mtum.c", "version_data.h", "include/*.h"]
 "tinygrad.viz" = ["index.html", "assets/**/*", "js/*"]
 
 

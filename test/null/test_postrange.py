@@ -38,6 +38,16 @@ class TestReductionAxes(unittest.TestCase):
     k.apply_opt(Opt(OptOps.PADTO, 0, 8))
     self.assertIs(k.reduceop.src[0].op, Ops.INDEX)  # padding a bound dependency must not mask the reduction's input
 
+  def test_pad_symbolic_global_axis(self):
+    size = UOp.variable("size", 1, 33)
+    i = UOp.range(size, 0, AxisType.GLOBAL)
+    inp, out = (UOp.param(n, dtypes.float, (33,)) for n in (0, 1))
+    k = self.scheduler(out[i].store(inp[i]).end(i).sink(arg=KernelInfo()))
+    padded = k.apply_opt(Opt(OptOps.PADTO, 0, 8))
+    for n in (1, 8, 17, 32, 33):
+      self.assertEqual(padded.src[0].sym_infer({"size":n}), ((n+7)//8)*8)
+    k.apply_opt(Opt(OptOps.SPLIT, 0, (8, AxisType.UPCAST)))
+
   def test_upcast_both_roles(self):
     k, _, _ = self.reduction()
     k.apply_opt(Opt(OptOps.SPLIT, 1, (4, AxisType.UPCAST)))

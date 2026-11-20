@@ -4,10 +4,11 @@ from dataclasses import dataclass, replace
 from typing import Callable
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, dtypes, Device
 from tinygrad.llm.kernels.amd import Linear, ExpertWeights, fp8_matmul, gated_delta_prefill, flash_attention, amd_custom_kernels_supported
+from tinygrad.llm.kernels.mt import RMSNorm, is_s30, s30_decode_attention
 from tinygrad.llm.gguf import gguf_parse, gguf_shard, GGUFPackedTable, _GGML_QUANT
 from tinygrad.llm.hf import hf_load
 from tinygrad.uop.ops import resolve, smax, ssimplify
-from tinygrad.helpers import unwrap, round_up, ceildiv, get_child
+from tinygrad.helpers import unwrap, round_up, ceildiv, get_child, TRAINING
 
 StartPos = tuple[int|UOp, ...]
 
@@ -43,6 +44,7 @@ def gated_activation(gate:Tensor, up:Tensor, config:TransformerConfig) -> Tensor
   alpha, limit, up_bias, situ = config.swiglu_alpha, config.swiglu_limit, config.swiglu_up_bias, config.situ
   if situ is not None: return (gate / situ[0]).tanh() * situ[0] * gate.sigmoid() * (up / situ[1]).tanh() * situ[1]
   if limit is not None and limit > 0: gate, up = gate.clamp(max_=limit), up.clamp(-limit, limit)
+  if gate.ndim == 3 and gate.shape[1] == 1 and alpha == 1.0 and up_bias == 0.0 and is_s30(gate.device): return gate.silu() * up
   # TODO: remove the need for this contiguous
   return gate * (gate * alpha).sigmoid().contiguous() * (up + up_bias)
 
@@ -269,8 +271,8 @@ class FFNBlock:
     self.config = config
 
     # --- RMSNorms --------------------------------------------------------
-    self.attn_norm: Callable[[Tensor], Tensor] = nn.RMSNorm(config.dim, config.norm_eps)
-    self.ffn_norm:  Callable[[Tensor], Tensor] = nn.RMSNorm(config.dim, config.norm_eps)
+    self.attn_norm: Callable[[Tensor], Tensor] = RMSNorm(config.dim, config.norm_eps)
+    self.ffn_norm:  Callable[[Tensor], Tensor] = RMSNorm(config.dim, config.norm_eps)
     if config.hc is not None:
       hc = GatedResidual if config.hc.low_rank else HyperConnection
       self.hc_attn, self.hc_ffn = hc(config), hc(config)
@@ -408,8 +410,8 @@ class TransformerBlock(FFNBlock):
       attn = flash_attention(q, assigned_kv.transpose(0, 1), start_pos[0]+T)
       attn = attn.transpose(1, 2).reshape(B, T, -1)                                    # back to (B,T,D)
       return self.attn_output(attn if not self.config.attn_output_gate else (attn * gate.sigmoid()))
-    assigned_kv = _cache_prefix(assigned_kv, start_pos, T, 3).transpose(0, 1)
-    k, v = assigned_kv[0], assigned_kv[1]
+    prefix = _cache_prefix(assigned_kv, start_pos, T, 3).transpose(0, 1)
+    k, v = prefix[0], prefix[1]
     mask = (idx_mask.repeat_interleave(self.config.n_heads // int(idx_mask.shape[1]), dim=1) if idx_mask is not None else
             _causal_mask(x, start_pos, self.config.sliding_window))
     if hasattr(self, 'attn_sinks'):
@@ -418,7 +420,10 @@ class TransformerBlock(FFNBlock):
       sink_col = self.attn_sinks["weight"].reshape(1, -1, 1, 1).expand(1, self.config.n_heads, T, 1)
       if mask is None: mask = Tensor.zeros(1, 1, T, S, dtype=x.dtype, buffer=False)
       mask = mask.expand(B, self.config.n_heads, T, S).cat(sink_col.expand(B, -1, -1, -1), dim=-1)
-    attn = q.scaled_dot_product_attention(k, v, attn_mask=mask, enable_gqa=True)     # (B,H,T,Hd)
+    if not TRAINING and mask is None and T == 1 and self.config.max_context <= 128 and self.config.head_dim == 64 and q.dtype == dtypes.float and \
+        isinstance(pos:=start_pos[0], UOp) and pos.is_variable and is_s30(q.device):
+      attn = s30_decode_attention(q, assigned_kv.transpose(0, 1), pos)
+    else: attn = q.scaled_dot_product_attention(k, v, attn_mask=mask, enable_gqa=True)  # (B,H,T,Hd)
     attn = attn.transpose(1, 2).reshape(B, T, -1)                                    # back to (B,T,D)
     return self.attn_output(attn if not self.config.attn_output_gate else (attn * gate.sigmoid()))
 
@@ -779,7 +784,7 @@ class Transformer:
       if config.compress_ratios: self.blk.append(CompressedAttentionBlock(c, config.compress_ratios[i]))
       else: self.blk.append(GatedDeltaNetBlock(c, config.ssm) if config.ssm and config.ssm_layers[i] else block_cls(c))
     self.token_embd  = nn.Embedding(config.vocab_size, config.dim)
-    self.output_norm: Callable[[Tensor], Tensor] = nn.RMSNorm(config.dim, config.norm_eps)
+    self.output_norm: Callable[[Tensor], Tensor] = RMSNorm(config.dim, config.norm_eps)
     if config.hc and config.hc.head: self.output_hc = HyperConnection(config, head=True)
     if config.hc and config.hc.low_rank: self.output_hc, self.output_norm = GatedResidual(config, inject=False), lambda x: x
     if config.attn_res_block_size: self.output_res_score = AttentionResidual(config)
@@ -789,6 +794,7 @@ class Transformer:
     self._cached_tokens: list[int] = []
     self._position_count: int|None = None
     # we specialize the JIT for prefill and rollout
+    self.full_chunk_size, self.full_prefill_jit = 0, TinyJit(self.forward)
     self.prefill_jit = TinyJit(self.forward)
     self.rollout_jit = TinyJit(self.forward)
 
@@ -810,7 +816,9 @@ class Transformer:
     if self._position_count is None: self._position_count = len(start_pos)
     assert len(start_pos) == self._position_count, "position count is fixed for this model"
     positions = tuple(UOp.variable(f"start_pos_{b}", 0, self.max_context-1).bind(p) if isinstance(p, int) else p for b, p in enumerate(start_pos))
-    return (self.prefill_jit if resolve(tokens.shape[1] != 1) else self.rollout_jit)(tokens.contiguous(), temperature, *positions)
+    jit = self.prefill_jit if resolve(tokens.shape[1] != 1) else self.rollout_jit
+    if isinstance(n:=tokens.shape[1], int) and n > 1 and n == self.full_chunk_size: jit = self.full_prefill_jit
+    return jit(tokens.contiguous(), temperature, *positions)
 
   @staticmethod
   def from_gguf(gguf:Tensor|str|pathlib.Path, max_context:int|None=None,
@@ -957,8 +965,14 @@ class Transformer:
     nn.state.load_state_dict(model, state_dict, verbose=False, consume=True, realize=False)  # NOTE: rope_freqs.weight (32,) is unused
     # NOTE: without this contiguous, it unpacks the weights from the model every time. we shouldn't need this, but for now it's faster
     if realize:
-      for s in (params:=nn.state.get_parameters(model)): s.replace(s.contiguous())
-      Tensor.realize(*params)
+      params = nn.state.get_state_dict(model)
+      transpose = is_s30(model.token_embd.weight.device, "USC")
+      for name, s in params.items():
+        # Store block projections with adjacent output channels contiguous for the S30's prefill workgroups.
+        if transpose and name.startswith("blk.") and name.endswith(".weight") and s.ndim == 2 and isinstance(get_child(model, name[:-7]), Linear):
+          s.replace(s.T.contiguous().T)
+        else: s.replace(s.contiguous())
+      Tensor.realize(*params.values())
     if config.ple is not None: model.blk[config.ple.layer].ple.table = GGUFPackedTable(unwrap(ple_entry))
     return model, kv
 
@@ -1054,6 +1068,11 @@ class Transformer:
 
   def generate(self, tokens:list[int], chunk_size:int=32, temperature:float=0.0):
     if self.has_recurrent_block and not amd_custom_kernels_supported(self.token_embd.weight.device): chunk_size = 1
+    # Fixed full chunks let the S30 compiler tile both matrix axes without per-row bounds checks.
+    if is_s30(self.token_embd.weight.device) and chunk_size != self.full_chunk_size:
+      self.full_chunk_size = chunk_size
+      self.full_prefill_jit.reset()
+      self.prefill_jit.reset()  # the symbolic tail's upper bound changes with the chunk size
     v_start_pos = UOp.variable("start_pos", 0, self.max_context-1)
     v_toks = UOp.variable("toks", 1, chunk_size)
     # TODO: use UOp.variable for temperature once float variables are supported
@@ -1066,7 +1085,7 @@ class Transformer:
     while len(tokens) < self.max_context:
       n_toks = min(chunk_size, len(tokens) - start_pos)
       if self.config.ple: self.blk[self.config.ple.layer].ple.write_rows(tokens, start_pos, n_toks, chunk_size)
-      sp, nt = v_start_pos.bind(start_pos), v_toks.bind(n_toks)
+      sp, nt = v_start_pos.bind(start_pos), n_toks if n_toks == self.full_chunk_size else v_toks.bind(n_toks)
       out = self(t[:, sp:sp+nt] if start_pos < prompt_len or out is None else out, (sp,), temp).realize()
       start_pos += n_toks
       # chunked prefill: keep processing until all prompt tokens are consumed

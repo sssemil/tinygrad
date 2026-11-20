@@ -3173,6 +3173,11 @@ class TestOps(TensorTestCase):
                    lambda x,y,z: torch.nn.functional.scaled_dot_product_attention(x,y,z,enable_gqa=True),
                    lambda x,y,z: Tensor.scaled_dot_product_attention(x,y,z,enable_gqa=True))
 
+  def test_scaled_dot_product_attention_gqa_decode(self):
+    helper_test_op([(2,6,1,8), (1,2,7,8), (2,2,7,4)],
+                   lambda q,k,v: torch.nn.functional.scaled_dot_product_attention(q, k.repeat_interleave(3, -3), v.repeat_interleave(3, -3)),
+                   lambda q,k,v: q.scaled_dot_product_attention(k, v, enable_gqa=True))
+
   def test_binary_crossentropy_reductions(self):
     for kwargs in ({}, {"reduction": "sum"}, {"reduction": "none"}):
       helper_test_op([(32,10), (32,10)], lambda x,y: torch.nn.functional.binary_cross_entropy(x.sigmoid(), y.clip(0,1), **kwargs),

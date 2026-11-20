@@ -311,6 +311,12 @@ class RandMixin(OpMixin):
     """
     # GQA: https://docs.pytorch.org/docs/stable/generated/torch.nn.functional.scaled_dot_product_attention.html
     if enable_gqa:
+      # For one query token, the heads sharing each KV head can be the rows of a single matmul.
+      h, kv = self.shape[-3], key.shape[-3]
+      if self.shape[-2] == 1 and attn_mask is None and not is_causal and dropout_p == 0 and isinstance(h, int) and isinstance(kv, int) and \
+          0 < kv < h and h % kv == 0 and kv == value.shape[-3]:
+        q = self.unflatten(-3, (kv, h//kv)).squeeze(-2)
+        return q.scaled_dot_product_attention(key, value).flatten(-3, -2).unsqueeze(-2)
       key = key.repeat_interleave(int(self.shape[-3] // key.shape[-3]), dim=-3)
       value = value.repeat_interleave(int(self.shape[-3] // value.shape[-3]), dim=-3)
 
