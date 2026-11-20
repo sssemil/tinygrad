@@ -20,9 +20,9 @@ Separate cold-slot runs place every GPU-visible page in Chestnut SRAM or the bri
 
 | Model | Result | Rail enable to result | Fresh shaders |
 | --- | --- | ---: | ---: |
-| MNIST, test image 0 | Class 7 | 0.370 s | 9 |
-| Whisper tiny.en, test.wav | Could you please let me out of the box? | 122.593 s | 93 |
-| Qwen2.5-0.5B, 36-token France prompt | All eight CPU reference tokens, including EOS | 141.507 s | 32 |
+| MNIST, test image 0 | Class 7 | 0.369 s | 9 |
+| Whisper tiny.en, test.wav | Could you please let me out of the box? | 121.985 s | 93 |
+| Qwen2.5-0.5B, 36-token France prompt | All eight CPU reference tokens, including EOS | 141.433 s | 32 |
 
 The entire 2 MiB external bridge flash matches its reconstructed contents, including the application built from source with its target runtime objects. The outstanding boot question is what the S30 board and the bridge silicon execute before the host can train the PCIe link. All measurements used the original board boot storage.
 
@@ -673,3 +673,9 @@ Eight tensor and dispatch tests formerly required the vendor compiler, even for 
 The extra coverage exposed a missing USC lowering for truncation. The new lowering clears fractional mantissa bits and keeps the sign when a fraction truncates to zero. On hardware, all 65,536 half-precision bit patterns and 60,008 single-precision inputs agreed with NumPy, including signed zeros, infinities and NaN classification. The hardware suite also keeps a small edge-case regression for both types.
 
 Half-precision sine of 1.0 had rounded to 0.841796875. Computing the emulated range reduction and polynomial at single precision before rounding once gave 0.84130859375. Over all half-precision encodings, finite results differed from double-precision NumPy rounded to half in 14 cases, each by one ULP. Both zero signs were preserved and every nonfinite input returned NaN. The CPU transcendental and rewrite tests passed.
+
+## November 20, 2026 — keep small streamed products distributed across compute cores
+
+Filling workgroups across multiple output dimensions helped ordinary Whisper, but its smaller SRAM-only products took 128.130 s for the same complete clip, up from 122.593 s. A tiled matrix now uses further local axes only when it has enough output work items for two full groups. A prototype transcribed the clip in 122.205 s. The isolated run took 121.985 s and verified all 93 generated shaders. SRAM-only MNIST returned 7 in 369.03 ms and Qwen returned the eight CPU reference tokens in 141.433 s.
+
+The threshold changed none of the launch dimensions of the 165 archived ordinary inference kernels. All 118 batch-16 training graphs compiled. Fresh offline model runs again verified every result. Warm latency was 13.77 ms for MNIST, 2.142 s for Whisper and 3.107 s for Qwen. The five-pair MNIST and interleaved Whisper comparisons at the top give repeated process measurements.

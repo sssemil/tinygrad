@@ -105,13 +105,15 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
         k.apply_opt(Opt(OptOps.SPLIT, a, (4, AxisType.UPCAST)))
     if local_axes is None: local_axes = [k.rngs[a] for a in reversed(k.axes_of(AxisType.GLOBAL, AxisType.WEAK, reduce=False))]
     width = 128 if spatial or tiled else 64 if red is not None and len(local_axes) > 1 else 32
+    # Avoid folding a small matrix into a single workgroup on the two-core S30.
+    multidim = spatial or (tiled and prod(r.vmax+1 for r in local_axes) >= 2*width)
     for r in local_axes:
       if r.src[0].op is not Ops.CONST: continue
       size = next((n for n in range(min(64, width) if spatial else width, 1, -1) if r.src[0].val%n == 0), 1)
       if size > 1:
         k.apply_opt(Opt(OptOps.SPLIT, k.rngs.index(r), (size, AxisType.LOCAL)))
         width //= size
-        if not (spatial or tiled) or width == 1 or len(k.axes_of(AxisType.LOCAL)) == 3: break
+        if not multidim or width == 1 or len(k.axes_of(AxisType.LOCAL)) == 3: break
     if not spatial and not tiled and dot is not None:
       lhs, rhs = (x.ranges for x in dot.src)
       if (a:=next((i for i in k.upcastable_dims() if k.full_shape[i]%2 == 0 and (k.rngs[i] in lhs) != (k.rngs[i] in rhs)), None)) is not None:
