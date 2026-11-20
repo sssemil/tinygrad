@@ -16,19 +16,21 @@ from tinygrad.uop.ops import KernelInfo
 # GPU virtual addresses for streamed input, resident activations, and the completion word visible at USB XDATA 0xb800.
 INPUT, ACTIVATIONS, RESULT = 0x7100000000, 0x7200000000, 0x7300000000
 INPUT_SIZE, ACTIVATION_SIZE = 0x28000, 0x38000
+PARAMS = 0x5000  # after the dispatch ring and before the compute state at 0x6000
 
 class ChestnutBoot(MTS30Firmware):
   context_pa = (1<<39) | 0x240000  # upper half of the bridge SRAM on the Sudi outbound PCIe bus
+  mem_size, code_base, code_size, tables = 0x20000, 0x8000, 0x8000, 0x10000
   def _map_context(self, size:int):
-    self.mem, self.code_end = bytearray(0x20000), 0
-    mmu = MTMMU4(self.context_pa+0x10000, size=0x10000)
+    self.mem, self.code_end, self.dirty_code = bytearray(self.mem_size), 0, False
+    mmu = MTMMU4(self.context_pa+self.tables, size=0x10000)
     # The first 160 KiB holds each kernel's inputs. Join the two free runs around the context into one activation heap.
     base = self.context_pa-HALF
     mmu.map_range(INPUT, base, INPUT_SIZE, MT_PTE_READ_ONLY)
     mmu.map_range(ACTIVATIONS, base+INPUT_SIZE, HALF-INPUT_SIZE, MT_PTE_READ_WRITE)
     mmu.map_range(ACTIVATIONS+HALF-INPUT_SIZE, self.context_pa+len(self.mem), HALF-len(self.mem), MT_PTE_READ_WRITE)
     mmu.map(RESULT, (1<<39) | 0x822000, MT_PTE_READ_WRITE)
-    for va in (USC_BASE, PDS_BASE): mmu.map_range(va, self.context_pa+0x8000, 0x8000, MT_PTE_READ_ONLY)
+    for va in (USC_BASE, PDS_BASE): mmu.map_range(va, self.context_pa+self.code_base, self.code_size, MT_PTE_READ_ONLY)
     return memoryview(self.mem)[:0x8000], mmu
 
   def prepare(self, program:UOp, addresses:list[int]) -> tuple[bytearray, bytearray]:
@@ -36,19 +38,21 @@ class ChestnutBoot(MTS30Firmware):
     for (off, fmt), addr in zip(layout, addresses, strict=True): struct.pack_into(fmt, params, off, addr)
     usc = self.code_end
     pds = round_up(usc+len(text)+32, 64)  # include the USC prefetch guard
-    loader = s30_pds(FW_DEVVA+0x3000, len(params)//4, usc, temps, bool(local))
+    loader = s30_pds(FW_DEVVA+PARAMS, len(params)//4, usc, temps, bool(local))
     self.code_end = round_up(pds+len(loader), 64)
-    if self.code_end > 0x8000 or len(params) > 0x1000: raise MemoryError("S30 program exceeds Chestnut SRAM")
-    self.mem[0x8000+usc:0x8000+usc+len(text)] = text
-    self.mem[0x8000+pds:0x8000+pds+len(loader)] = loader
+    if self.code_end > self.code_size or len(params) > 0x1000: raise MemoryError("S30 program exceeds Chestnut SRAM")
+    self.mem[self.code_base+usc:self.code_base+usc+len(text)] = text
+    self.mem[self.code_base+pds:self.code_base+pds+len(loader)] = loader
+    self.dirty_code = True
     shared = ceildiv(len(params), 64)
     grid = s30_grid(program.arg.global_size, program.arg.local_size, shared+ceildiv(local, 16))
     return params, s30_cdm_stream(s30_dispatch(pds, shared, attrs)+grid)
 
   def stage(self, params:bytearray, stream:bytearray):
-    self.mem[0x3000:0x3000+len(params)] = params
+    self.mem[PARAMS:PARAMS+len(params)] = params
     self.mem[DIRECT_CDM:DIRECT_CDM+len(stream)] = stream
-    self.upload_mmu()
+    if self.dirty_code or self.mmu.dirty_ranges: self.upload_mmu()
+    else: self.dev.pci_dev.usb.scsi_write(self.mem[DIRECT_CDM:PARAMS+len(params)], slot_start=(HALF+DIRECT_CDM)//SLOT)
 
   def launch(self, data:bytes|bytearray, params:bytearray, stream:bytearray):
     if len(data) > INPUT_SIZE: raise MemoryError("S30 input exceeds Chestnut SRAM")
@@ -77,8 +81,10 @@ class ChestnutBoot(MTS30Firmware):
   def result(self) -> int: return int.from_bytes(self.dev.pci_dev.usb.read(0xb800, 4), "little")
 
   def upload_mmu(self, full:bool=False):
-    self.mem[0x10000:0x10000+self.mmu.next] = self.mmu.root[:self.mmu.next]
+    self.mem[self.tables:self.tables+self.mmu.next] = self.mmu.root[:self.mmu.next]
     self.dev.pci_dev.usb.scsi_write(self.mem, slot_start=HALF//SLOT)
+    self.mmu.dirty_ranges.clear()
+    self.dirty_code = False
 
 class ColdSlot(USBPCIDevice):
   def _setup_pcie(self, usb:USB3, vram_bars:dict[int,int]|None):

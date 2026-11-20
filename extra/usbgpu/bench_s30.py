@@ -20,11 +20,11 @@ def whisper_inference(audio:Path):
   waveform = load_file_waveform(str(audio))
   return lambda: transcribe_waveform(model, enc, [waveform], truncate=True)
 
-def qwen_prompt(kv) -> list[int]:
+def qwen_prompt(kv, question:str="What is the capital of France?") -> list[int]:
   from jinja2 import Template
   from tinygrad.llm.tokenizer import SimpleTokenizer
   tok = SimpleTokenizer.from_gguf_kv(kv)
-  prompt = Template(tok.chat_template).render(messages=[dict(role="user", content="What is the capital of France?")], add_generation_prompt=True)
+  prompt = Template(tok.chat_template).render(messages=[dict(role="user", content=question)], add_generation_prompt=True)
   return tok.encode(prompt)
 
 def qwen_inference(weights:Path):

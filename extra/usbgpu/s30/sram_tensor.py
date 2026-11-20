@@ -1,4 +1,5 @@
 """Stage one fixed-shape tensor kernel in the lower half of Chestnut SRAM, then return its output over USB."""
+import operator
 from collections.abc import Callable
 import numpy as np
 from extra.usbgpu.s30.sram import ChestnutBoot
@@ -8,6 +9,10 @@ from tinygrad.helpers import Target, round_up
 from tinygrad.renderer.usc import MTUSCRenderer
 from tinygrad.runtime.support.mt.mmu import MT_PTE_READ_WRITE
 from tinygrad.runtime.support.usb import HALF
+
+class SRAMTensorBoot(ChestnutBoot):
+  # Tiled models keep activations on the host between launches. Use the upper SRAM half for context, page tables and programs.
+  mem_size, code_base, code_size, tables = HALF, 0x18000, HALF-0x18000, 0x8000
 
 class SRAMKernel:
   def __init__(self, fw:ChestnutBoot, fn:Callable[..., Tensor], *samples:np.ndarray):
@@ -39,3 +44,39 @@ class SRAMKernel:
     self.fw.stage(*self.cmd)
     self.fw.kick_direct(0.5)
     return np.frombuffer(self.fw.read_output(self.nbytes), self.dtype).reshape(self.shape)
+
+
+def tiles(fn:Callable, *xs:np.ndarray, size:int) -> np.ndarray:
+  return np.concatenate([fn(*(x[i:i+size] for x in xs)) for i in range(0,len(xs[0]),size)])
+
+def _project(x:Tensor, w:Tensor): return x @ w.T
+def _peak(x:Tensor): return x.max(-1, keepdim=True)
+def _exp(x:Tensor, m:Tensor): return (x-m).exp()
+def _sum(x:Tensor): return x.sum(-1, keepdim=True)
+def _argmax(x:Tensor): return x.argmax()
+
+class SRAMModel:
+  def __init__(self, fw:ChestnutBoot):
+    self.fw = fw
+    self.programs:dict[tuple, SRAMKernel] = {}
+
+  def op(self, fn:Callable, *xs:np.ndarray) -> np.ndarray:
+    key = fn, tuple((x.shape, x.dtype) for x in xs)
+    if key not in self.programs: self.programs[key] = SRAMKernel(self.fw, fn, *xs)
+    return self.programs[key](*xs)
+
+  def projection(self, x:np.ndarray, w:np.ndarray, rows:int, batch:int, bias:np.ndarray|None=None) -> np.ndarray:
+    def apply(v):
+      out = np.concatenate([self.op(_project, v, w[j:j+rows]) for j in range(0,len(w),rows)], axis=1)
+      return out if bias is None else self.op(operator.add, out, bias)
+    return tiles(apply, x, size=batch)
+
+  def softmax(self, scores:np.ndarray) -> np.ndarray:
+    ex = self.op(_exp, scores, self.op(_peak, scores))
+    return self.op(operator.truediv, ex, self.op(_sum, ex))
+
+  def argmax(self, scores:np.ndarray) -> int:
+    flat = scores.ravel()
+    maxima = np.concatenate([self.op(_peak, flat[i:i+8192]) for i in range(0,len(flat),8192)])
+    page = int(self.op(_argmax, maxima).item())
+    return page*8192 + int(self.op(_argmax, flat[page*8192:(page+1)*8192]).item())

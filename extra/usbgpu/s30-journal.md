@@ -14,6 +14,18 @@ Measured on the same Chestnut S30 with compiler caching disabled. The cold colum
 
 The benchmark checked all five outputs against the recorded reference for each model on each backend. The native column uses the offline, isolated benchmark. It checked every loaded USC program against compiler output generated in the same process. The check covered 10 distinct binaries for MNIST, 92 for Whisper and 73 for Qwen. The benchmark also checked that compute startup received only zero-filled context memory, with META master boot disabled. It blocked vendor firmware boot and management mailbox construction. The card powered up with its factory firmware still installed. The host did not upload proprietary code during these model runs. The board-management mailbox was unused.
 
+### Inference without card DDR
+
+Separate cold-slot runs place every GPU-visible page in Chestnut SRAM or the bridge completion queue. The host streams checkpoint and activation tiles. The S30 executes the trained model. These runs start the timer at slot rail enable, after host checkpoint preparation.
+
+| Model | Result | Rail enable to result | Fresh shaders |
+| --- | --- | ---: | ---: |
+| MNIST, test image 0 | Class 7 | 0.340 s | 9 |
+| Whisper tiny.en, test.wav | Could you please let me out of the box? | 124.180 s | 90 |
+| Qwen2.5-0.5B, 36-token France prompt | All eight CPU reference tokens, including EOS | 149.350 s | 31 |
+
+The bridge application matches a build from source, including its target runtime objects. The outstanding boot question is what the S30 board and the bridge silicon execute before the host can train the PCIe link. All measurements used the original board boot storage.
+
 ## November 20, 2026 — proprietary reference
 
 The existing `MT:MUSA` path uses mcc to build GPU code. The alternate `MT:LLVM` path uses the vendor MTGPU clang. Both use tinygrad's USB transport, MMU, queues and shader dispatch. The S30 boot path uploads the vendor's `mtfw-gen1.bin`. The board management controller also runs firmware.
@@ -503,3 +515,21 @@ Both compute cores now fetch their ring controls, dispatch words and launch para
 On the 36-token Qwen prompt followed by eight generated tokens, two isolated native processes gave warm medians of 4.743 s and 4.732 s. A fresh proprietary run gave 4.809 s. Every run returned the exact eight reference tokens on all five calls. The native column at the top is the final isolated run. Across MNIST, Whisper and Qwen the five outputs on each backend passed, 18 native hardware tests passed with vendor paths absent, and all 28 hardware tests passed in the reference environment.
 
 A fixed four-position prompt tail gave 4.856 s with the previous VRAM dispatch ring, at the cost of recapturing when tail lengths changed. The normal model keeps its symbolic tail. A separate 32×896 by 896×4864 projection sweep tested different row, column and reduction tiles. The best measured reduction unroll of two took 15.34 ms versus 15.79 ms for four. Wider tiles also exhausted the register file in one case. The measurements did not justify a new compiler-wide rule.
+
+## November 20, 2026 — transcribe through bridge SRAM from waveform to text
+
+The host prepared the log-mel spectrogram of test.wav and streamed the tiny.en checkpoint and intermediate tensors. The S30 performed both encoder convolutions, all encoder and decoder attention, normalization and feed-forward layers, vocabulary projections and greedy token selection. Each encoder layer processed all 1,500 valid positions. Query tiles contained up to 16 time steps, key tiles up to 384 positions, and the value products accumulated independently for 16 output features at a time. The CPU decoded token IDs into text and checked the result with the ordinary CPU transformer.
+
+The 32 KiB code area used by the first convolution experiment filled during planning. Streamed models can now use 160 KiB for programs and keep page tables between the dispatch context and code. Repeated launches update only the SRAM slot containing parameters and stream controls. New programs or page-table changes trigger a full upload. An offline shape-and-dtype replay caught an accidental FP64 promotion in a host array of vocabulary maxima. Transport now preserves the score dtype when collecting those values.
+
+The offline sandbox verified 90 distinct newly rendered shaders and the complete reference transcript after 124.180 s from rail enable. The shared tensor operations also completed full Qwen with 31 fresh shaders. Its first token arrived at 80.299 s and all eight by 149.350 s, compared with the previous 88.699 s and 167.405 s. A separate CPU model invocation checked the generated sequence after the GPU work finished. The sampler uses computed logits for each token and accepts an alternate chat prompt. Early SRAM MNIST still returned class 7 before mailbox readiness, and the Whisper frontend still matched all 1,728,000 CPU activations.
+
+From the workspace:
+
+```sh
+export PYTHON="$PWD/.s30-tools/whisper-venv/bin/python"
+tinygrad/extra/usbgpu/s30/bench_isolated.sh sram-transcribe tinygrad/test/models/whisper/test.wav
+tinygrad/extra/usbgpu/s30/bench_isolated.sh sram-generate .s30-tools/models/Qwen2.5-0.5B-Instruct-Q8_0.gguf
+```
+
+In the vendor 3.1.0 driver, the Sudi eFuse inventory helper constructs a message and calls `mtgpu_ipc_transmit_ext`. Its result therefore depends on an already-operating mailbox. This was an offline source-of-initialization check. No fuse commands were issued.
