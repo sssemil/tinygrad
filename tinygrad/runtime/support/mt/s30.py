@@ -22,6 +22,7 @@ CDM_CONTROL_SIZE, CDM_RING_SIZE = 128, 0x800
 DIRECT_CDM = 0x4000  # shared ring controls in the direct context, below the compute state at 0x6000
 TIMER_MASK = (1<<48)-1  # bit 63 of CR_TIMER mirrors bit 31
 META_BATCH = 0x8000
+META_TOKEN, META_TIMESTAMPS = 0x40, 0x80  # upper two bits of the one-byte Chestnut doorbell
 META_BATCH_PDS = 0xf0000000  # above the S30 allocator's 2 GiB range
 S30_STAGE_VA, S30_UPLOAD_SIZE = 0x7000000000, HALF-2*SLOT
 S30_READ_VA, S30_COMPLETION_VA = S30_STAGE_VA-HALF, S30_STAGE_VA+HALF
@@ -99,6 +100,11 @@ class MTS30Firmware(MTComputeRegisters):
       self.mmu.map_range(S30_STAGE_VA, base, S30_UPLOAD_SIZE, MT_PTE_READ_ONLY)
       self.mmu.map_range(S30_STAGE_VA+S30_UPLOAD_SIZE, base+S30_UPLOAD_SIZE, HALF-S30_UPLOAD_SIZE, MT_PTE_READ_WRITE)
     if self.meta_enabled:
+      # META can return the completed request in lower SRAM and release the bridge's armed bulk IN transfer.
+      reply = FW_DEVVA+META_BATCH+HALF
+      self.mmu.map_range(reply, self.mmu.pages[S30_READ_VA], HALF, MT_PTE_READ_WRITE)
+      self.mmu.map(reply+HALF, self.mmu.pages[S30_COMPLETION_VA], MT_PTE_READ_WRITE)
+      self.mmu.map(reply+HALF+0x1000, (1<<39) | 0x820000, MT_PTE_READ_WRITE)
       for va in (FW_DEVVA+META_BATCH, PDS_BASE+META_BATCH_PDS): self.mmu.map_range(va, self.mmu.pages[S30_STAGE_VA], HALF, MT_PTE_READ_WRITE)
     with self._boot((self.meta_code if self.meta_enabled else b"").ljust(0x8000, b"\0")):
       route = self._read(0x24e0, 4)
@@ -128,7 +134,8 @@ class MTS30Firmware(MTComputeRegisters):
           self.meta_sequence = 0
           # CR_TIMER counts GPU clocks divided by 256. Calibrate across the port setup at the current S30 clock.
           t0, host0 = self._sample_timer()
-          MetaPort(self).start(META_BATCH+HALF-0x1000)
+          unwrap(self.bridge).write(0xa800, b"\0")
+          MetaPort(self).start(META_BATCH+2*HALF+0x1000)
           t1, host1 = self._sample_timer()
           self.tick_seconds = (host1-host0)/((t1-t0) & 0xffffffff)
         self.direct = True
@@ -142,19 +149,19 @@ class MTS30Firmware(MTComputeRegisters):
         self.direct = False
         self._write(0x24e0, route, 4)
 
-  def start_direct(self, timestamps:bool=False) -> None:
+  def start_direct(self, flags:int=0) -> None:
     if self.meta_enabled:
-      self.meta_sequence = self.meta_sequence % 0x7fffffff + 1
-      self.v[0x1000:0x1004] = struct.pack("<I", self.meta_sequence | timestamps<<31)
+      self.meta_sequence += 1
+      unwrap(self.bridge).write(0xa800, bytes([(self.meta_sequence & 63) | flags]))
       return
     for reg,value in ((0x138, 4), (0x478, 1)):
       for core in (MT_CORE_STRIDE, 0): self._write(core+reg, value, 4)
 
-  def wait_direct(self, timeout:float, timestamps:bool=False) -> memoryview|None:
+  def wait_direct(self, timeout:float, flags:int=0) -> memoryview|None:
     deadline = time.monotonic()+timeout
     if self.meta_enabled:
-      end = 0x1010+16*len(self.meta_pending) if timestamps else 0x1008
-      request = self.meta_sequence | timestamps<<31
+      end = 0x1010+16*len(self.meta_pending) if flags & META_TIMESTAMPS else 0x1008
+      request = (self.meta_sequence & 63) | flags
       while (completed:=int.from_bytes((reply:=self.v[0x1004:end])[:4], "little")) != request:
         if time.monotonic() >= deadline:
           events = [self._read(core+0x130, 4) for core in (0, MT_CORE_STRIDE)]
@@ -162,7 +169,7 @@ class MTS30Firmware(MTComputeRegisters):
           kernels = [(off, program.name) for off,program in self.meta_pending]
           for offset in (MT_CORE_STRIDE, 0): self._reset(offset)
           raise TimeoutError(f"S30 META sequence {self.meta_sequence}, completed {completed}, events {events}, faults {faults}, pending {kernels}")
-      return memoryview(reply)[12:] if timestamps else None
+      return memoryview(reply)[12:] if flags & META_TIMESTAMPS else None
     for core in (0, MT_CORE_STRIDE):
       while not self._read(core+0x130, 4) & 4:
         if time.monotonic() >= deadline:
@@ -211,9 +218,20 @@ class MTS30Firmware(MTComputeRegisters):
     return None
 
   def kick_direct(self, timeout:float, readback:memoryview|None=None, timestamps:bool=False) -> memoryview|None:
-    if readback is None: self.start_direct(timestamps)
-    else: unwrap(self.bridge).scsi_read(readback, lambda: self.start_direct(timestamps))
-    return self.wait_direct(timeout, timestamps)
+    if self.meta_enabled:
+      flags = (META_TOKEN if readback is None else 0) | (META_TIMESTAMPS if timestamps else 0)
+      dest = memoryview(bytearray(16+16*len(self.meta_pending) if timestamps else 4)) if readback is None else readback
+      try: unwrap(self.bridge).scsi_read(dest, lambda: self.start_direct(flags), timeout=max(1, round(timeout*1000)))
+      except RuntimeError:
+        self.wait_direct(0, flags)  # report GPU faults if META failed to finish
+        raise
+      if readback is not None: return self.wait_direct(timeout, flags) if timestamps else None
+      if (token:=int.from_bytes(dest[:4], "little")) != ((self.meta_sequence & 63) | flags):
+        raise RuntimeError(f"S30 META sequence {self.meta_sequence} received stale bulk completion {token:#x}")
+      return dest[16:] if timestamps else None
+    if readback is None: self.start_direct()
+    else: unwrap(self.bridge).scsi_read(readback, self.start_direct)
+    return self.wait_direct(timeout)
 
 def s30_dispatch(pds_off:int, shared:int, attrs:int) -> tuple[int, ...]:
   return (2, pds_off | 2, pds_off+16, 0, 0, 0, 0x02000000 | shared, 0, 0x100085 | attrs<<12, pds_off+32, pds_off+64)
@@ -415,11 +433,12 @@ class S30VRAMView(USBMMIOInterface):
         data = super().__getitem__(index)
         return memoryview(bytes(data)) if isinstance(data, memoryview) else data  # the next USB transfer reuses the bulk buffer
       dest, n = memoryview(bytearray(size)), size//128*128
-      copy, signal = self.dev.s30_copy, self.dev.s30_read_signal
+      copy = self.dev.s30_copy
+      signal = None if self.dev.s30_fw.meta_enabled else self.dev.s30_read_signal
       for off in range(0, n, HALF):
         chunk = dest[off:min(off+HALF, n)]
-        copy(S30_READ_VA, self.va+offset+off, global_size=(len(chunk)//128,1,1), local_size=(32,1,1))
-        signal(S30_COMPLETION_VA, readback=chunk)
+        copy(S30_READ_VA, self.va+offset+off, global_size=(len(chunk)//128,1,1), local_size=(32,1,1), readback=chunk if signal is None else None)
+        if signal is not None: signal(S30_COMPLETION_VA, readback=chunk)
       if n < size: dest[n:] = super().__getitem__(slice(offset+n, offset+size))
       return dest
 

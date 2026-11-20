@@ -222,6 +222,36 @@ class TestS30USB(unittest.TestCase):
         self.assertAlmostEqual(elapsed, float(events[-1].en-events[-1].st)*1e-6, places=12)
       self.assertEqual(list(buf.as_memoryview().cast("i")), [count]*(9*32))
 
+  def test_meta_bulk_completion(self):
+    from unittest.mock import patch
+    from tinygrad.runtime.support.usb import SLOT
+    dev = Device["MT"]
+    fw = dev.s30_fw
+    if not fw.meta_enabled: self.skipTest("requires native META dispatch")
+    prg = increment(dev)
+    buf = Buffer("MT", SLOT, initial_value=bytes(SLOT))
+    dev.synchronize()
+    fw.meta_sequence = 62
+    with Context(PROFILE=1), patch.object(dev, "profile_events", []) as events:
+      for _ in range(256): prg(buf.meta.va, global_size=(9,1,1), local_size=(32,1,1))
+      dev.synchronize()
+      self.assertEqual(fw.meta_sequence, 63)
+      self.assertEqual(len(events), 256)  # the last timer pair crosses the first SRAM page
+      self.assertTrue(all(e.st < e.en for e in events))
+      self.assertTrue(all(a.en <= b.st for a,b in zip(events, events[1:])))
+      expected = struct.pack("<I", 256)*(9*32)+bytes(SLOT-9*32*4)
+      self.assertEqual(bytes(buf.as_memoryview()), expected)
+      self.assertEqual(fw.meta_sequence, 64)  # staged data and its profile survive the six-bit sequence wrap
+    read = fw.bridge.scsi_read
+    def stale(dest, *args, **kwargs):
+      read(dest, *args, **kwargs)
+      dest[0] ^= 1
+    with patch.object(fw.bridge, "scsi_read", stale), self.assertRaisesRegex(RuntimeError, "stale bulk completion"):
+      prg(buf.meta.va, global_size=(9,1,1), local_size=(32,1,1), wait=True)
+    self.assertFalse(fw.direct)
+    prg(buf.meta.va, global_size=(9,1,1), local_size=(32,1,1), wait=True)
+    self.assertEqual(bytes(buf.as_memoryview()), struct.pack("<I", 258)*(9*32)+bytes(SLOT-9*32*4))
+
   def test_native_workgroup_exchange(self):
     import numpy as np
     from tinygrad.dtype import AddrSpace

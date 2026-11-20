@@ -198,12 +198,12 @@ class CustomASM24Controller:
     self.usb.control_write(0xF2, value=len(buf_padded) // 512, index=(slot_start & 0xFF) | (ceildiv(len(buf_padded), 0x4000) << 8))
     self.usb.bulk_write(buf_padded)
 
-  def scsi_read(self, dest:memoryview, signal:Callable[[], None]):
+  def scsi_read(self, dest:memoryview, signal:Callable[[], None], timeout:int=2000):
     if not 0 < dest.nbytes <= HALF: raise ValueError("readback must fit in the lower SRAM half")
     wire = round_up(dest.nbytes, 512)
     self.usb.control_write(0xf2, value=0x8000 | wire//512, index=ceildiv(wire, SLOT)<<8)
     signal()  # the downstream GPU writes the completion entry for this transfer
-    dest[:] = self.usb.bulk_read(wire, timeout=2000)[:dest.nbytes]
+    dest[:] = self.usb.bulk_read(wire, timeout=timeout)[:dest.nbytes]
 
 class USBMMIOInterface(MMIOInterface):
   def __init__(self, usb, addr, size, fmt, pcimem=True): # pylint: disable=super-init-not-called
