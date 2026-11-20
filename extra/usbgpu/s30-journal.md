@@ -8,9 +8,9 @@ Measured on the same Chestnut S30 with compiler caching disabled. The cold colum
 
 | Workload | Native cold | MUSA cold | Native warm | MUSA warm |
 | --- | ---: | ---: | ---: | ---: |
-| MNIST, batch of 16 | 0.865 s | 3.490 s | 15.24 ms | 13.76 ms |
-| Whisper tiny.en, test.wav | 8.297 s | 51.250 s | 2.520 s | 2.285 s |
-| Qwen2.5-0.5B Q8_0 | 15.564 s | 172.203 s | 3.262 s | 4.813 s |
+| MNIST, batch of 16 | 0.865 s | 3.533 s | 15.24 ms | 14.39 ms |
+| Whisper tiny.en, test.wav | 8.297 s | 51.173 s | 2.520 s | 2.289 s |
+| Qwen2.5-0.5B Q8_0 | 15.564 s | 172.234 s | 3.262 s | 4.811 s |
 
 The benchmark checked all five outputs against the recorded reference for each model on each backend. The native column uses the offline, isolated benchmark. It checked every loaded USC program against compiler output generated in the same process. The check covered 10 distinct binaries for MNIST, 94 for Whisper and 73 for Qwen. The benchmark also checked that compute startup received only zero-filled context memory, with META master boot disabled. It blocked vendor firmware boot and management mailbox construction. The card powered up with its factory firmware still installed. The host did not upload proprietary code during these model runs. The board-management mailbox was unused.
 
@@ -585,6 +585,14 @@ Each source-generated shader with a splittable grid now reads a base group index
 
 The hardware regression ran the same loaded program with 9, 1 and 4 groups in sequence along each of X, Y and Z, with 32 lanes in every group. Each launch incremented its elements exactly once. The batch-16 SGD comparison again matched the CPU loss and all 20 state tensors. Offline compilation also passed all 165 archived inference graphs. Splitting only X in an initial experiment gave 15.23 ms warm MNIST and 2.505 s warm Whisper, while splitting only Y gave 14.85 ms and 2.978 s. The shipped selection uses the dimensions of each generated kernel.
 
-Compared with the correct single-grid path, the isolated warm medians fell from 24.00 to 15.24 ms for MNIST, from 4.166 to 2.520 s for Whisper and from 4.603 to 3.262 s for Qwen. All fifteen results matched the proprietary reference. On this prompt and clip, warm MNIST and Whisper still took about 11% and 10% longer than MUSA. Warm Qwen took about 32% less time. The SRAM-only runner also builds its two parameter blocks and streams from source.
+Compared with the correct single-grid path, the isolated warm medians fell from 24.00 to 15.24 ms for MNIST, from 4.166 to 2.520 s for Whisper and from 4.603 to 3.262 s for Qwen. All fifteen results matched the proprietary reference. On this prompt and clip, warm MNIST and Whisper still took about 6% and 10% longer than MUSA. Warm Qwen took about 32% less time. The SRAM-only runner also builds its two parameter blocks and streams from source.
 
 In the independent cold-slot checks, the SRAM-only digit, waveform and complete token sequence all matched. Each sandbox started with an empty kernel cache and rejected both card DDR and management IPC. These measurements primarily reflect transfers between the host and the bridge SRAM. Across two successive runs, the full clip took 122.17–122.29 s and all eight tokens took 141.25–141.35 s.
+
+All 23 applicable native hardware tests passed with the vendor paths unavailable. All 33 passed in the reference environment. The subsequent MUSA runs on the same checkout also checked all five calls per model. Reading single register words with control transfers measured 15.19 ms warm MNIST. Submitting the four doorbell-related USB control transfers asynchronously measured 14.71 ms. Allowing more floating-point operations between paired loads gave 15.30 ms MNIST and 2.524 s Whisper. These experiments stayed outside the driver.
+
+## November 20, 2026 — locate the next board observation
+
+The reverse-side photograph in an independent teardown of a 4 GiB S30 shows board mark M2022-A08 and an eight-pin package at U1 near the upper heatsink mounting hole. Its package marking cannot be read reliably in the image. An S10 teardown identifies a Macronix serial flash on that different board. The chip identity and PCB revision on the attached S30 still need a local visual check. The version inventory and model tests cannot resolve those details. [S30 reverse-side photograph from the teardown author](https://img1.mydrivers.com/img/20240409/b2feab90-5f10-4c73-ad2d-ff0d26cb10fc.jpg) · [S10 teardown by EEFocus](https://www.eefocus.com/video/1927556.html)
+
+The Sudi 3.1.0 driver's function named `get_board_info_rom` sends a management request and matches its result against the driver's ten-entry `reg_mem_manufact_data` table. This helper identifies a memory manufacturer after management startup. It supplies neither a board flash read nor a way to start the management processor from source.
