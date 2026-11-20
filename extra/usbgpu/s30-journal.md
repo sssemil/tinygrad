@@ -4,13 +4,13 @@ Hardware used for these measurements is the 4 GiB MTT S30 on Chestnut over USB. 
 
 ## Latest end-to-end cold and warm measurements
 
-Measured on the same Chestnut S30 with compiler caching disabled. The cold column starts before device and checkpoint setup and stops when the first result is available. Warm latency is the median of calls 3–5 in the same process. The MNIST row reports the median across five fresh processes per backend. Each Qwen call reprocesses the prompt and returns eight tokens. The input files and output comparisons are described below.
+Measured on the same Chestnut S30 with compiler caching disabled. The cold column starts before device and checkpoint setup and stops when the first result is available. Warm latency is the median of calls 3–5 in the same process. The MNIST row reports the median across five fresh processes per backend. The Whisper row summarizes three native and two MUSA processes, using the median of each column. Each Qwen call reprocesses the prompt and returns eight tokens. The input files and output comparisons are described below.
 
 | Workload | Native cold | MUSA cold | Native warm | MUSA warm |
 | --- | ---: | ---: | ---: | ---: |
 | MNIST, batch of 16 | 0.851 s | 3.503 s | 13.73 ms | 13.85 ms |
-| Whisper tiny.en, test.wav | 8.374 s | 51.173 s | 2.526 s | 2.289 s |
-| Qwen2.5-0.5B Q8_0 | 15.518 s | 172.234 s | 3.262 s | 4.811 s |
+| Whisper tiny.en, test.wav | 7.998 s | 51.893 s | 2.148 s | 2.285 s |
+| Qwen2.5-0.5B Q8_0 | 15.402 s | 172.834 s | 3.115 s | 4.832 s |
 
 The benchmark checked all five outputs against the recorded reference for each model on each backend. The native column uses the offline, isolated benchmark. It checked every loaded USC program against compiler output generated in the same process. The check covered 10 distinct binaries for MNIST, 94 for Whisper and 73 for Qwen. The benchmark also checked that compute startup received only zero-filled context memory, with META master boot disabled. It blocked vendor firmware boot and management mailbox construction. The card powered up with its factory firmware still installed. The host did not upload proprietary code during these model runs. The board-management mailbox was unused.
 
@@ -650,4 +650,8 @@ Five further MNIST comparisons alternated backend order between pairs. The five 
 
 A warm Whisper trace measured 0.5605 s across the four launches of its largest attention kernel. The kernel used only 32 lanes along its first chosen local axis. The USC scheduler already budgeted 128 lanes for tiled products, but stopped as soon as it had split one axis. It now tries the next available output axis while there is capacity. Existing per-thread tiles and the register allocation stay the same. The rule also applies to other tiled matrix products.
 
-The first isolated run with the change reduced Whisper from 2.526 s to 2.156 s warm and Qwen from 3.262 s to 3.115 s. All fifteen native results matched across the three models. The verifier counted 10, 94 and 73 freshly generated shaders for MNIST, Whisper and Qwen. All 165 archived inference graphs and all 118 graphs captured in a batch-16 training step compiled. All 23 applicable native hardware tests passed. Two other experiments that widened the per-thread accumulator tile exhausted the 64-register file. Transposing just the encoder's linear weights measured 2.52 s on the preceding scheduler.
+The first isolated run with the change reduced Whisper from 2.526 s to 2.156 s warm and Qwen from 3.262 s to 3.115 s. All fifteen native results matched across the three models. The verifier counted 10, 94 and 73 freshly generated shaders for MNIST, Whisper and Qwen. All 165 archived inference graphs and all 118 graphs captured in a batch-16 training step compiled. All 23 applicable native hardware tests passed. Two other experiments that widened the per-thread accumulator tile exhausted the 64-register file. Transposing just the encoder's linear weights measured 2.50 s on the preceding scheduler.
+
+Across three isolated processes, the native warm medians on the same Whisper clip were 2.156, 2.148 and 2.145 s. Two interleaved MUSA controls gave 2.289 and 2.280 s. All 25 transcripts matched. On the eight-token Qwen workload a fresh MUSA control took 4.832 s warm. Another isolated MNIST run gave 13.79 ms versus 14.01 ms on MUSA. The five-pair MNIST comparison remains in the table since the compiler changed none of its ten archived launch shapes. Of the other 155 archived graphs, one Whisper and four Qwen launch shapes changed.
+
+Five independent FP32 matrix products on the card matched NumPy element for element, including rectangular, batched and odd-sized products. The first used 16×8 lanes and the second used 24×4. The batch-16 SGD step again agreed with CPU on its loss and all 20 updated model tensors.
