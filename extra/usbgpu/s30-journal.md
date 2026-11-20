@@ -596,3 +596,20 @@ All 23 applicable native hardware tests passed with the vendor paths unavailable
 The reverse-side photograph in an independent teardown of a 4 GiB S30 shows board mark M2022-A08 and an eight-pin package at U1 near the upper heatsink mounting hole. Its package marking cannot be read reliably in the image. An S10 teardown identifies a Macronix serial flash on that different board. The chip identity and PCB revision on the attached S30 still need a local visual check. The version inventory and model tests cannot resolve those details. [S30 reverse-side photograph from the teardown author](https://img1.mydrivers.com/img/20240409/b2feab90-5f10-4c73-ad2d-ff0d26cb10fc.jpg) · [S10 teardown by EEFocus](https://www.eefocus.com/video/1927556.html)
 
 The Sudi 3.1.0 driver's function named `get_board_info_rom` sends a management request and matches its result against the driver's ten-entry `reg_mem_manufact_data` table. This helper identifies a memory manufacturer after management startup. It supplies neither a board flash read nor a way to start the management processor from source.
+
+## November 20, 2026 — check early DDR writes from the GPU
+
+A fresh USC kernel copied a random 4 KiB page from Chestnut SRAM to S30 physical address 0x80000000, the start of the native allocator's VRAM region. The kernel, parameters, ring and MMU tables all lived on the bridge. BAR2 was unassigned during the GPU write. A separate process later mapped BAR2 normally and compared all 4,096 bytes against the original host page. Each measurement used its own downstream power cycle and a newly generated pattern.
+
+| Time from rail enable to GPU write | CDM completion | Independent BAR2 comparison |
+| --- | --- | --- |
+| 100, 250, 400, 500 and 550 ms | Within 1 ms in each trial | All five pages differed |
+| 580, 600, 650 and 700 ms | Within 1 ms in each trial | Every byte matched, including a second 650 ms control |
+
+The management rings were unready at submission in every trial. At one second the headers were still unready in the five early-write trials and ready in the later trials. These timings apply to this card and power sequence. Completion alone is insufficient to establish usable DDR during board startup. The comparison cannot identify the code that initialized memory or distinguish a lost early write from one overwritten during initialization.
+
+## November 20, 2026 — check for additional usable bridge SRAM
+
+Two fresh markers sent to the base SRAM slot were visible to a native shader at bridge PCI address 0x200000. The shader read zero at displacements 0x80000, 0x100000, 0x180000 and 0x200000. Directing a one-sector USB DMA write to slot 32 put its marker in slot 0 in both trials. An independent GPU write test gave each candidate address a distinct random word, restarted the compute context, and read the words back. The in-range control at displacement 0x10000 matched. All four candidate locations again returned zero. These specific address tests support keeping the 512 KiB transfer window. They do not exhaust all bridge address mappings.
+
+After the probes, ordinary isolated native MNIST correctly classified all 16 digits on five calls and verified 10 newly generated USC binaries. No flash was changed.
