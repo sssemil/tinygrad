@@ -7,7 +7,7 @@ from tinygrad import Device, Tensor, TinyJit, UOp, Variable, nn, dtypes
 from tinygrad.nn.state import torch_load, load_state_dict
 from tinygrad.dtype import least_upper_dtype, sum_acc_dtype
 from tinygrad.uop.ops import KernelInfo, Ops
-from tinygrad.helpers import getenv, fetch
+from tinygrad.helpers import getenv, fetch, round_up
 
 from examples.audio_helpers import mel
 import numpy as np
@@ -127,6 +127,13 @@ class ResidualAttentionBlock:
     x = x + norm(self.mlp_ln, x).sequential(self.mlp)
     return x.realize()
 
+def mel_prefix_frames(mel:np.ndarray) -> int:
+  # Keep six identical frames for both convolution boundaries and bucket the JIT input length.
+  n = mel.shape[-1]
+  if n < 6 or n%2: return n
+  changes = np.flatnonzero(np.any(mel[..., :-1] != mel[..., -1:], axis=(0, 1)))
+  return min(n, round_up((int(changes[-1])+1 if changes.size else 0)+6, 64))
+
 class AudioEncoder:
   def __init__(self, n_mels, n_audio_ctx, n_audio_state, n_audio_head, n_audio_layer, audio_ctx_alignment=1, **_):
     self.audio_ctx_alignment = audio_ctx_alignment
@@ -136,7 +143,14 @@ class AudioEncoder:
     self.ln_post = nn.LayerNorm(n_audio_state)
     self.positional_embedding = Tensor.empty(n_audio_ctx, n_audio_state)
     self.encode = TinyJit(self.__call__)
-    self.encode_silence_tail = TinyJit(functools.partial(self.__call__, pad_silence=True))
+    self._prefix_encode = TinyJit(functools.partial(self.__call__, pad_silence=True))
+    self._prefix_shape:tuple|None = None
+
+  def encode_silence_tail(self, x:Tensor) -> Tensor:
+    if x.shape != self._prefix_shape:
+      self._prefix_encode.reset()
+      self._prefix_shape = x.shape
+    return self._prefix_encode(x)
 
   def __call__(self, x, pad_silence=False):
     if pad_silence:
@@ -362,7 +376,10 @@ def transcribe_waveform(model: Whisper, enc, waveforms, truncate=False):
   transcriptions = [[] for _ in waveforms]
 
   for curr_frame in range(0, log_spec.shape[-1], FRAMES_PER_SEGMENT):
-    encoded_audio = model.encoder.encode(Tensor(log_spec[:, :, curr_frame:curr_frame + FRAMES_PER_SEGMENT]))
+    segment = log_spec[:, :, curr_frame:curr_frame + FRAMES_PER_SEGMENT]
+    if (frames:=mel_prefix_frames(segment)) < segment.shape[-1] == 2*model.encoder.positional_embedding.shape[0]:
+      encoded_audio = model.encoder.encode_silence_tail(Tensor(np.ascontiguousarray(segment[..., :frames])))
+    else: encoded_audio = model.encoder.encode(Tensor(segment))
 
     if all(len(c) == len(ctx[0]) for c in ctx): ctx = inferloop(np.array(ctx), encoded_audio)
     else: ctx = [inferloop((np.array([c]*model.batch_size)), encoded_audio)[i] for i,c in enumerate(ctx)]

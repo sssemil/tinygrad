@@ -9,10 +9,10 @@ Measured on the same Chestnut S30 with compiler caching disabled. The cold colum
 | Workload | Native cold | MUSA cold | Native warm | MUSA warm |
 | --- | ---: | ---: | ---: | ---: |
 | MNIST, batch of 16 | 0.850 s | 3.745 s | 27.44 ms | 14.02 ms |
-| Whisper tiny.en, test.wav | 11.131 s | 50.630 s | 5.162 s | 2.605 s |
+| Whisper tiny.en, test.wav | 10.788 s | 51.649 s | 4.858 s | 2.282 s |
 | Qwen2.5-0.5B Q8_0 | 16.869 s | 172.335 s | 5.031 s | 4.815 s |
 
-The benchmark checked all five outputs against the recorded reference for each model on each backend. The native column uses the offline, isolated benchmark. It checked every loaded USC program against compiler output generated in the same process. The check covered 10 distinct binaries for MNIST, 88 for Whisper and 77 for Qwen. The benchmark also checked that compute startup received only zero-filled context memory, with META master boot disabled. It blocked vendor firmware boot and management mailbox construction. The card powered up with its factory firmware still installed. The host did not upload proprietary code during these model runs. The board-management mailbox was unused.
+The benchmark checked all five outputs against the recorded reference for each model on each backend. The native column uses the offline, isolated benchmark. It checked every loaded USC program against compiler output generated in the same process. The check covered 10 distinct binaries for MNIST, 92 for Whisper and 77 for Qwen. The benchmark also checked that compute startup received only zero-filled context memory, with META master boot disabled. It blocked vendor firmware boot and management mailbox construction. The card powered up with its factory firmware still installed. The host did not upload proprietary code during these model runs. The board-management mailbox was unused.
 
 ## November 20, 2026 — proprietary reference
 
@@ -447,3 +447,9 @@ Three isolated runs compared all 1,152,000 first-layer activations and all 576,0
 ```sh
 extra/usbgpu/s30/bench_isolated.sh sram-whisper test/models/whisper/test.wav
 ```
+
+## November 20, 2026 — finish both Whisper convolutions before management readiness
+
+The file inference path now uses the encoder's existing silence-tail reconstruction when all batch members have an exactly constant mel suffix. It retains six equal frames for the convolution boundaries, then rounds the input up to a 64-frame JIT bucket. A late change in any mel band or batch member extends the prefix. A different bucket resets the prefix JIT.
+
+For test.wav the prefix was 256 of 3,000 mel frames. In three isolated rail cycles the second convolution completed by 254–269 ms with the management mailbox still uninitialized. Reconstructing the repeated interior columns from the computed values gave the same maximum errors across all 1,728,000 activations as the full convolution experiment. Using the same optimization for both full transcriptions gave 4.858 s native and 2.282 s MUSA warm. All five transcriptions on each path matched the reference. The native sandbox verified 92 fresh programs.

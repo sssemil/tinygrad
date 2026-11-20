@@ -2,7 +2,7 @@ from copy import copy
 import unittest
 import pathlib
 from examples.whisper import _token_norm, MultiHeadAttention
-from examples.whisper import AudioEncoder, TextDecoder, init_whisper, load_file_waveform, transcribe_file, transcribe_waveform
+from examples.whisper import AudioEncoder, TextDecoder, init_whisper, mel_prefix_frames, load_file_waveform, transcribe_file, transcribe_waveform
 from examples.audio_helpers import mel
 import examples.mlperf.metrics as metrics
 from tinygrad.helpers import fetch
@@ -109,11 +109,20 @@ class TestWhisperEncoder(unittest.TestCase):
   def test_silence_tail(self):
     encoder = AudioEncoder(n_mels=4, n_audio_ctx=32, n_audio_state=8, n_audio_head=2, n_audio_layer=1, audio_ctx_alignment=8)
     encoder.positional_embedding = Tensor.randn(32, 8)
-    for frames in (16, 32, 64):
+    for frames in (16, 16, 16, 32, 64, 16):
       silence = Tensor.randn(1, 4, 1)
       prefix = Tensor.randn(1, 4, frames-6).cat(silence.expand(1, 4, 6), dim=-1)
       full = prefix.pad((0, 64-frames), mode="replicate")
-      np.testing.assert_allclose(encoder(prefix, pad_silence=True).numpy(), encoder(full).numpy(), rtol=1e-4, atol=1e-5)
+      np.testing.assert_allclose(encoder.encode_silence_tail(prefix.contiguous()).numpy(), encoder(full).numpy(), rtol=1e-4, atol=1e-5)
+
+  def test_mel_prefix(self):
+    mel = np.zeros((2, 4, 256), np.float32)
+    self.assertEqual(mel_prefix_frames(mel), 64)
+    mel[1, 0, 63] = 1
+    self.assertEqual(mel_prefix_frames(mel), 128)
+    mel[0, 1, -5] = 1
+    self.assertEqual(mel_prefix_frames(mel), 256)
+    self.assertEqual(mel_prefix_frames(mel[..., :127]), 127)
 
   def test_aligned_attention(self):
     encoder = AudioEncoder(n_mels=4, n_audio_ctx=16, n_audio_state=8, n_audio_head=2, n_audio_layer=2)

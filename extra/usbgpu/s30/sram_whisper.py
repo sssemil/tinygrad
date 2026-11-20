@@ -1,7 +1,7 @@
 """Run both trained Whisper encoder convolutions on the S30 using only Chestnut SRAM."""
 import argparse, time
 import numpy as np
-from examples.whisper import init_whisper, load_file_waveform, prep_audio
+from examples.whisper import init_whisper, load_file_waveform, mel_prefix_frames, prep_audio
 from extra.usbgpu.s30.sram import ChestnutBoot, cold_link, mailbox
 from tinygrad import Context, Tensor
 from tinygrad.codegen import do_to_program
@@ -57,7 +57,7 @@ def run(audio:str):
   fw = ChestnutBoot(mt)
   fw.mmu.map_range(TILE, fw.context_pa-HALF, HALF, MT_PTE_READ_WRITE)
   start = cold_link(mt)
-  actual, x = [], mel
+  actual, x = [], mel[..., :mel_prefix_frames(mel)]
   with fw.boot_direct():
     for i,((w,b),stride,frames) in enumerate(zip(weights, (1, 2), (64, 32), strict=True), 1):
       x = convolution(fw, x, w, b, stride, frames)
@@ -67,6 +67,8 @@ def run(audio:str):
   for i,(layer,got) in enumerate(zip(convs, actual, strict=True), 1):
     expected = layer(expected).gelu().realize()
     ref = expected.numpy()
+    if missing := ref.shape[-1]-got.shape[-1]:
+      got = np.concatenate((got[..., :-1], np.repeat(got[..., -2:-1], missing, axis=-1), got[..., -1:]), axis=-1)
     np.testing.assert_allclose(got, ref, atol=2e-4, rtol=2e-4)
     print(f"conv{i} verified {got.size} activations, maximum absolute error {np.abs(got-ref).max():.8f}")
 
