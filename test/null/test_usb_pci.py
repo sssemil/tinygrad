@@ -1,7 +1,7 @@
 import struct, unittest
 from unittest.mock import Mock
 from tinygrad.runtime.support.system import System
-from tinygrad.runtime.support.usb import CustomASM24Controller
+from tinygrad.runtime.support.usb import CustomASM24Controller, USBMMIOInterface
 
 
 class TestUSBPCI(unittest.TestCase):
@@ -19,6 +19,29 @@ class TestUSBPCI(unittest.TestCase):
       ctrl.pcie_mem_write(addr, bytes(8))
       ctrl.usb.control_write.assert_called_with(0xf0, 0xf00 | write, 1, struct.pack('<III', addr & 0xffffffff, addr >> 32, 2), 5000)
       ctrl.usb.bulk_write.assert_called_once_with(bytes(8))
+
+  def test_unaligned_write_reads_only_edges(self):
+    usb = Mock()
+    base = 0x1001
+    for offset, length, reads in ((0, 2, [0x1000]), (2, 9, [0x1000]), (3, 9, [0x100c]), (0, 10, [0x1000,0x1008]), (0, 0, [])):
+      mem = bytearray(range(32))
+      usb.reset_mock()
+      usb.pcie_mem_read.side_effect = lambda addr, n: mem[addr-0x1000:addr-0x1000+n]
+      def write(addr, data): mem[addr-0x1000:addr-0x1000+len(data)] = data
+      usb.pcie_mem_write.side_effect = write
+      USBMMIOInterface(usb, base, 16, 'B')[offset:offset+length] = bytes(length)
+      self.assertEqual([call.args for call in usb.pcie_mem_read.call_args_list], [(addr, 4) for addr in reads])
+      self.assertEqual(mem, bytes(range(1+offset))+bytes(length)+bytes(range(1+offset+length, 32)))
+
+  def test_large_read_across_4g(self):
+    limit = 4 << 20
+    ctrl = CustomASM24Controller.__new__(CustomASM24Controller)
+    ctrl.usb = Mock()
+    ctrl.usb.bulk_read.side_effect = [bytes(limit), b'abcd']
+    self.assertEqual(ctrl.pcie_mem_read((1<<32)-limit, limit+4), bytes(limit)+b'abcd')
+    self.assertEqual([call.args for call in ctrl.usb.control_write.call_args_list],
+                     [(0xf0, 0xf00, 2, struct.pack('<III', (1<<32)-limit, 0, limit//4), 5000),
+                      (0xf0, 0xf20, 2, struct.pack('<III', 0, 1, 1), 5000)])
 
   def test_rebar_selection_and_rollback(self):
     for device_id, fail in ((0x01021ed5, False), (0x01021ed5, True), (0x02011ed5, False)):

@@ -158,8 +158,13 @@ class CustomASM24Controller:
   def pcie_mem_read(self, address:int, nbytes:int) -> memoryview:
     """Streaming PCIe memory read via 0xF0 mode 2 + bulk IN. Returns little-endian bytes."""
     assert nbytes % 4 == 0, f"pcie_mem_read requires 4-byte aligned size, got {nbytes}"
-    self._f0_out(0x00 if address < 1 << 32 else 0x20, 0x0F, address, nbytes // 4, mode=2)
-    return self.usb.bulk_read(nbytes, timeout=30000)
+    limit = 4 << 20  # maximum reliable ASM24 bulk read
+    if nbytes <= limit:
+      self._f0_out(0x00 if address < 1 << 32 else 0x20, 0x0F, address, nbytes // 4, mode=2)
+      return self.usb.bulk_read(nbytes, timeout=30000)
+    data = memoryview(bytearray(nbytes))
+    for off in range(0, nbytes, limit): data[off:off+limit] = self.pcie_mem_read(address+off, min(limit, nbytes-off))
+    return data
 
   def read(self, base_addr:int, length:int) -> bytes:
     """Read from chip XDATA via vendor control IN (bRequest=0xE4). wValue=addr, wLength=size."""
@@ -207,13 +212,16 @@ class USBMMIOInterface(MMIOInterface):
   def __setitem__(self, index, data):
     off, _ = self._off_from_index(index)
     data = struct.pack(self.fmt, data) if isinstance(data, int) else bytes(data)
+    if not data: return
     if not self.pcimem: self.usb.scsi_write(data) if self.addr == 0xf000 else self.usb.write(self.addr + off, data)
     else:
       off += self.addr
       # writes are whole dwords
       if len(data) % 4 or off % 4:
         start, end = off & ~3, round_up(off+len(data),4)
-        aligned = bytearray(self.usb.pcie_mem_read(start,end-start))
+        aligned = bytearray(end-start)
+        if off != start: aligned[:4] = self.usb.pcie_mem_read(start, 4)
+        if end != off+len(data) and (off == start or end-start > 4): aligned[-4:] = self.usb.pcie_mem_read(end-4, 4)
         aligned[off-start:off-start+len(data)] = data
         off, data = start, aligned
       self.usb.pcie_mem_write(off, data)

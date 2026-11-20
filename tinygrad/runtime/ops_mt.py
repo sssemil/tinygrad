@@ -217,12 +217,7 @@ class MTAllocator(Allocator['MTDevice']):
   def _copyin(self, dest:int, src:memoryview):
     view, meta = self.dev._view(dest)
     off = dest-meta.va
-    if off % 4 == 0 and src.nbytes % 4 == 0: view[off:off+src.nbytes] = src.cast('B')
-    else:
-      start, end = off & ~3, round_up(off+src.nbytes,4)
-      data = bytearray(view[start:end])
-      data[off-start:off-start+src.nbytes] = src.cast('B')
-      view[start:end] = data
+    view[off:off+src.nbytes] = src.cast('B')
 
   def _copyout(self, dest:memoryview, src:int):
     view, meta = self.dev._view(src)
