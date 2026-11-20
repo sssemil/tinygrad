@@ -33,7 +33,7 @@ if __name__ == "__main__":
   with patch.object(MTUSCRenderer, "render", render_shader), patch.object(MTS30Program, "__init__", load_shader), \
        patch.object(MTS30Firmware, "_boot", direct_boot), patch.object(MTS30Firmware, "boot", side_effect=RuntimeError("vendor firmware boot")), \
        patch.object(MTSMC, "__init__", side_effect=RuntimeError("management firmware IPC")):
-    if sys.argv[1] in ("sram-mnist", "sram-whisper", "sram-qwen"):
+    if sys.argv[1] in ("sram-mnist", "sram-whisper", "sram-qwen", "sram-generate"):
       from extra.usbgpu.s30 import sram
       module = sys.argv.pop(1).replace("-", "_")
       map_bar, f0_out, shader = USBPCIDevice.map_bar, CustomASM24Controller._f0_out, sram.s30_shader

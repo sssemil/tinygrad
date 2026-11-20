@@ -3,7 +3,7 @@
 set -eu
 if [[ ${1:-} == sram-mnist ]]; then
   if [[ $# != 2 && ( $# != 4 || $3 != --index ) ]]; then echo "usage: $0 sram-mnist WEIGHTS [--index N]" >&2; exit 2; fi
-elif [[ ${1:-} == sram-whisper || ${1:-} == sram-qwen ]]; then
+elif [[ ${1:-} == sram-whisper || ${1:-} == sram-generate || ${1:-} == sram-qwen ]]; then
   if [[ $# != 2 ]]; then echo "usage: $0 $1 INPUT" >&2; exit 2; fi
 elif [[ $# != 2 && ( $# != 3 || ${3:-} != --check-reference ) ]]; then
   echo "usage: $0 {mnist|whisper|qwen} INPUT [--check-reference]" >&2; exit 2
@@ -40,7 +40,7 @@ elif [[ $base != /usr ]]; then opts+=(--ro-bind "$base" "$base"); fi
 case "$1" in
   mnist|sram-mnist) assets=(e8e6ed0857e9bb000985bfea8283b0b3.gunzip 684fe191a76d9107981692e6f0d3842f.gunzip 40a9ec2164c7887e8a5f1225de927907.gunzip 7b1e157ab43d54d0946f76d1bb6df574.gunzip) ;;
   whisper|sram-whisper) assets=(3a2cae277fcec4464349df535729caaf 5386a662f5b1245493601b29a5e61f40) ;;
-  qwen|sram-qwen) assets=() ;;
+  qwen|sram-qwen|sram-generate) assets=() ;;
   *) echo "unknown model $1" >&2; exit 2 ;;
 esac
 for asset in "${assets[@]}"; do

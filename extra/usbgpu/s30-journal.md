@@ -483,3 +483,15 @@ The five-call offline Qwen benchmark compiled 73 distinct shaders and returned t
 The rotary embedding for 14 attention heads exposed an implicit permutation on the scheduler's output buffer. Reading the physical buffer as a contiguous NumPy array put the second half of the first head in the wrong position. Requesting a contiguous kernel output before scheduling fixed it. The complete first Qwen block for four actual token IDs then matched the ordinary CPU transformer, with maximum absolute error 0.0000589 and relative L2 error 0.0000189.
 
 A separate check compared each instruction in the nine relocated SDCC assembler listings with the corresponding bytes of the source-built Chestnut application. All 535 explicit direct branches and calls in the 4,618 listed instructions target one of 258 instruction addresses inside that application. There were no indexed jump instructions. Its reset, INT0 and INT1 vectors target 0x0016, 0x1e05 and 0x1fde. This checks explicit control transfers in the application after handoff. It leaves the bridge silicon's behavior before the application's reset vector unresolved.
+
+## November 20, 2026 — generate the complete Qwen response without card DDR
+
+All 24 transformer blocks, the token embedding lookup within each streamed page, the vocabulary projection and greedy selection ran on the S30 using only Chestnut SRAM. The host decoded checkpoint data and prepared token IDs, fixed rotary coefficients and causal masks. It held intermediate activations and the FP16 KV cache between GPU tiles. Attention and each autoregressive step used the prior GPU outputs. The offline process started with an empty compiler cache and the GGUF as its only model file. Its guards covered all 30 distinct shaders and excluded management IPC, GPU VRAM and the vendor compute image.
+
+The 36-token prompt produced 785, 6722, 315, 9625, 374, 12095, 13 and 151645. From slot power-on, the first token arrived at 88.699 s and EOS at 167.405 s. Host checkpoint preparation preceded that timer. A separate full-prompt run compared all vocabulary logits for the first token with the ordinary CPU model. Maximum absolute logit difference was 0.00999, and both selected token 785. The same layout fix passed the original early-slot MNIST, Whisper frontend and Qwen block checks. This SRAM diagnostic trades speed for independence from local DDR. The board still boots with its factory storage present.
+
+From the workspace with the card idle:
+
+```sh
+PYTHON="$PWD/.s30-tools/whisper-venv/bin/python" tinygrad/extra/usbgpu/s30/bench_isolated.sh sram-generate .s30-tools/models/Qwen2.5-0.5B-Instruct-Q8_0.gguf
+```
