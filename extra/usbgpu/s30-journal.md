@@ -459,3 +459,15 @@ For test.wav the prefix was 256 of 3,000 mel frames. In three isolated rail cycl
 A separate process switched off the slot and observed LTSSM zero and the bridge rail-enable bit clear before each launch. The next process acquired the ordinary device lock, applied the pinned bridge source's lane and PHY setup, verified the S30 PCI identity and assigned only the 32 MiB register BAR. The SRAM path no longer opens the ordinary GPU device before power cycling. Its verifier rejects generic PCI enumeration, normal bridge power-on, configuration writes outside the command register and BAR0, memory TLPs outside BAR0, and GPU page-table mappings outside the bridge SRAM and completion queue.
 
 Three independent starts per model returned the correct digit at 340–372 ms and completed both Whisper convolutions at 259–262 ms. All finished with uninitialized management rings. Three passive observations after separate rail cycles found valid headers at 741–748 ms. Both rings' read and write indices remained zero from then until the final sample at 2.25 s. No management messages were sent. This bounds what was observable through this mailbox; it leaves the identity of the board code executing before link training unresolved.
+
+## November 20, 2026 — run Qwen's trained feed-forward block before management readiness
+
+The same fixed-shape tensor runner now streams Whisper convolution tiles and Qwen matrix tiles through Chestnut. Each tensor expression is scheduled and compiled from scratch for the S30. Inputs follow the output area in the lower SRAM half. A source-built GPU completion shader releases each USB readback.
+
+The Qwen fixture uses the last position of the ordinary 36-token France prompt. The host prepares the first block's normalized input using its embedding, attention and residual. The S30 computes the gate and up projections, SiLU times up, and the down projection. Each gate or up tile has 128 of 4,864 rows, and each down tile has 16 of 896 rows. The GPU reads about 25 MiB of decoded FP16 weights through the bridge over the course of the run. The checkpoint supplies tensor data only.
+
+In three isolated fresh processes starting with the slot already off, all 896 outputs matched the independent CPU feed-forward result with maximum absolute error 0.00000251. The four distinct GPU programs were generated in each process. The block finished at 485–504 ms with the management rings still invalid. This is the feed-forward portion of block zero. The full eight-token Qwen benchmark uses the standard native GPU path with local DDR.
+
+```sh
+extra/usbgpu/s30/bench_isolated.sh sram-qwen ../.s30-tools/models/Qwen2.5-0.5B-Instruct-Q8_0.gguf
+```

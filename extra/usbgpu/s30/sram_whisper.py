@@ -4,14 +4,8 @@ import numpy as np
 from examples.whisper import init_whisper, load_file_waveform, mel_prefix_frames, prep_audio
 from extra.usbgpu.s30.sram import ChestnutBoot, mailbox, open_cold
 from tinygrad import Context, Tensor
-from tinygrad.codegen import do_to_program
-from tinygrad.helpers import Target, ceildiv, round_up
-from tinygrad.renderer.usc import MTUSCRenderer
-from tinygrad.runtime.support.mt.mmu import MT_PTE_READ_WRITE
-from tinygrad.runtime.support.usb import HALF
-
-# The lower SRAM half is transient for these kernels. Keep outputs at slot zero for USB readback.
-TILE = 0x7400000000
+from tinygrad.helpers import ceildiv, round_up
+from extra.usbgpu.s30.sram_tensor import SRAMKernel
 
 def convolution(fw:ChestnutBoot, x:np.ndarray, weights:np.ndarray, bias:np.ndarray, stride:int, frames:int) -> np.ndarray:
   channels, _, kernel = weights.shape
@@ -22,29 +16,12 @@ def convolution(fw:ChestnutBoot, x:np.ndarray, weights:np.ndarray, bias:np.ndarr
   padded = np.pad(x, ((0,0),(0,0),(1, stride*(round_up(width, frames)-1)+kernel-x.shape[-1]-1)))
   def parts(row:int, col:int):
     return (np.ascontiguousarray(padded[:,:,stride*col:stride*col+tile_input]), weights[row:row+rows], bias[row:row+rows])
-  samples = parts(0, 0)
-  tensors = [Tensor(v).contiguous().realize() for v in samples]
-  output = tensors[0].conv2d(tensors[1], tensors[2], stride=stride).gelu()
-  call, = output.schedule_linear().src
-  prog = do_to_program(call.body, MTUSCRenderer(Target("MT","USC","mp_10")))
-  output_bytes = rows*frames*output.dtype.itemsize
-  payload = bytearray(round_up(output_bytes, 64))
-  offsets = {}
-  for t,v in zip(tensors, samples, strict=True):
-    offsets[t.uop.buf_uop] = len(payload)
-    payload.extend(bytes(round_up(v.nbytes, 64)))
-  if len(payload) > HALF: raise MemoryError("convolution tile exceeds Chestnut SRAM")
-  params, stream = fw.prepare(prog, [TILE if i in prog.arg.outs else TILE+offsets[call.src[i+1]] for i in prog.arg.globals])
+  conv = SRAMKernel(fw, lambda a,w,b: a.conv2d(w, b, stride=stride).gelu(), *parts(0, 0))
   result = np.empty((1, channels, width), np.float32)
   for col in range(0, width, frames):
     valid = min(width-col, frames)
     for row in range(0, channels, rows):
-      for off,v in zip(offsets.values(), parts(row, col), strict=True): payload[off:off+v.nbytes] = memoryview(v).cast("B")
-      fw.dev.pci_dev.usb.scsi_write(payload)
-      fw.stage(params, stream)
-      fw.kick_direct(0.5)
-      tile = np.frombuffer(fw.read_output(output_bytes), np.float32).reshape(rows, frames)
-      result[0,row:row+rows,col:col+valid] = tile[:,:valid]
+      result[:,row:row+rows,col:col+valid] = conv(*parts(row, col))[..., :valid]
   return result
 
 def run(audio:str):
@@ -54,7 +31,6 @@ def run(audio:str):
   weights = [(c.weight.numpy(), c.bias.numpy()) for c in convs]
   mt, start = open_cold()
   fw = ChestnutBoot(mt)
-  fw.mmu.map_range(TILE, fw.context_pa-HALF, HALF, MT_PTE_READ_WRITE)
   actual, x = [], mel[..., :mel_prefix_frames(mel)]
   with fw.boot_direct():
     for i,((w,b),stride,frames) in enumerate(zip(weights, (1, 2), (64, 32), strict=True), 1):
