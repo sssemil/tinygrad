@@ -205,6 +205,27 @@ class TestS30USB(unittest.TestCase):
       out = Tensor.empty(64, device="MT", dtype=dtypes.int).custom_kernel(fxn=kernel)[0]
       self.assertEqual(out.tolist(), [x+32*y+1024*z for z in range(2) for y in range(4) for x in range(8)])
 
+  def test_native_split_grid(self):
+    from tinygrad.codegen import to_program
+    from tinygrad.renderer import TinyELF
+    from tinygrad.runtime.support.mt.s30 import MTS30Program
+    from tinygrad.uop.ops import KernelInfo, UOp
+    with Context(DEV="MT:USC", CACHELEVEL=0):
+      dev = Device["MT"]
+      for axis in range(3):
+        out = UOp.placeholder((9*32,), dtypes.int, slot=0)
+        i = UOp.special(9, f"gidx{axis}")*32+UOp.special(32, "lidx0")
+        ast = out[i].store(out[i]+1).sink(arg=KernelInfo(name="increment_grid", optimized=True))
+        prg = MTS30Program(dev, TinyELF.from_program(to_program(ast, dev.renderer)), {})
+        buf = Buffer("MT", 9*32*4, initial_value=bytes(9*32*4))
+        expected = [0]*(9*32)
+        for groups in (9, 1, 4):
+          sizes = [1,1,1]
+          sizes[axis] = groups
+          prg(buf.meta.va, global_size=tuple(sizes), local_size=(32,1,1))
+          for j in range(groups*32): expected[j] += 1
+          self.assertEqual(list(buf.as_memoryview().cast("i")), expected)
+
   def test_native_workgroup_exchange(self):
     import numpy as np
     from tinygrad.dtype import AddrSpace

@@ -1,6 +1,6 @@
 from __future__ import annotations
 import functools, hashlib, struct, threading, time
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager, ExitStack
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -243,20 +243,35 @@ def s30_read_signal() -> UOp:
   cq = UOp.placeholder((4,), dtypes.uint, slot=0)
   return cq[3].store(1<<16).sink(arg=KernelInfo(name="release_sram", opts_to_apply=()))
 
-def s30_grid(groups:tuple[int,int,int], local:tuple[int,int,int], shared:int) -> tuple[int,...]:
+def s30_grid(groups:Sequence[int], local:tuple[int,int,int], shared:int) -> tuple[int,...]:
   lx,ly,lz = local
   lanes = lx*ly*lz
   return (*(g-1 for g in groups), (lanes if lanes < 32 else 0)<<25 | 2<<11 | shared, (lx-1)<<20 | (ly-1)<<10 | (lz-1))
 
-def s30_cdm_stream(words:tuple[int,...], *, direct:bool=False) -> bytearray:
+def s30_cdm_stream(words:tuple[int,...], secondary:tuple[int,...]|None=None) -> bytearray:
+  # A direct secondary stream either starts at TERMINATE or after it with its own disjoint grid.
+  secondary_offset = 4*(len(words)+int(bool(secondary))) if secondary is not None else 0
+  if secondary: words += (0x80000000,)+secondary
   write_offset = (len(words)+1)*4 + 64  # include the CDM prefetch guard after STREAM_TERMINATE
   if write_offset >= CDM_RING_SIZE: raise ValueError("S30 compute stream exceeds its ring")
   stream = bytearray(2*CDM_CONTROL_SIZE+write_offset)
   for core in range(2): struct.pack_into('<Q', stream, core*CDM_CONTROL_SIZE, write_offset)
-  # Both CDMs must reach TERMINATE. Starting the secondary at the first dispatch executes in-place stores twice on the direct path.
-  if direct: struct.pack_into('<Q', stream, CDM_CONTROL_SIZE+8, len(words)*4)
+  struct.pack_into('<Q', stream, CDM_CONTROL_SIZE+8, secondary_offset)
   struct.pack_into(f'<{len(words)+1}I', stream, 2*CDM_CONTROL_SIZE, *words, 0x80000000)
   return stream
+
+def s30_direct_stream(dispatches:tuple[tuple[int,...],...], groups:tuple[int,int,int], local:tuple[int,int,int], shared:int,
+                      split:int, params:bytearray, offset_arg:int) -> tuple[bytearray, bytearray]:
+  primary = list(groups)
+  secondary:tuple[int,...] = ()
+  second_params = params.copy() if split else bytearray()
+  if split and (count:=groups[split-1]) > 1:
+    other = primary.copy()
+    first = ceildiv(count, 2)
+    primary[split-1], other[split-1] = first, count-first
+    struct.pack_into('<I', second_params, offset_arg, first)
+    secondary = dispatches[1]+s30_grid(other, local, shared)
+  return params+second_params, s30_cdm_stream(dispatches[0]+s30_grid(primary, local, shared), secondary)
 
 def s30_cdm_packet(words:tuple[int,...], regions:int, addr:int, controls:int=0x200) -> bytearray:
   packet = s30_submission(mtfw.MTFW_SUBMISSION_CMD_GPU_CDM, mtfw.MTFW_SUB_REGION_CDM, 16+CDM_KICK_SIZE)
@@ -269,12 +284,12 @@ def s30_cdm_packet(words:tuple[int,...], regions:int, addr:int, controls:int=0x2
   struct.pack_into('<5Q', packet, kick+0x118, scratch+0xc00, addr+ring, addr+controls, CDM_RING_SIZE, scratch+0xe00)
   return packet
 
-def s30_shader(obj:TinyELF) -> tuple[bytes, bytearray, int, int, int, list[tuple[int,str]]]:
+def s30_shader(obj:TinyELF) -> tuple[bytes, bytearray, int, int, int, list[tuple[int,str]], int]:
   if obj.target.renderer == "USC":
-    ntemps, local_words, nconst = struct.unpack_from('<HHI', obj.lib)
+    ntemps, local_words, nconst, split = struct.unpack_from('<HHHBx', obj.lib)
     native_args = [(8*i, '<i' if space is AddrSpace.ALU else '<Q') for i,(_,space,_,_) in enumerate(obj.signature)]
     off = 8+4*nconst
-    return obj.lib[off:], bytearray(8*len(native_args))+obj.lib[8:off], ceildiv(ntemps, 2), 1, local_words, native_args
+    return obj.lib[off:], bytearray(8*len(native_args))+obj.lib[8:off], ceildiv(ntemps, 2), 1, local_words, native_args, split
   image = MTKernelImage.from_elf(obj.lib)
   k = image.metadata.kernel
   if k['.arch_id'] != 110 or k['.private_memory_size'] or k['.coef_reg_count'] or k['.const_calc_kernel'] or k['.has_barrier']:
@@ -291,7 +306,7 @@ def s30_shader(obj:TinyELF) -> tuple[bytes, bytearray, int, int, int, list[tuple
     if space is not AddrSpace.ALU: dt = dtypes.uint64
     if param['.reg_bank'] != 3 or param['.size'] != dt.itemsize: raise NotImplementedError("Unsupported S30 kernel argument layout")
     args.append((4*param['.offset'], '<'+unwrap(dt.fmt)))
-  return image.text, params, temps, attrs, 0, args
+  return image.text, params, temps, attrs, 0, args, 0
 
 def s30_pds(params:int, shared:int, usc:int, temps:int, local:bool=False) -> bytearray:
   # DOUT encodes a 64-bit source pair, a 32-bit control word and a destination (DMA, register write, USC).
@@ -320,18 +335,19 @@ class MTS30Program(Program['MTDevice']):
   def __init__(self, dev:MTDevice, obj:TinyELF, links:dict):
     self.dev, self.name, self.profile_key = dev, obj.name, obj.profile_key
     self.direct = obj.target.renderer == "USC"
-    text, params, temps, attrs, local_words, self.args = s30_shader(obj)
+    text, params, temps, attrs, local_words, self.args, self.split = s30_shader(obj)
     shared = len(params)//4
     # Rogue USC prefetches one more instruction (up to 32 bytes), even when the shader ends at a page boundary.
     code = text + bytes(32)
     self.code = Buffer(dev.device, len(code), initial_value=code)
     # One transfer updates the parameters immediately before the ring controls and the dispatch stream.
     pds_start = 0 if self.direct else round_up(CDM_SUBMISSION_SIZE, 32)
-    param_size = round_up(len(params), 32)
+    stride = round_up(len(params), 32)
+    param_size = stride*(1+bool(self.split))
     controls = DIRECT_CDM if self.direct else round_up(pds_start + 96 + len(params), 256)
     if param_size > controls: raise ValueError("S30 parameters exceed the direct ring allocation")
     self.param_offset = controls - param_size
-    packet_size = 96 if self.direct else controls + 2*CDM_CONTROL_SIZE + CDM_RING_SIZE
+    packet_size = 96*(1+bool(self.split)) if self.direct else controls + 2*CDM_CONTROL_SIZE + CDM_RING_SIZE
     self.packet = Buffer(dev.device, packet_size, preallocate=True)
     packet_off, usc_off = self.packet.meta.va & 0xffffffff, self.code.meta.va & 0xffffffff
     pds_off = packet_off + pds_start
@@ -342,14 +358,16 @@ class MTS30Program(Program['MTDevice']):
       dev.s30_fw.mmu.map_range(USC_BASE+usc_off, self.code.meta.pa, self.code.meta.size, MT_PTE_READ_ONLY)
     self.shared = ceildiv(shared, 16)
     dispatch = s30_dispatch(pds_off, self.shared, attrs)
-    words = dispatch + (0,)*5
+    self.dispatches = (dispatch, s30_dispatch(pds_off+96, self.shared, attrs)) if self.split else (dispatch,)
     self.shared += ceildiv(local_words, 16)
-    self.grid_offset = param_size+2*CDM_CONTROL_SIZE+4*len(dispatch)
     if self.direct:
       self.packet.host[:len(pds)] = pds
-      self.launch = bytearray(param_size)+s30_cdm_stream(words, direct=True)
+      if self.split:
+        self.packet.host[96:192] = s30_pds(params_base+self.param_offset+stride, shared, usc_off, temps, bool(local_words))
+      self.launch = bytearray(stride)
     else:
-      packet = s30_cdm_packet(words, max(8, temps, attrs), self.packet.meta.va, controls)
+      self.grid_offset = param_size+2*CDM_CONTROL_SIZE+4*len(dispatch)
+      packet = s30_cdm_packet(dispatch+(0,)*5, max(8, temps, attrs), self.packet.meta.va, controls)
       packet[pds_start:pds_start+len(pds)] = pds
       self.packet.host[:len(packet)] = packet
       self.launch = packet[self.param_offset:self.param_offset+self.grid_offset+20]
@@ -366,15 +384,17 @@ class MTS30Program(Program['MTDevice']):
         fw.session.enter_context(fw.boot_direct() if self.direct else fw.boot())
       try:
         start = time.perf_counter()
-        struct.pack_into('<5I', self.launch, self.grid_offset, *s30_grid(global_size, local_size, self.shared))
         wait_seconds = 5.0 if timeout is None else timeout/1000
         if self.direct:
+          params, stream = s30_direct_stream(self.dispatches, global_size, local_size, self.shared, self.split, self.launch, 8*len(self.args))
+          data = params+stream
           if fw.bridge is not None:
             slot, pad = divmod(S30_RING_OFFSET+self.param_offset-DIRECT_CDM, SLOT)
-            fw.bridge.scsi_write(bytes(pad)+self.launch, slot_start=slot)
-          else: fw.v[self.param_offset:self.param_offset+len(self.launch)] = self.launch
+            fw.bridge.scsi_write(bytes(pad)+data, slot_start=slot)
+          else: fw.v[self.param_offset:self.param_offset+len(data)] = data
           fw.kick_direct(wait_seconds, readback)
         else:
+          struct.pack_into('<5I', self.launch, self.grid_offset, *s30_grid(global_size, local_size, self.shared))
           resp = fw.submit(None, mtfw.MTFW_SUBMISSION_CMD_GPU_CDM, CDM_SUBMISSION_SIZE, self.launch, wait_seconds,
                            resident=self.packet, offset=self.param_offset)
           if resp.value: raise RuntimeError(f"S30 kernel {self.name} failed with firmware status {resp.value:#x}")

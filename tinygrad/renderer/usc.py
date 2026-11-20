@@ -232,6 +232,9 @@ class MTUSCRenderer(Renderer):
     if local_words > self.shared_max: raise NotImplementedError("S30 local storage exceeds the supported allocation")
     local_words = local_words+5 if local_words or any(u.op is Ops.BARRIER for u in uops) else 0
     ins:list[Instruction] = []
+    # The second CDM reads its starting group from the first shared word after the arguments.
+    axis = max((u for u in uops if u.op is Ops.SPECIAL and u.arg.startswith("gidx")), key=lambda u:u.vmax, default=None)
+    split = int(axis.arg[-1])+1 if axis is not None and axis.vmax > 0 else 0
     constants:list[int] = []
     regs:dict[UOp,int] = {}
     offsets:dict[tuple[UOp,int],int] = {}
@@ -250,7 +253,7 @@ class MTUSCRenderer(Renderer):
       return len(ins)-1
     def literal(bits:int) -> int:
       if bits not in constants: constants.append(bits)
-      return emit("imm", imm=2*len(params)+constants.index(bits))
+      return emit("imm", imm=2*len(params)+int(bool(split))+constants.index(bits))
     def select(cond:int, t:int, f:int) -> int:
       return emit("select", emit("ilt", literal(0), cond), t, f)
     slots:dict[tuple[UOp,int],int] = {}
@@ -284,7 +287,9 @@ class MTUSCRenderer(Renderer):
       if u in regs: return regs[u]
       if u._shape != () or u.dtype not in supported:
         raise NotImplementedError(f"S30 USC scalar {u.op} {u.dtype}")
-      if u.op is Ops.SPECIAL and u.arg in ("gidx0", "gidx1", "gidx2"): r = emit("group", imm=int(u.arg[-1]))
+      if u.op is Ops.SPECIAL and u.arg in ("gidx0", "gidx1", "gidx2"):
+        r = emit("group", imm=int(u.arg[-1]))
+        if split == int(u.arg[-1])+1: r = emit("iadd", r, emit("imm", imm=2*len(params)))
       elif u.op is Ops.SPECIAL and u.arg == "lidx0": r = emit("lane")
       elif u.op is Ops.SPECIAL and u.arg in ("lidx1", "lidx2"):
         yz = emit("lane", imm=1)
@@ -408,4 +413,5 @@ class MTUSCRenderer(Renderer):
         raise NotImplementedError(f"S30 USC cannot lower {u.op}")
     code, temps = assemble(ins)
     # Shared registers hold pointer pairs followed by the shader's literal words.
-    return (struct.pack(f'<HHI{len(constants)}I', temps, local_words, len(constants), *constants) + code).hex()
+    if split: constants.insert(0, 0)
+    return (struct.pack(f'<HHHBx{len(constants)}I', temps, local_words, len(constants), split, *constants) + code).hex()

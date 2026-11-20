@@ -8,7 +8,7 @@ from tinygrad.renderer.usc import MTUSCRenderer
 from tinygrad.runtime.support.mt.compute import FW_DEVVA
 from tinygrad.runtime.support.mt.mmu import MTMMU4, MT_PTE_READ_ONLY, MT_PTE_READ_WRITE
 from tinygrad.runtime.support.mt.mtdev import MTDev, MT_DDR_BAR, MT_IPC_RING_SIZE, MT_S30_ID, MT_S30_SRAM_OFFSET, MT_SYS_BAR, MT_USB_GPU_BUS, MT_VENDOR_ID
-from tinygrad.runtime.support.mt.s30 import DIRECT_CDM, PDS_BASE, USC_BASE, MTS30Firmware, s30_cdm_stream, s30_dispatch, s30_grid, s30_pds, s30_shader
+from tinygrad.runtime.support.mt.s30 import DIRECT_CDM, PDS_BASE, USC_BASE, MTS30Firmware, s30_direct_stream, s30_dispatch, s30_pds, s30_shader
 from tinygrad.runtime.support.mt.s30 import s30_read_signal
 from tinygrad.runtime.support.system import USBPCIDevice
 from tinygrad.runtime.support.usb import CustomASM24Controller, HALF, SLOT, USB3
@@ -35,19 +35,24 @@ class ChestnutBoot(MTS30Firmware):
     return memoryview(self.mem)[:0x8000], mmu
 
   def prepare(self, program:UOp, addresses:list[int]) -> tuple[bytearray, bytearray]:
-    text, params, temps, attrs, local, layout = s30_shader(TinyELF.from_program(program))
+    text, params, temps, attrs, local, layout, split = s30_shader(TinyELF.from_program(program))
     for (off, fmt), addr in zip(layout, addresses, strict=True): struct.pack_into(fmt, params, off, addr)
     usc = self.code_end
     pds = round_up(usc+len(text)+32, 64)  # include the USC prefetch guard
     loader = s30_pds(FW_DEVVA+PARAMS, len(params)//4, usc, temps, bool(local))
+    shared = ceildiv(len(params), 64)
+    dispatches = (s30_dispatch(pds, shared, attrs),)
+    if split:
+      stride = round_up(len(params), 32)
+      dispatches += (s30_dispatch(pds+len(loader), shared, attrs),)
+      loader += s30_pds(FW_DEVVA+PARAMS+stride, len(params)//4, usc, temps, bool(local))
+      params.extend(bytes(stride-len(params)))
     self.code_end = round_up(pds+len(loader), 64)
-    if self.code_end > self.code_size or len(params) > 0x1000: raise MemoryError("S30 program exceeds Chestnut SRAM")
+    if self.code_end > self.code_size or len(params)*(1+bool(split)) > 0x1000: raise MemoryError("S30 program exceeds Chestnut SRAM")
     self.mem[self.code_base+usc:self.code_base+usc+len(text)] = text
     self.mem[self.code_base+pds:self.code_base+pds+len(loader)] = loader
     self.dirty_code = True
-    shared = ceildiv(len(params), 64)
-    grid = s30_grid(program.arg.global_size, program.arg.local_size, shared+ceildiv(local, 16))
-    return params, s30_cdm_stream(s30_dispatch(pds, shared, attrs)+grid, direct=True)
+    return s30_direct_stream(dispatches, program.arg.global_size, program.arg.local_size, shared+ceildiv(local, 16), split, params, 8*len(layout))
 
   def stage(self, params:bytearray, stream:bytearray):
     self.mem[PARAMS:PARAMS+len(params)] = params

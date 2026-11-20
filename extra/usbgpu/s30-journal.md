@@ -8,11 +8,11 @@ Measured on the same Chestnut S30 with compiler caching disabled. The cold colum
 
 | Workload | Native cold | MUSA cold | Native warm | MUSA warm |
 | --- | ---: | ---: | ---: | ---: |
-| MNIST, batch of 16 | 0.850 s | 3.490 s | 24.00 ms | 13.76 ms |
-| Whisper tiny.en, test.wav | 9.981 s | 51.250 s | 4.166 s | 2.285 s |
-| Qwen2.5-0.5B Q8_0 | 17.691 s | 172.203 s | 4.603 s | 4.813 s |
+| MNIST, batch of 16 | 0.865 s | 3.490 s | 15.24 ms | 13.76 ms |
+| Whisper tiny.en, test.wav | 8.297 s | 51.250 s | 2.520 s | 2.285 s |
+| Qwen2.5-0.5B Q8_0 | 15.564 s | 172.203 s | 3.262 s | 4.813 s |
 
-The benchmark checked all five outputs against the recorded reference for each model on each backend. The native column uses the offline, isolated benchmark. It checked every loaded USC program against compiler output generated in the same process. The check covered 10 distinct binaries for MNIST, 93 for Whisper and 73 for Qwen. The benchmark also checked that compute startup received only zero-filled context memory, with META master boot disabled. It blocked vendor firmware boot and management mailbox construction. The card powered up with its factory firmware still installed. The host did not upload proprietary code during these model runs. The board-management mailbox was unused.
+The benchmark checked all five outputs against the recorded reference for each model on each backend. The native column uses the offline, isolated benchmark. It checked every loaded USC program against compiler output generated in the same process. The check covered 10 distinct binaries for MNIST, 94 for Whisper and 73 for Qwen. The benchmark also checked that compute startup received only zero-filled context memory, with META master boot disabled. It blocked vendor firmware boot and management mailbox construction. The card powered up with its factory firmware still installed. The host did not upload proprietary code during these model runs. The board-management mailbox was unused.
 
 ### Inference without card DDR
 
@@ -20,9 +20,9 @@ Separate cold-slot runs place every GPU-visible page in Chestnut SRAM or the bri
 
 | Model | Result | Rail enable to result | Fresh shaders |
 | --- | --- | ---: | ---: |
-| MNIST, test image 0 | Class 7 | 0.364 s | 9 |
-| Whisper tiny.en, test.wav | Could you please let me out of the box? | 121.688 s | 90 |
-| Qwen2.5-0.5B, 36-token France prompt | All eight CPU reference tokens, including EOS | 141.560 s | 31 |
+| MNIST, test image 0 | Class 7 | 0.370 s | 9 |
+| Whisper tiny.en, test.wav | Could you please let me out of the box? | 122.170 s | 93 |
+| Qwen2.5-0.5B, 36-token France prompt | All eight CPU reference tokens, including EOS | 141.250 s | 32 |
 
 The entire 2 MiB external bridge flash matches its reconstructed contents, including the application built from source with its target runtime objects. The outstanding boot question is what the S30 board and the bridge silicon execute before the host can train the PCIe link. All measurements used the original board boot storage.
 
@@ -578,3 +578,13 @@ All 32 hardware tests passed with the reference stack available. Fresh SRAM-only
 The source link produced a 9,197-byte 8051 body. Its reset vector at 0 jumps to startup at 0x16 and then to main at 0x2020. The firmware enables external interrupts 0 and 1 and timer 0. The timer vector at 0x0b contains eight zero-byte NOP instructions before the external-1 vector. Walking fall-through, both conditional successors and direct call targets from these vectors visited 4,595 instructions. The decoded instruction bytes matched the linked listings and installed application body. All 229 reachable direct call sites target instructions in that body. The walk found no computed jump. It assumes ordinary call and interrupt returns and starts after control reaches the application vector. It does not observe silicon execution at power-on.
 
 The flash's OTP address space is separate from the verified 2 MiB main array. The pinned application reads five OTP bytes to build the USB serial descriptor. A separate device read confirmed that the four serial bytes passed the application's XOR check and that its formatting reproduced the enumerated USB serial. The diagnostic exited OTP mode, checked the JEDEC ID again, and a subsequent native GPU multiplication returned [6, 9]. No write-enable, erase or program command was issued. [Bridge startup assembly](https://github.com/tinygrad/asm2464pd-firmware/blob/ed4e39b7e0794e19ba193477067c48757a5cf9ef/handmade/src/crt0.s) · [OTP read implementation](https://github.com/tinygrad/asm2464pd-firmware/blob/ed4e39b7e0794e19ba193477067c48757a5cf9ef/handmade/src/flash.h)
+
+## November 20, 2026 — give the two command processors disjoint workgroups
+
+Each source-generated shader with a splittable grid now reads a base group index from its launch parameters. The compiler selects the largest group dimension. The primary CDM starts at zero. The secondary CDM starts at the first group after the primary's range. Each gets its own launch-parameter block and ring start, and both use the same USC code. A one-group replay sends the secondary directly to the terminator. The new shader header stores the split dimension in a previously zero byte. Older shaders keep their single-grid behavior.
+
+The hardware regression ran the same loaded program with 9, 1 and 4 groups in sequence along each of X, Y and Z, with 32 lanes in every group. Each launch incremented its elements exactly once. The batch-16 SGD comparison again matched the CPU loss and all 20 state tensors. Offline compilation also passed all 165 archived inference graphs. Splitting only X in an initial experiment gave 15.23 ms warm MNIST and 2.505 s warm Whisper, while splitting only Y gave 14.85 ms and 2.978 s. The shipped selection uses the dimensions of each generated kernel.
+
+Compared with the correct single-grid path, the isolated warm medians fell from 24.00 to 15.24 ms for MNIST, from 4.166 to 2.520 s for Whisper and from 4.603 to 3.262 s for Qwen. All fifteen results matched the proprietary reference. On this prompt and clip, warm MNIST and Whisper still took about 11% and 10% longer than MUSA. Warm Qwen took about 32% less time. The SRAM-only runner also builds its two parameter blocks and streams from source.
+
+In the independent cold-slot checks, the SRAM-only digit, waveform and complete token sequence all matched. Each sandbox started with an empty kernel cache and rejected both card DDR and management IPC. These measurements primarily reflect transfers between the host and the bridge SRAM. Across two successive runs, the full clip took 122.17–122.29 s and all eight tokens took 141.25–141.35 s.
