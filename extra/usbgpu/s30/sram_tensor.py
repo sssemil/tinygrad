@@ -15,7 +15,7 @@ class SRAMKernel:
     va = 0x7400000000
     fw.mmu.map_range(va, fw.context_pa-HALF, HALF, MT_PTE_READ_WRITE)
     tensors = [Tensor(np.ascontiguousarray(v)).contiguous().realize() for v in samples]
-    output = fn(*tensors)
+    output = fn(*tensors).contiguous()
     call, = output.schedule_linear().src
     prg = do_to_program(call.body, MTUSCRenderer(Target("MT","USC","mp_10")))
     self.shape, self.dtype, self.nbytes = output.shape, np.dtype(output.dtype.fmt), output.nbytes()
