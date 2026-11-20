@@ -4,11 +4,11 @@ Hardware used for these measurements is the 4 GiB MTT S30 on Chestnut over USB. 
 
 ## Latest end-to-end cold and warm measurements
 
-Measured on the same Chestnut S30 with compiler caching disabled. The cold column starts before device and checkpoint setup and stops when the first result is available. Warm latency is the median of calls 3–5 in the same process. Each Qwen call reprocesses the prompt and returns eight tokens. The input files and output comparisons are described below.
+Measured on the same Chestnut S30 with compiler caching disabled. The cold column starts before device and checkpoint setup and stops when the first result is available. Warm latency is the median of calls 3–5 in the same process. The MNIST row reports the median across five fresh processes per backend. Each Qwen call reprocesses the prompt and returns eight tokens. The input files and output comparisons are described below.
 
 | Workload | Native cold | MUSA cold | Native warm | MUSA warm |
 | --- | ---: | ---: | ---: | ---: |
-| MNIST, batch of 16 | 0.837 s | 3.499 s | 13.45 ms | 14.04 ms |
+| MNIST, batch of 16 | 0.851 s | 3.503 s | 13.73 ms | 13.85 ms |
 | Whisper tiny.en, test.wav | 8.374 s | 51.173 s | 2.526 s | 2.289 s |
 | Qwen2.5-0.5B Q8_0 | 15.518 s | 172.234 s | 3.262 s | 4.811 s |
 
@@ -624,7 +624,7 @@ With `BEAM=1`, the offline MNIST runner generated and loaded 830 distinct USC pr
 
 Examining the measured schedule for the 20-column convolution showed that one thread computed ten neighboring outputs with the same five-tap filter. The native scheduler now uses two filter widths when a batched convolution has a compatible output width. It groups work along output channels and scanlines. Reusing the wider tile with the previous lane order gave 18.35–18.63 ms on batch-16 MNIST. Grouping channels and scanlines with up to 128 lanes brought that to 13.61–13.65 ms in three exploratory runs.
 
-Two fresh offline processes using the default scheduler and empty caches measured 13.49 and 13.45 ms warm. A fresh MUSA run between them measured 14.04 ms. All five batches matched on each run. The table uses the second isolated native run and that MUSA run for MNIST. The isolated Whisper and Qwen results are also fresh. Their MUSA columns carry forward the previous same-card controls.
+Two fresh offline processes using the default scheduler and empty caches measured 13.49 and 13.45 ms warm. A fresh MUSA run between them measured 14.04 ms. All five batches matched on each run. The isolated Whisper and Qwen results are also fresh. Their MUSA columns carry forward the previous same-card controls.
 
 All 165 archived inference graphs compiled. All 23 applicable native hardware tests passed, including exact convolution comparisons with NumPy at five output widths. A batch-16 training step agreed with the CPU on the loss and all 20 updated tensors. The separate SRAM-only MNIST runner produced class 7 in 362.98 ms from rail enable with nine freshly generated programs and both management rings unready.
 
@@ -643,3 +643,5 @@ Cycling the downstream slot keeps Chestnut powered. The isolated SRAM verifier n
 With this preparation MNIST image 0 returned 7 in 370.36 ms and image 1 returned 2 in 368.06 ms. Both finished before management mailbox readiness and used nine freshly generated shaders each. Whisper returned the reference transcript in 122.593 s with 93 fresh shaders. Qwen returned the first token at 76.297 s and all eight in 141.507 s with 32 fresh shaders. The complete sequence matched independent CPU generation.
 
 Two other read-only checks narrowed the boot investigation. The public bridge emulator maps XDATA addresses to code at an offset of 0xddfc. On this Chestnut, 16-byte USB reads at 0xe423, 0xe437 and 0xe600 each returned zeros. The corresponding positions in the freshly rebuilt 8051 application all have nonzero instruction bytes. This mapping did not disclose application code through these reads with the installed firmware. Separately, the vendor driver's generic management register read and write helpers both call `mtgpu_ipc_transmit_ext`. Those helpers require management IPC before they can inspect or change controller registers. Neither check identifies what executes in the first 52 ms. [Emulator read callback](https://github.com/tinygrad/asm2464pd-firmware/blob/ed4e39b7e0794e19ba193477067c48757a5cf9ef/emulate/hardware.py#L1679)
+
+Five further MNIST comparisons alternated backend order between pairs. The five native warm process medians ranged from 13.51 to 13.90 ms, with a median of 13.73 ms. MUSA ranged from 13.82 to 14.03 ms, with a median of 13.85 ms. Their ranges overlap. The median times to first result were 0.851 s and 3.503 s respectively. All 50 batches matched the reference. Each native run generated its own ten shaders. The MNIST row at the top now uses these five-pair measurements.
