@@ -12,7 +12,8 @@ def trace_power(bridge:CustomASM24Controller, hold:float):
     time.sleep(hold)
     mv, ma, fault = struct.unpack("<HhB", bridge.usb.control_read(0xc0, 5))
     perst, ltssm = (bridge.read(reg, 1)[0] for reg in (0xb480, 0xb450))
-    print(f"{time.monotonic()-start:7.3f} s  {stage:24s}  PERST control {perst:#04x}  LTSSM {ltssm:#04x}  {mv} mV  {ma} mA", flush=True)
+    pins = int.from_bytes(bridge.read(0xc650, 4), "little") & ((1<<28)-1)
+    print(f"{time.monotonic()-start:7.3f} s  {stage:24s}  PERST control {perst:#04x}  LTSSM {ltssm:#04x}  GPIO {pins:#09x}  {mv} mV  {ma} mA", flush=True)
     if fault:
       bridge.set_pcie_power(False)
       raise OSError("Chestnut reports a power fault")
