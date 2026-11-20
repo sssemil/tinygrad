@@ -47,7 +47,29 @@ def _rematerialize_ids(ins:list[Instruction]) -> list[Instruction]:
     out.append((op, tuple(args), imm))
   return out
 
+def _forward_slot_reads(ins:list[Instruction]) -> list[Instruction]:
+  # A register load is a snapshot. Read the slot directly if its value and active lanes stay the same through the last use.
+  last_use = {v:i for i,(_,src,_) in enumerate(ins) for v in src}
+  aliases:dict[int,int] = {}
+  writes:dict[int,int] = {}
+  boundary = len(ins)
+  for i in reversed(range(len(ins))):
+    op, src, _ = ins[i]
+    if op == "mov" and last_use.get(i, i) < min(boundary, writes.get(src[0], boundary)): aliases[i] = src[0]
+    elif op == "assign": writes[src[0]] = i
+    elif op in ("back", "range", "cndst", "cndend"): boundary = i
+  if not aliases: return ins
+  idx:dict[int,int] = {}
+  out:list[Instruction] = []
+  for i,(op,src,imm) in enumerate(ins):
+    if i in aliases: idx[i] = idx[aliases[i]]
+    else:
+      idx[i] = len(out)
+      out.append((op, tuple(idx[v] if v >= 0 else v for v in src), imm))
+  return out
+
 def assemble(ins:list[Instruction]) -> tuple[bytes, int]:
+  ins = _forward_slot_reads(ins)
   if (ret:=_assemble(ins) or _assemble(_delay_loads(ins)) or _assemble(_rematerialize_ids(ins))) is not None: return ret
   raise NotImplementedError("S30 USC needs more than 64 live temporaries")
 
@@ -58,6 +80,18 @@ def _assemble(ins:list[Instruction]) -> tuple[bytes, int]|None:
   for i,(_,src,_) in enumerate(ins):
     for v in src:
       if v >= 0: last[v] = max(last.get(v, i), i, *(end for start,end in loops if v <= start <= i <= end))
+  # Write a floating-point result directly into its accumulator when the old value has had its last read.
+  targets:dict[int,int] = {}
+  used:dict[int,int] = {}
+  boundary = -1
+  for i,(op,src,_) in enumerate(ins):
+    if op == "assign":
+      slot, value = src
+      if (value > max(slot,boundary) and last.get(value) == i and used.get(slot,-1) <= value and
+          ins[value][0] in ("fma", "fmul", "fadd") and value not in used):
+        targets[value] = slot
+    if op in ("range", "back", "barrier", "cndst", "cndend"): boundary = i
+    for v in src: used[v] = i
   # Overlap two independent reads. Keep the first address live until the second DMA waits for both data fences.
   first:set[int] = set()
   second:set[int] = set()
@@ -81,9 +115,12 @@ def _assemble(ins:list[Instruction]) -> tuple[bytes, int]|None:
   fence:int|None = None
   for i,(op,src,imm) in enumerate(ins):
     if op in ("imm", "half_to_float") and i not in last: continue
-    operands = tuple(regs[v] if v >= 0 else ~v for v in src)
-    for v in expires[i]: free.add(regs.pop(v))
-    if op not in ("st", "st8", "st16", "assign", "back", "cndst", "cndend", "lmst", "barrier"):
+    operands = tuple(regs[targets.get(v,v)] if v >= 0 else ~v for v in src)
+    for v in expires[i]:
+      if v not in targets: free.add(regs.pop(v))
+    if op == "assign" and src[1] in targets: continue
+    if i in targets: dst = regs[targets[i]]
+    elif op not in ("st", "st8", "st16", "assign", "back", "cndst", "cndend", "lmst", "barrier"):
       if not free: return None
       dst = min(free)
       peak = max(peak, dst+1)
@@ -247,7 +284,11 @@ class MTUSCRenderer(Renderer):
     constants:list[int] = []
     regs:dict[UOp,int] = {}
     offsets:dict[tuple[UOp,int],int] = {}
+    # Select reads P0 implicitly. Reuse its last comparison across consecutive masked accesses.
+    predicate:tuple[int,int]|None = None
     def emit(op:str, *src:int, imm:int=0) -> int:
+      nonlocal predicate
+      if op in ("ilt", "ieq", "fgt", "feq", "back", "range", "cndst", "cndend", "barrier"): predicate = None
       for i,half_bit in enumerate(half_bits.get(op, ())):
         if ins[src[i]][0] == "half_to_float":
           src = (*src[:i], ins[src[i]][1][0], *src[i+1:])
@@ -264,7 +305,9 @@ class MTUSCRenderer(Renderer):
       if bits not in constants: constants.append(bits)
       return emit("imm", imm=2*len(params)+int(bool(split))+constants.index(bits))
     def select(cond:int, t:int, f:int) -> int:
-      return emit("select", emit("ilt", literal(0), cond), t, f)
+      nonlocal predicate
+      if predicate is None or predicate[0] != cond: predicate = (cond, emit("ilt", literal(0), cond))
+      return emit("select", predicate[1], t, f)
     slots:dict[tuple[UOp,int],int] = {}
     quot_rem:dict[tuple[UOp,UOp],tuple[int,int]] = {}
     def divide(n:UOp, d:UOp) -> tuple[int,int]:
@@ -416,7 +459,8 @@ class MTUSCRenderer(Renderer):
           emit(store, addr, value, imm=ptr)
           if gate is not None: emit("cndend")
       # Respect the scheduler's placement of invariant address arithmetic before nested reductions.
-      elif has_loop and u not in products and u.op in (Ops.SPECIAL, Ops.TRUNCDIV, Ops.TRUNCMOD, *self.code_for_op): reg(u)
+      elif has_loop and u not in products and u.op in (Ops.SPECIAL, Ops.TRUNCDIV, Ops.TRUNCMOD, Ops.CMPLT, Ops.CMPEQ,
+                                                       Ops.AND, Ops.OR, Ops.XOR, *self.code_for_op): reg(u)
       elif u.op not in (Ops.PARAM, Ops.BUFFER, Ops.CONST, Ops.CAST, Ops.INDEX, Ops.SPECIAL, Ops.CMPEQ, Ops.CMPLT, Ops.WHERE,
                         Ops.AND, Ops.OR, Ops.XOR, Ops.BITCAST, Ops.TRUNCDIV, Ops.TRUNCMOD, *self.code_for_op, Ops.STACK, Ops.AFTER, Ops.SINK):
         raise NotImplementedError(f"S30 USC cannot lower {u.op}")

@@ -2,7 +2,29 @@
 
 Hardware used for these measurements is the 4 GiB MTT S30 on Chestnut over USB. The host runs tinygrad. Model checkpoints are inputs. The shader cache starts empty for native acceptance runs.
 
-## Latest end-to-end cold and warm measurements
+## Native USC compared with the two vendor compilers
+
+Each inference process started with compiler caching disabled, loaded the same checkpoint and checked all five outputs. Cold latency includes device setup, checkpoint loading and the first prediction. Warm latency is the median of predictions 3–5. Native and vendor LLVM each ran in one fresh process per model. The MUSA column uses the same-card reference run recorded below.
+
+| Inference workload | Native META cold / warm | MUSA cold / warm | Vendor LLVM cold / warm |
+| --- | ---: | ---: | ---: |
+| MNIST, 16 digits | 0.899 s / 9.16 ms | 3.858 s / 14.20 ms | 1.911 s / 15.08 ms |
+| Whisper tiny.en, test.wav | 7.829 s / 1.470 s | 52.666 s / 2.311 s | 31.677 s / 2.275 s |
+| Qwen2.5-0.5B Q8_0, prompt plus eight tokens | 14.173 s / 1.766 s | 173.649 s / 4.856 s | 155.829 s / 5.032 s |
+
+Training used 200 Adam updates from random weights with the same seed and batch size of 32. The total includes the first update and JIT capture. Warm latency is the median over updates 3–200. Training and held-out scoring ran on the S30. The final column counts correct predictions on the entire MNIST test set.
+
+| Training path | 200 updates | Warm update | Correct / 10,000 |
+| --- | ---: | ---: | ---: |
+| Native USC and source-built META | 36.95 s | 169.91 ms | 9,662 |
+| MUSA | 90.99 s | 278.13 ms | 9,692 |
+| Vendor LLVM | 67.10 s | 284.75 ms | 9,747 |
+
+The scheduler tiles convolution gradients across output channels and splits long reductions across a workgroup. The USC compiler reuses the predicate for repeated masked accesses and reads accumulators directly until their next write. A floating-point instruction can write the accumulator register once its previous value has had its last use. For a separate SGD update from identical pretrained weights, native and CPU tinygrad agreed on the loss and all 20 state tensors at absolute and relative tolerance 0.0002.
+
+The offline native verifier regenerated 10 MNIST, 94 Whisper, 73 Qwen and 102 training shaders from UOps, independently assembled the META scheduler and checked its completion on the card. The board retained its factory boot storage.
+
+## Host-direct and META comparison before shader tuning
 
 Each native mode ran in five fresh, offline processes per model on the same card. The order alternated within each pair. Cold time starts before device and checkpoint setup and ends at the first checked output. Warm time is the median of calls 3–5, then the median across processes. MUSA used one fresh process per model with compiler caching disabled.
 

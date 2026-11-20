@@ -328,6 +328,23 @@ class TestS30USB(unittest.TestCase):
       prg(dst.meta.va, src.meta.va, wait=True)
       self.assertEqual(struct.unpack("<f", dst.as_memoryview())[0], sum(vals))
 
+  def test_native_accumulator_write(self):
+    from tinygrad.dtype import AddrSpace
+    from tinygrad.renderer import TinyELF
+    from tinygrad.renderer.usc import assemble, Instruction
+    from tinygrad.runtime.support.mt.s30 import MTS30Program
+    # Both adds read the old accumulator before the first assignment. The final add can write the slot directly.
+    ins:list[Instruction] = [("imm", (), 2), ("imm", (), 3), ("slot", (), 0), ("assign", (2,1), 0),
+                             ("fadd", (2,1), 0), ("fadd", (2,1), 0), ("assign", (2,4), 0),
+                             ("fadd", (2,5), 0), ("assign", (2,7), 0), ("st", (0,2), 0)]
+    code, temps = assemble(ins)
+    lib = struct.pack("<HHH2xIf", temps, 0, 2, 0, 3.)+code
+    with Context(DEV="MT:USC", CACHELEVEL=0):
+      dev, out = Device["MT"], Buffer("MT", 4, initial_value=bytes(4))
+      prg = MTS30Program(dev, TinyELF(lib, "accumulator", dev.renderer.target, ((None, AddrSpace.GLOBAL, dtypes.float, ()),)), {})
+      prg(out.meta.va, wait=True)
+      self.assertEqual(struct.unpack("<f", out.as_memoryview())[0], 12.)
+
   def test_native_paired_projections(self):
     import numpy as np
     rng = np.random.default_rng(30)

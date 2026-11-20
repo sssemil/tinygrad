@@ -19,6 +19,17 @@ class TestMTCompiler(unittest.TestCase):
     ins.extend([("st", (0,acc), 0), ("st", (1,acc), 0)])
     self.assertLessEqual(assemble(ins)[1], 64)
 
+  def test_usc_slot_snapshot(self):
+    from tinygrad.renderer.usc import assemble, _assemble, Instruction
+    start:list[Instruction] = [("imm", (), 2), ("slot", (), 0), ("assign", (1,0), 0)]
+    snapshot:Instruction = ("mov", (1,), 0)
+    self.assertEqual(assemble(start+[snapshot, ("st", (0,3), 0)]), _assemble(start+[("st", (0,1), 0)]))
+    # Keep snapshots across writes, loop edges and changes of active lanes.
+    for body in [[("assign", (1,0), 0)], [("range", (0,), 0), ("ilt", (4,0), 0), ("back", (4,5), 0)],
+                 [("ilt", (0,1), 0), ("cndst", (4,), 0), ("cndend", (), 0)]]:
+      ins = start+[snapshot]+body+[("st", (0,3), 0)]
+      self.assertEqual(assemble(ins), _assemble(ins))
+
   def test_default_renderer(self):
     from tinygrad.device import select_renderer
     from tinygrad.helpers import Target

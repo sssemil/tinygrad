@@ -69,9 +69,29 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
           k.apply_opt(Opt(OptOps.SPLIT, k.rngs.index(row), (row_lanes, AxisType.LOCAL)))
           k.apply_opt(Opt(OptOps.SPLIT, k.upcastable_dims(reduce=True)[-1], (4, AxisType.UPCAST)))
           return k
+    # Give each output its own workgroup when a long reduction has too few outputs to fill the cores.
+    if (red is not None and len(k.reduceops) == 1 and len(red.src) > 2 and len(outs:=k.axes_of(AxisType.GLOBAL)) == 1
+        and k.rngs[outs[0]].vmax < 64 and (inner:=red.src[-1]).src[0].op is Ops.CONST and inner.vmax >= 127):
+      if lanes:=next((n for n in range(128, 15, -1) if (inner.vmax+1)%n == 0), 0):
+        loop, _ = k.apply_opt(Opt(OptOps.SPLIT, k.rngs.index(inner), (lanes, AxisType.LOCAL)))
+        if loop in k.rngs and loop.src[0].divides(4) is not None: k.apply_opt(Opt(OptOps.SPLIT, k.rngs.index(loop), (4, AxisType.UPCAST)))
+        return k
     spatial = dot is not None and sum(1 < k.full_shape[i] <= 5 for i in k.upcastable_dims(reduce=True)) >= 2
+    local_axes = None
+    # Convolution gradients with independent channel axes reuse both operands across a tile of output elements.
+    if dot is not None and red is not None and red.dtype == dtypes.float and len(k.reduceops) == 1 and not spatial:
+      axes = [k.rngs[i] for i in k.axes_of(AxisType.GLOBAL)]
+      lhs, rhs = (x.ranges for x in dot.src)
+      left, right = [r for r in axes if r in lhs and r not in rhs], [r for r in axes if r in rhs and r not in lhs]
+      if len(axes) == len(left)+len(right) == 4 and left and right and (len(red.src) > 2 or len(left) == len(right) == 2):
+        row_axis, col_axis = (max(rs, key=lambda r:r.vmax) for rs in (right, left))
+        if min(row_axis.vmax, col_axis.vmax) >= 15 and row_axis.src[0].divides(4) is not None and col_axis.src[0].divides(2) is not None:
+          row, _ = k.apply_opt(Opt(OptOps.SPLIT, k.rngs.index(row_axis), (4, AxisType.UPCAST)))
+          k.apply_opt(Opt(OptOps.SPLIT, k.rngs.index(col_axis), (2, AxisType.UPCAST)))
+          local_axes = [row]+[k.rngs[i] for i in k.axes_of(AxisType.GLOBAL) if k.rngs[i] is not row]
+    channel_tile = local_axes is not None
     tiled = wide_cols = False
-    if dot is not None and red is not None and red.dtype == dtypes.float and len(red.src) == 2:
+    if not channel_tile and dot is not None and red is not None and red.dtype == dtypes.float and len(red.src) == 2:
       lhs, rhs = (x.ranges for x in dot.src)
       dims = [r for r in k.rngs if r.axis_type is AxisType.GLOBAL and (r.src[0].op is Ops.CONST or r.src[0].is_variable) and r.vmax+1 >= 16]
       rows, cols = [r for r in dims if r in lhs and r not in rhs], [r for r in dims if r in rhs and r not in lhs]
@@ -84,7 +104,6 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
           if r.src[0].divides(n) is not None:
             k.apply_opt(Opt(OptOps.SPLIT, k.rngs.index(r), (n, AxisType.UPCAST)))
             tiled = True
-    local_axes = None
     if spatial and dot is not None and len(k.reduceops) == 1:
       lhs, rhs = (x.ranges for x in dot.src)
       axes = [k.rngs[i] for i in k.upcastable_dims()]
@@ -107,10 +126,10 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
     # Weight gradients reduce over images and positions. Distribute channels before the small filter axes.
     filter_grad = (dot is not None and red is not None and len(k.reduceops) == 1 and len(red.src) >= 3 and
                    not spatial and sum(1 < r.vmax+1 <= 5 for r in local_axes) >= 2)
-    if filter_grad: local_axes.sort(key=lambda r: r.vmax+1 <= 5)
+    if filter_grad and not channel_tile: local_axes.sort(key=lambda r: r.vmax+1 <= 5)
     width = 128 if spatial or tiled else 64 if red is not None and len(local_axes) > 1 else 32
     # Avoid folding a small matrix into a single workgroup on the two-core S30.
-    multidim = spatial or filter_grad or (tiled and prod(r.vmax+1 for r in local_axes) >= 2*width)
+    multidim = channel_tile or spatial or filter_grad or (tiled and prod(r.vmax+1 for r in local_axes) >= 2*width)
     for r in local_axes:
       if r.src[0].op is not Ops.CONST: continue
       size = next((n for n in range(min(64, width) if spatial else width, 1, -1) if r.src[0].val%n == 0), 1)
@@ -118,6 +137,7 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
         k.apply_opt(Opt(OptOps.SPLIT, k.rngs.index(r), (size, AxisType.LOCAL)))
         width //= size
         if not multidim or width == 1 or len(k.axes_of(AxisType.LOCAL)) == 3: break
+    if channel_tile: return k
     if not spatial and not tiled and dot is not None:
       lhs, rhs = (x.ranges for x in dot.src)
       if (a:=next((i for i in k.upcastable_dims() if k.full_shape[i]%2 == 0 and (k.rngs[i] in lhs) != (k.rngs[i] in rhs)), None)) is not None:
