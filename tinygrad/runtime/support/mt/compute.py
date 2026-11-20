@@ -1,7 +1,8 @@
 from __future__ import annotations
 import os, pathlib, struct, time
 from tinygrad.runtime.autogen import mtfw
-from tinygrad.runtime.support.mt.mtdev import MTDev, MT_SOCIF_OFFSET
+from tinygrad.runtime.support.mt.mtdev import MTDev
+from tinygrad.runtime.support.memory import MMIOInterface
 from tinygrad.runtime.support.mt.mmu import MTMMU4
 
 FW_BASE, ROOT_BASE, INIT_SIZE, FW_DEVVA = 0x20000000, 0x30000000, 0x2000000, 0xe1c0000000
@@ -25,7 +26,56 @@ class MTFirmwareLayout:
     self.watchdog = self.gpu + 0x4c0
     self.ccb = FWIF_OFF + 0x40ee0
 
-class MTFirmware:
+class MTComputeRegisters:
+  dev:MTDev
+  mmu:MTMMU4
+  root_view:MMIOInterface
+  def _write(self, off:int, value:int, size:int=8) -> None: self.dev.regs._write(self.dev.socif + off, value.to_bytes(size, 'little'))
+  def _read(self, off:int, size:int=8) -> int: return int.from_bytes(self.dev.regs._read(self.dev.socif + off, size), 'little')
+
+  def _reset(self, core_offset:int=0) -> None:
+    self._write(core_offset+0xa100, 0, 4)
+    self._read(core_offset+0xa100, 4)
+    for value in [0x1249249249249249,0x36db6db6db6db6db,0x7fffffffffffffff]:
+      self._write(core_offset+0x630, value)
+      self._read(core_offset+0x630)
+    for off in [0x650,0x640]:
+      self._write(core_offset+off, 0xffffffff, 4)
+      self._read(core_offset+off, 4)
+    for value in [0x386000000800,0x3860000088f2,0x20000080f2,0x2000000000]:
+      self._write(core_offset+0x100, value)
+      self._read(core_offset+0x100)
+    for off in [0x640,0x650]:
+      self._write(core_offset+off, 0, 4)
+      self._read(core_offset+off, 4)
+    for value in [0x36db6db6db6db6db,0x1249249249249249,0]:
+      self._write(core_offset+0x630, value)
+      self._read(core_offset+0x630)
+    self._read(core_offset+0x100)
+    self._write(core_offset+0xbf8, 1, 4)
+    self._write(core_offset+0xb50, 0)
+
+  def _setup_mmu(self, core_offset:int=0) -> None:
+    self._write(core_offset+0xe140, 0, 4)
+    self._read(core_offset+0xe140, 4)
+    self._write(core_offset+0xe148, self.mmu.root_pa >> 12, 4)
+    for off,value in [(0xe350,0),(0xe358,0xfff80800),(0xe360,0),(0xe368,0xfff80000)]: self._write(core_offset+off, value)
+    self._write(core_offset+0xe328, 0x0202020202020202)
+    self._write(core_offset+0xe320, 0x78ff2)
+
+  def upload_mmu(self, full:bool=False) -> None:
+    if full:
+      self.root_view[:self.mmu.next] = self.mmu.root[:self.mmu.next]
+      self.mmu.dirty_pages.clear()
+      return
+    chunks:list[tuple[int,int]] = []
+    for off in sorted(self.mmu.dirty_pages):
+      if chunks and off == chunks[-1][1]: chunks[-1] = (chunks[-1][0],off+0x1000)
+      else: chunks.append((off,off+0x1000))
+    for start,end in chunks: self.root_view[start:end] = self.mmu.root[start:end]
+    self.mmu.dirty_pages.clear()
+
+class MTFirmware(MTComputeRegisters):
   def __init__(self, dev:MTDev, path:str|None=None, core_count:int=8, prepare:bool=True, mmu:MTMMU4|None=None, v=None):
     self.dev, self.path, self.core_count = dev, path or os.environ.get('MT_FIRMWARE', DEFAULT_FIRMWARE), core_count
     if prepare and not pathlib.Path(self.path).is_file():
@@ -80,40 +130,9 @@ class MTFirmware:
     self.v[lay.regcfg:lay.regcfg+16] = rc
     self.mmu.map_range(FW_DEVVA, FW_BASE, INIT_SIZE)
 
-  def _write(self, off:int, value:int, size:int=8) -> None: self.dev.smc._write(MT_SOCIF_OFFSET + off, value.to_bytes(size, 'little'))
-  def _read(self, off:int, size:int=8) -> int: return int.from_bytes(self.dev.smc._read(MT_SOCIF_OFFSET + off, size), 'little')
-
-  def upload_mmu(self) -> None:
-    if not self.mmu.dirty_pages: return
-    chunks:list[tuple[int,int]] = []
-    for off in sorted(self.mmu.dirty_pages):
-      if chunks and off == chunks[-1][1]: chunks[-1] = (chunks[-1][0],off+0x1000)
-      else: chunks.append((off,off+0x1000))
-    for start,end in chunks: self.root_view[start:end] = self.mmu.root[start:end]
-    self.mmu.dirty_pages.clear()
-
   def start(self, timeout:float=10.0) -> None:
     self.upload_mmu()
-    self._write(0xa100, 0, 4)
-    self._read(0xa100, 4)
-    for value in [0x1249249249249249,0x36db6db6db6db6db,0x7fffffffffffffff]:
-      self._write(0x630, value)
-      self._read(0x630)
-    for off in [0x650,0x640]:
-      self._write(off, 0xffffffff, 4)
-      self._read(off, 4)
-    for value in [0x386000000800,0x3860000088f2,0x20000080f2,0x2000000000]:
-      self._write(0x100, value)
-      self._read(0x100)
-    for off in [0x640,0x650]:
-      self._write(off, 0, 4)
-      self._read(off, 4)
-    for value in [0x36db6db6db6db6db,0x1249249249249249,0]:
-      self._write(0x630, value)
-      self._read(0x630)
-    self._read(0x100)
-    self._write(0xbf8, 1, 4)
-    self._write(0xb50, 0)
+    self._reset()
     self._write(0, 0x5545010155151101)
     self._write(0x80, 0x5554151555455555)
     self._write(0x1158, 0xff, 4)
@@ -126,12 +145,7 @@ class MTFirmware:
     self._write(0x7080, 0x1000000000000000 | FW_BASE)
     self._write(0x7048, 0x3000000000000000 | (FW_BASE + 0x100000))
     self._write(0xb50, 0)
-    self._write(0xe140, 0, 4)
-    self._read(0xe140, 4)
-    self._write(0xe148, ROOT_BASE >> 12, 4)
-    for off,value in [(0xe350,0),(0xe358,0xfff80800),(0xe360,0),(0xe368,0xfff80000)]: self._write(off, value)
-    self._write(0xe328, 0x0202020202020202)
-    self._write(0xe320, 0x78ff2)
+    self._setup_mmu()
     self._write(0, (self._read(0) & 0xfcfffffff3fffcff) | 0x100000004000100)
     self._write(0x80, (self._read(0x80) & 0xffffffffcf3fffff) | 0x10400000)
     time.sleep(3e-6)

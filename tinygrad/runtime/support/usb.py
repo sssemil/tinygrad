@@ -1,4 +1,5 @@
 import ctypes, struct, time, functools, itertools
+from collections.abc import Callable
 from typing import cast
 from tinygrad.runtime.autogen import libusb, libc
 from tinygrad.helpers import DEBUG, DEV, HCQ_RUNTIME_DEV, to_mv, mv_address, round_up, ceildiv, flatten, to_tuple
@@ -150,23 +151,33 @@ class CustomASM24Controller:
     """Streaming PCIe memory write via 0xF0 mode 1 + bulk OUT. Data is little-endian dwords on the wire."""
     if not data: return
     assert len(data) % 4 == 0, f"pcie_mem_write requires 4-byte aligned size, got {len(data)}"
-    for off in range(0, len(data), STREAM):
-      chunk = data[off:off+STREAM]
-      self._f0_out(0x60, 0x0F, address + off, len(chunk) // 4, mode=1)
-      self.usb.bulk_write(chunk)
+    if len(data) == 4 and address % 4 == 0:
+      self.pcie_request(0x40 if address < 1 << 32 else 0x60, address, int.from_bytes(data, 'little'))
+      return
+    for off, size in self._pcie_chunks(address, len(data), STREAM):
+      self._f0_out(0x40 if address+off < 1<<32 else 0x60, 0x0F, address+off, size//4, mode=1)
+      self.usb.bulk_write(data[off:off+size])
+
+  @staticmethod
+  def _pcie_chunks(address:int, nbytes:int, limit:int):
+    # A 3DW request cannot extend beyond the 32-bit address space.
+    off = 0
+    while off < nbytes:
+      size = min(limit, nbytes-off)
+      if address+off < 1<<32: size = min(size, (1<<32)-address-off)
+      yield off, size
+      off += size
 
   def pcie_mem_read(self, address:int, nbytes:int) -> memoryview:
     """Streaming PCIe memory read via 0xF0 mode 2 + bulk IN. Returns little-endian bytes."""
     assert nbytes % 4 == 0, f"pcie_mem_read requires 4-byte aligned size, got {nbytes}"
-    # The ASM24 bridge can fail bulk reads larger than 4 MiB.
-    if nbytes <= 4 * STREAM:
-      self._f0_out(0x20, 0x0F, address, nbytes // 4, mode=2)
-      return self.usb.bulk_read(nbytes, timeout=30000)
-    result = bytearray(nbytes)
-    for off in range(0,nbytes,4 * STREAM):
-      size = min(4 * STREAM,nbytes-off)
-      self._f0_out(0x20,0x0F,address+off,size//4,mode=2)
-      result[off:off+size] = self.usb.bulk_read(size,timeout=30000)
+    # Bound each bulk IN transfer through the ASM24 bridge.
+    result = bytearray()
+    for off, size in self._pcie_chunks(address, nbytes, 4*STREAM):
+      self._f0_out(0 if address+off < 1<<32 else 0x20, 0x0F, address+off, size//4, mode=2)
+      data = self.usb.bulk_read(size, timeout=30000)
+      if size == nbytes: return data
+      result.extend(data)
     return memoryview(result)
 
   def read(self, base_addr:int, length:int) -> bytes:
@@ -187,19 +198,30 @@ class CustomASM24Controller:
     self.usb.control_write(0xF2, value=len(buf_padded) // 512, index=(slot_start & 0xFF) | (ceildiv(len(buf_padded), 0x4000) << 8))
     self.usb.bulk_write(buf_padded)
 
+  def scsi_read(self, dest:memoryview, signal:Callable[[], None], timeout:int=2000):
+    if not 0 < dest.nbytes <= HALF: raise ValueError("readback must fit in the lower SRAM half")
+    wire = round_up(dest.nbytes, 512)
+    self.usb.control_write(0xf2, value=0x8000 | wire//512, index=ceildiv(wire, SLOT)<<8)
+    signal()  # the downstream GPU writes the completion entry for this transfer
+    dest[:] = self.usb.bulk_read(wire, timeout=timeout)[:dest.nbytes]
+
 class USBMMIOInterface(MMIOInterface):
   def __init__(self, usb, addr, size, fmt, pcimem=True): # pylint: disable=super-init-not-called
     self.usb, self.addr, self.nbytes, self.fmt, self.el_sz, self.pcimem = usb, addr, size, fmt, struct.calcsize(fmt), pcimem
 
   def _off_from_index(self, index):
-    if isinstance(index, slice): return ((index.start or 0) * self.el_sz, ((index.stop or len(self))-(index.start or 0)) * self.el_sz)
+    if isinstance(index, slice):
+      start, stop, step = index.indices(len(self))
+      if step != 1: raise ValueError("USB MMIO requires a contiguous slice")
+      return start*self.el_sz, max(0, stop-start)*self.el_sz
     return (index * self.el_sz, self.el_sz)
 
   def __getitem__(self, index):
     off, sz = self._off_from_index(index)
     if self.pcimem:
+      off += self.addr
       start, end = off & ~3, round_up(off+sz,4)
-      data = self.usb.pcie_mem_read(self.addr + start, end-start)
+      data = self.usb.pcie_mem_read(start, end-start)
       if start != off or end != off+sz: data = data[off-start:off-start+sz]
     else: data = self.usb.read(self.addr + off, sz)
     return (data if self.fmt == 'B' else memoryview(data).cast(self.fmt).tolist()) if isinstance(index, slice) else int.from_bytes(data, "little")
@@ -207,15 +229,19 @@ class USBMMIOInterface(MMIOInterface):
   def __setitem__(self, index, data):
     off, _ = self._off_from_index(index)
     data = struct.pack(self.fmt, data) if isinstance(data, int) else data if isinstance(data, (bytes, bytearray, memoryview)) else bytes(data)
+    if not data: return
     if not self.pcimem: self.usb.scsi_write(data) if self.addr == 0xf000 else self.usb.write(self.addr + off, data)
     else:
+      off += self.addr
       # writes are whole dwords
       if len(data) % 4 or off % 4:
         start, end = off & ~3, round_up(off+len(data),4)
-        aligned = bytearray(self.usb.pcie_mem_read(self.addr+start,end-start))
+        aligned = bytearray(end-start)
+        if off != start: aligned[:4] = self.usb.pcie_mem_read(start, 4)
+        if end != off+len(data) and (off == start or end-start > 4): aligned[-4:] = self.usb.pcie_mem_read(end-4, 4)
         aligned[off-start:off-start+len(data)] = data
         off, data = start, aligned
-      self.usb.pcie_mem_write(self.addr+off, data)
+      self.usb.pcie_mem_write(off, data)
 
   def view(self, offset:int=0, size:int|None=None, fmt=None):
     return USBMMIOInterface(self.usb, self.addr+offset, self.nbytes-offset if size is None else size, fmt=fmt or self.fmt, pcimem=self.pcimem)

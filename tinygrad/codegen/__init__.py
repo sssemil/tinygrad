@@ -7,7 +7,7 @@ from tinygrad.uop.ops import PatternMatcher, graph_rewrite, MapCtx, UOp, Ops, UP
 from tinygrad.uop.weak import pm_lower_weak, pm_commit_weak, pm_cast_const
 from tinygrad.uop.uir import render_uir
 from tinygrad.uop.spec import type_verify, spec_tensor, spec_program
-from tinygrad.renderer import Renderer, Estimates
+from tinygrad.renderer import Renderer, Estimates, RegisterAllocationError
 from tinygrad.renderer.x86 import ISARenderer, IselContext
 from tinygrad.dtype import dtypes, AddrSpace
 
@@ -525,7 +525,11 @@ def do_to_program(ast:UOp, renderer:Renderer) -> UOp:
     prg = UOp(Ops.PROGRAM, src=(full_sink,), arg=prog_info)
   else: raise RuntimeError(f"can't call to_program on {ast.op}")
   if not isinstance(prg.arg, ProgramInfo): prg = prg.replace(arg=ProgramInfo.from_sink(prg.src[0], renderer.target))
-  prg = graph_rewrite(prg, pm_to_program, ctx=renderer, name="linearize/render")
+  try: prg = graph_rewrite(prg, pm_to_program, ctx=renderer, name="linearize/render")
+  except RegisterAllocationError:
+    # An automatically unrolled kernel can exceed the hardware register file. Retry with its original loops.
+    if ast.op is not Ops.SINK or ast.arg.optimized or ast.arg.opts_to_apply is not None or ast.arg.applied_opts or NOOPT: raise
+    return do_to_program(ast.replace(arg=replace(ast.arg, opts_to_apply=())), renderer)
   if VIZ: graph_rewrite(prg, PatternMatcher([]), name="View Program")
   return prg
 
