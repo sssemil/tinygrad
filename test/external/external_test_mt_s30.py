@@ -353,7 +353,10 @@ class TestS30USB(unittest.TestCase):
     rng = np.random.default_rng(30)
     a,b,c = (rng.normal(size=257).astype(np.float16) for _ in range(3))
     with Context(DEV="MT:USC", CACHELEVEL=0):
-      x,y,z = (Tensor(v, device="MT").float() for v in (a,b,c))
+      x,y,z = (Tensor(v, device="MT") for v in (a,b,c))
+      np.testing.assert_array_equal((x*y+z).numpy(), a*b+c)
+      np.testing.assert_array_equal((x<y).numpy(), a<b)
+      x,y,z = x.float(), y.float(), z.float()
       af,bf,cf = (v.astype(np.float32) for v in (a,b,c))
       np.testing.assert_array_equal((x*y+z).numpy(), af*bf+cf)
       np.testing.assert_array_equal((x*y+0.25).numpy(), af*bf+0.25)
@@ -388,6 +391,10 @@ class TestS30USB(unittest.TestCase):
         x,y = Tensor(a, device="MT"), Tensor(b, device="MT")
         np.testing.assert_array_equal((((x*y)>>y) ^ (x<<y)).numpy(), ((a*b)>>b) ^ (a<<b))
         np.testing.assert_array_equal(x.float().numpy(), a.astype(np.float32))
+      # Long arithmetic decomposes into word operations before multiply-add fusion.
+      a,b,c = (rng.integers(-(1<<40), 1<<40, 255, dtype=np.int64) for _ in range(3))
+      x,y,z = (Tensor(v, device="MT") for v in (a,b,c))
+      np.testing.assert_array_equal((x*y+z).numpy(), a*b+c)
 
   def test_batched_matmul(self):
     import numpy as np

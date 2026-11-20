@@ -1,8 +1,10 @@
 import struct
-from collections import Counter, defaultdict
+from collections import defaultdict
+from tinygrad.codegen.decomp.op import get_late_rewrite_patterns
 from tinygrad.dtype import AddrSpace, DType, dtypes
 from tinygrad.helpers import Target
 from tinygrad.renderer import Compiler, RegisterAllocationError, Renderer
+from tinygrad.renderer.cstyle import create_non_native_float_pats
 from tinygrad.uop.ops import Ops, PatternMatcher, UOp, UPat
 
 def _field(value:int, bits:tuple[int, ...]) -> int:
@@ -374,7 +376,9 @@ class USCCompiler(Compiler):
 
 class MTUSCRenderer(Renderer):
   compiler = USCCompiler()
-  extra_matcher = PatternMatcher([(UPat(Ops.TRUNC, (dtypes.float, dtypes.half), src=(UPat.var("x"),)), _trunc)])
+  # Fuse after dtype decomposition so emulated 64-bit arithmetic is lowered first.
+  extra_matcher = PatternMatcher([(UPat(Ops.TRUNC, (dtypes.float, dtypes.half), src=(UPat.var("x"),)), _trunc)]) + \
+    create_non_native_float_pats((dtypes.half,), casting=False) + get_late_rewrite_patterns((Ops.MULACC,), False)
   supports_float4 = False
   shared_max = 2048  # bytes guaranteed even for narrow elements, each occupying one local dword
   global_max, local_max = (0x7fffffff,65535,65535), (1024,1024,64)
@@ -385,16 +389,6 @@ class MTUSCRenderer(Renderer):
   def supported_dtypes(self):
     return {dtypes.float, dtypes.half, dtypes.int, dtypes.uint, dtypes.short, dtypes.ushort, dtypes.char, dtypes.uchar, dtypes.bool}
   def render(self, uops:list[UOp]) -> str:
-    uses = Counter(x for u in uops for x in u.src)
-    fused:dict[UOp,tuple[UOp,UOp]] = {}
-    muls:set[UOp] = set()
-    for u in uops:
-      if u.op in (Ops.RANGE, Ops.END): muls.clear()
-      if u.op is Ops.MUL and uses[u] == 1 and u.dtype in (dtypes.float, dtypes.int, dtypes.uint): muls.add(u)
-      if u.op is Ops.ADD:
-        if u.src[0] in muls: fused[u] = (u.src[0],u.src[1])
-        elif u.src[1] in muls: fused[u] = (u.src[1],u.src[0])
-    products = {a for a,_ in fused.values()}
     has_loop = any(u.op is Ops.RANGE for u in uops)
     supported = self.supported_dtypes()
     params = sorted((u for u in uops if u.op is Ops.PARAM), key=lambda u:u.arg.slot)
@@ -520,7 +514,6 @@ class MTUSCRenderer(Renderer):
         a,b = (reg(x) for x in u.src)
         dt = u.src[0].dtype
         if dtypes.is_float(dt):
-          if dt == dtypes.half: a,b = emit("half_to_float", a), emit("half_to_float", b)
           r = emit("ilt", literal(0), emit("feq", a, b) if u.op is Ops.CMPEQ else emit("fgt", b, a))
         else:
           if dt == dtypes.uint and u.op is Ops.CMPLT: a,b = emit("iadd", a, literal(1<<31)), emit("iadd", b, literal(1<<31))
@@ -529,22 +522,15 @@ class MTUSCRenderer(Renderer):
       elif u.op is Ops.WHERE:
         cond, t, f = (reg(x) for x in u.src)
         r = select(cond, t, f)
-      elif u in fused:
-        mul, acc = fused[u]
-        r = emit("fma" if u.dtype == dtypes.float else "imad", *(reg(x) for x in (*mul.src,acc)))
+      elif u.op is Ops.MULACC:
+        r = narrow(emit("fma" if u.dtype == dtypes.float else "imad", *(reg(x) for x in u.src)), u.dtype)
       elif u.op in (Ops.ADD, Ops.MUL, Ops.MAX) and u.dtype != dtypes.bool:
         a,b = (reg(x) for x in u.src)
-        if u.dtype == dtypes.half: a,b = emit("half_to_float", a), emit("half_to_float", b)
         if u.op is Ops.MAX and u.dtype == dtypes.uint:
           test = emit("ilt", emit("iadd", a, literal(1<<31)), emit("iadd", b, literal(1<<31)))
           r = emit("select", test, b, a)
         else: r = narrow(emit(("f" if dtypes.is_float(u.dtype) else "i")+u.op.name.lower(), a, b), u.dtype)
-        if u.dtype == dtypes.half: r = emit("float_to_half", r)
-      elif u.op in (Ops.RECIP, Ops.SQRT, Ops.LOG2, Ops.EXP2) and u.dtype in (dtypes.half, dtypes.float):
-        a = reg(u.src[0])
-        if u.dtype == dtypes.half: a = emit("half_to_float", a)
-        r = emit(u.op.name.lower(), a)
-        if u.dtype == dtypes.half: r = emit("float_to_half", r)
+      elif u.op in (Ops.RECIP, Ops.SQRT, Ops.LOG2, Ops.EXP2): r = emit(u.op.name.lower(), reg(u.src[0]))
       elif u.op is Ops.SHL: r = narrow(emit("lsl", *(reg(x) for x in u.src)), u.dtype)
       elif u.op is Ops.SHR: r = emit("lsr" if u.src[0].vmin >= 0 else "asr", *(reg(x) for x in u.src))
       elif u.op in (Ops.TRUNCDIV, Ops.TRUNCMOD) and u.dtype in (dtypes.int, dtypes.uint):
@@ -619,9 +605,9 @@ class MTUSCRenderer(Renderer):
           emit(store, addr, value, imm=ptr)
           if gate is not None: emit("cndend")
       # Respect the scheduler's placement of invariant address arithmetic before nested reductions.
-      elif has_loop and u not in products and u.op in (Ops.SPECIAL, Ops.TRUNCDIV, Ops.TRUNCMOD, Ops.CMPLT, Ops.CMPEQ,
-                                                       Ops.AND, Ops.OR, Ops.XOR, *self.code_for_op): reg(u)
-      elif u.op not in (Ops.PARAM, Ops.BUFFER, Ops.CONST, Ops.CAST, Ops.INDEX, Ops.SPECIAL, Ops.CMPEQ, Ops.CMPLT, Ops.WHERE,
+      elif has_loop and u.op in (Ops.SPECIAL, Ops.MULACC, Ops.TRUNCDIV, Ops.TRUNCMOD, Ops.CMPLT, Ops.CMPEQ,
+                                  Ops.AND, Ops.OR, Ops.XOR, *self.code_for_op): reg(u)
+      elif u.op not in (Ops.PARAM, Ops.BUFFER, Ops.CONST, Ops.CAST, Ops.INDEX, Ops.SPECIAL, Ops.MULACC, Ops.CMPEQ, Ops.CMPLT, Ops.WHERE,
                         Ops.AND, Ops.OR, Ops.XOR, Ops.BITCAST, Ops.TRUNCDIV, Ops.TRUNCMOD, Ops.STACK, Ops.SHRINK, Ops.AFTER, Ops.SINK,
                         *self.code_for_op):
         raise NotImplementedError(f"S30 USC cannot lower {u.op}")

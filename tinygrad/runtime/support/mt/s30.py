@@ -1,5 +1,5 @@
 from __future__ import annotations
-import functools, struct, threading, time
+import functools, shutil, struct, threading, time
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager, ExitStack
 from decimal import Decimal
@@ -11,7 +11,7 @@ from tinygrad.helpers import PROFILE, ProfileRangeEvent, ceildiv, getenv, perf_c
 from tinygrad.renderer import TinyELF
 from tinygrad.uop.ops import UOp, KernelInfo
 from tinygrad.runtime.support.mt.compute import MTComputeRegisters, FW_BASE, FW_DEVVA, ROOT_BASE
-from tinygrad.runtime.support.mt.meta import MetaPort, assemble, use_meta
+from tinygrad.runtime.support.mt.meta import META_AS, MetaPort, assemble
 from tinygrad.runtime.support.mt.mmu import MTMMU4, MT_PAGE_SIZE, MT_PTE_READ_ONLY, MT_PTE_READ_WRITE
 from tinygrad.runtime.support.mt.mtdev import MT_BUFFER_PA, MT_BUFFER_VA, MT_CORE_STRIDE, MTDev
 from tinygrad.runtime.support.system import USBPCIDevice
@@ -37,7 +37,7 @@ class MTS30Firmware(MTComputeRegisters):
     self.root_view = dev.pci_dev.map_bar(2, off=ROOT_BASE, size=len(self.mmu.root), fmt="B")
     self.bridge = pci.usb if isinstance(pci:=dev.pci_dev, USBPCIDevice) and pci.usb.usb.product.startswith("custom") else None
     self.ring_va = S30_STAGE_VA+S30_RING_OFFSET-HALF if self.bridge is not None else FW_DEVVA+DIRECT_CDM
-    self.meta_enabled = self.bridge is not None and use_meta()
+    self.meta_enabled = self.bridge is not None and bool(getenv("MT_META", int(shutil.which(META_AS) is not None)))
     if getenv("MT_META") == 1 and not self.meta_enabled:
       raise RuntimeError("MT_META=1 requires native USC and the Chestnut SRAM transport")
     if self.meta_enabled:
@@ -233,8 +233,8 @@ class MTS30Firmware(MTComputeRegisters):
     else: unwrap(self.bridge).scsi_read(readback, self.start_direct)
     return self.wait_direct(timeout)
 
-def s30_dispatch(pds_off:int, shared:int, attrs:int) -> tuple[int, ...]:
-  return (2, pds_off | 2, pds_off+16, 0, 0, 0, 0x02000000 | shared, 0, 0x100085 | attrs<<12, pds_off+32, pds_off+64)
+def s30_dispatch(pds_off:int, shared:int) -> tuple[int, ...]:
+  return (2, pds_off | 2, pds_off+16, 0, 0, 0, 0x02000000 | shared, 0, 0x101085, pds_off+32, pds_off+64)
 
 def s30_read_signal() -> UOp:
   cq = UOp.placeholder((4,), dtypes.uint, slot=0)
@@ -270,13 +270,6 @@ def s30_direct_stream(dispatches:tuple[tuple[int,...],...], groups:tuple[int,int
     secondary = dispatches[1]+s30_grid(other, local, shared)
   return params+second_params, s30_cdm_stream(dispatches[0]+s30_grid(primary, local, shared), secondary)
 
-def s30_shader(obj:TinyELF) -> tuple[bytes, bytearray, int, int, int, list[tuple[int,str]], int]:
-  if obj.target.renderer != "USC": raise ValueError("S30 requires native USC code")
-  ntemps, local_words, nconst, split = struct.unpack_from('<HHHBx', obj.lib)
-  native_args = [(8*i, '<i' if space is AddrSpace.ALU else '<Q') for i,(_,space,_,_) in enumerate(obj.signature)]
-  off = 8+4*nconst
-  return obj.lib[off:], bytearray(8*len(native_args))+obj.lib[8:off], ceildiv(ntemps, 2), 1, local_words, native_args, split
-
 def s30_pds(params:int, shared:int, usc:int, temps:int, local:bool=False) -> bytearray:
   # DOUT encodes a 64-bit source pair, a 32-bit control word and a destination (DMA, register write, USC).
   def dout(dest:int, pair:int, ctrl:int=0, *, end:bool=False, pred:bool=False) -> int:
@@ -303,50 +296,32 @@ def s30_pds(params:int, shared:int, usc:int, temps:int, local:bool=False) -> byt
 class MTS30Program(Program['MTDevice']):
   def __init__(self, dev:MTDevice, obj:TinyELF, links:dict):
     self.dev, self.name, self.profile_key = dev, obj.name, obj.profile_key
-    text, params, temps, attrs, local_words, self.args, self.split = s30_shader(obj)
-    shared = len(params)//4
-    # Rogue USC prefetches one more instruction (up to 32 bytes), even when the shader ends at a page boundary.
-    code = text + bytes(32)
-    # One transfer updates the parameters immediately before the ring controls and the dispatch stream.
-    stride = round_up(len(params), 32)
-    param_size = stride*(1+bool(self.split))
-    if param_size > DIRECT_CDM: raise ValueError("S30 parameters exceed the direct ring allocation")
-    self.param_offset = DIRECT_CDM - param_size
+    if obj.target.renderer != "USC": raise ValueError("S30 requires native USC code")
+    temps, local_words, nconst, self.split = struct.unpack_from('<HHHBx', obj.lib)
+    self.args = [(8*i, '<i' if space is AddrSpace.ALU else '<Q') for i,(_,space,_,_) in enumerate(obj.signature)]
+    params = bytearray(8*len(self.args)) + obj.lib[8:8+4*nconst]
+    stride, shared = round_up(len(params), 32), len(params)//4
+    self.launch = params.ljust(stride, b'\0')
+    self.param_offset = DIRECT_CDM-stride*(1+bool(self.split))
+    if self.param_offset < 0: raise ValueError("S30 parameters exceed the direct ring allocation")
+
     fw = dev.s30_fw
-    if fw.meta_enabled:
-      # USC and its immutable PDS loader share a single upload and allocation.
-      pds_offset = round_up(len(code), 32)
-      self.code = Buffer(dev.device, pds_offset+96, preallocate=True)
-      usc_off = self.code.meta.va & 0xffffffff
-      pds = s30_pds(0, shared, usc_off, temps, bool(local_words))
-      self.code.host[:] = code.ljust(pds_offset, b'\0')+pds
-      with fw.lock:
-        fw.mmu.map_range(USC_BASE+usc_off, self.code.meta.pa, self.code.meta.size, MT_PTE_READ_ONLY)
-        page = pds_offset & -MT_PAGE_SIZE
-        fw.mmu.map_range(PDS_BASE+usc_off+page, self.code.meta.pa+page, self.code.meta.size-page, MT_PTE_READ_ONLY)
-      self.meta_dma = pds[:16]
-      self.meta_dispatch = s30_dispatch(usc_off+pds_offset, ceildiv(shared, 16), attrs)
-      self.shared = ceildiv(shared, 16)+ceildiv(local_words, 16)
-      self.launch = params.ljust(stride, b'\0')
-      return
-    self.code = Buffer(dev.device, len(code), initial_value=code)
-    usc_off = self.code.meta.va & 0xffffffff
-    with fw.lock: fw.mmu.map_range(USC_BASE+usc_off, self.code.meta.pa, self.code.meta.size, MT_PTE_READ_ONLY)
-    packet_size = 96*(1+bool(self.split))
-    self.packet = Buffer(dev.device, packet_size, preallocate=True)
-    pds_off = self.packet.meta.va & 0xffffffff
-    params_base = fw.ring_va-DIRECT_CDM
-    pds = s30_pds(params_base+self.param_offset, shared, usc_off, temps, bool(local_words))
-    with fw.lock: fw.mmu.map_range(PDS_BASE+pds_off, self.packet.meta.pa, self.packet.meta.size, MT_PTE_READ_ONLY)
-    self.shared = ceildiv(shared, 16)
-    dispatch = s30_dispatch(pds_off, self.shared, attrs)
-    self.dispatches = (dispatch, s30_dispatch(pds_off+96, self.shared, attrs)) if self.split else (dispatch,)
-    self.shared += ceildiv(local_words, 16)
-    self.packet.host[:len(pds)] = pds
-    if self.split:
-      self.packet.host[96:192] = s30_pds(params_base+self.param_offset+stride, shared, usc_off, temps, bool(local_words))
-    self.launch = bytearray(stride)
-    self.launch[:len(params)] = params
+    # Both modes share one allocation for USC and its PDS loader, with a USC prefetch guard before PDS.
+    text = obj.lib[8+4*nconst:]
+    pds_offset = round_up(len(text)+32, 32)
+    count = 2 if self.split and not fw.meta_enabled else 1
+    self.code = Buffer(dev.device, pds_offset+96*count, preallocate=True)
+    usc = self.code.meta.va & 0xffffffff
+    params_va = 0 if fw.meta_enabled else fw.ring_va-DIRECT_CDM+self.param_offset
+    pds = b"".join(s30_pds(params_va+i*stride, shared, usc, ceildiv(temps, 2), bool(local_words)) for i in range(count))
+    self.code.host[:] = text.ljust(pds_offset, b'\0')+pds
+    with fw.lock:
+      fw.mmu.map_range(USC_BASE+usc, self.code.meta.pa, self.code.meta.size, MT_PTE_READ_ONLY)
+      page = pds_offset & -MT_PAGE_SIZE
+      fw.mmu.map_range(PDS_BASE+usc+page, self.code.meta.pa+page, self.code.meta.size-page, MT_PTE_READ_ONLY)
+    self.meta_dma = pds[:16]
+    self.dispatches = tuple(s30_dispatch(usc+pds_offset+96*i, ceildiv(shared, 16)) for i in range(count))
+    self.shared = ceildiv(shared, 16)+ceildiv(local_words, 16)
 
   def enqueue_meta(self, fw:MTS30Firmware, groups:tuple[int,int,int], local:tuple[int,int,int], upload:bytes=b"") -> None:
     nprog = 1+bool(self.split)
@@ -355,7 +330,7 @@ class MTS30Program(Program['MTDevice']):
     off = len(fw.meta_data)
     base = FW_DEVVA+META_BATCH+off
     pds = META_BATCH_PDS+off+32
-    dispatches = tuple((2, (pds+16*i)|2, *self.meta_dispatch[2:]) for i in range(nprog))
+    dispatches = tuple((2, (pds+16*i)|2, *self.dispatches[0][2:]) for i in range(nprog))
     params, stream = s30_direct_stream(dispatches, groups, local, self.shared, self.split, self.launch, 8*len(self.args))
     size = round_up(controls+len(stream), 256)
     stride = round_up(size+len(upload), 256)
