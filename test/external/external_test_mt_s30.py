@@ -281,6 +281,32 @@ class TestS30USB(unittest.TestCase):
         dev.runtime(obj)(dst.meta.va, lhs.meta.va+4, rhs.meta.va, global_size=(2,1,1), local_size=(32,1,1), wait=True)
         np.testing.assert_array_equal(np.frombuffer(dst.as_memoryview(), np.float32), expected)
 
+  def test_native_unaligned_burst_load(self):
+    import numpy as np
+    from dataclasses import replace
+    from unittest.mock import patch
+    from tinygrad.renderer.usc import _assemble
+    from tinygrad.uop.ops import Ops
+    dev = Device["MT"]
+    rng = np.random.default_rng(31)
+    for width in (4, 8):
+      n = 256
+      src = rng.integers(0, 2**32, n*(width+1), dtype=np.uint32)
+      x, out = (UOp.placeholder((size,), dtypes.uint, slot=slot) for size,slot in ((src.size,1),(n*width,0)))
+      i = UOp.special(n//32, "gidx0")*32+UOp.special(32, "lidx0")
+      stores = [out[i*width+j].store(x[i*(width+1)+width-j]) for j in range(width)]
+      prg = to_program(UOp.sink(*stores, arg=KernelInfo(name="reverse_burst", optimized=True)), dev.renderer)
+      self.assertTrue(any(u.op is Ops.LOAD and u.shape == (width,) for u in prg.src[1].src))
+      obj = TinyELF.from_program(prg)
+      with patch("tinygrad.renderer.usc._assemble", side_effect=lambda ins: None if any(op.startswith("ldx") for op,_,_ in ins) else _assemble(ins)):
+        scalar = bytes.fromhex(dev.renderer.render(list(prg.src[1].src)))
+      self.assertNotEqual(obj.lib, scalar)
+      buf = Buffer("MT", src.nbytes, initial_value=src.tobytes())
+      for lib in (obj.lib, scalar):
+        dst = Buffer("MT", n*width*4, initial_value=bytes(n*width*4))
+        dev.runtime(replace(obj, lib=lib))(dst.meta.va, buf.meta.va, global_size=(n//32,1,1), local_size=(32,1,1), wait=True)
+        np.testing.assert_array_equal(np.frombuffer(dst.as_memoryview(), np.uint32).reshape(n,width), src.reshape(n,width+1)[:,width:0:-1])
+
   def test_native_conv2d(self):
     import numpy as np
     rng = np.random.default_rng(30)

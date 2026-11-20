@@ -12,6 +12,7 @@ def _field(value:int, bits:tuple[int, ...]) -> int:
 # Sources are instruction indices. A complemented index selects a shared register directly on these arithmetic operands.
 shared_bits:dict[str,tuple[int|None,...]] = {"iadd":(28,20), "imul":(28,None), "imad":(28,None,20), "fmul":(15,43), "fma":(15,43,35)}
 half_bits = {"fmul":(9,10), "fadd":(9,26), "fma":(9,10,26)}
+burst_width = {"ldx4":4, "ldx8":8}
 Instruction = tuple[str, tuple[int, ...], int]
 
 def _reorder(ins:list[Instruction], order:list[int]) -> list[Instruction]:
@@ -162,11 +163,35 @@ def _burst_dots(ins:list[Instruction], constants:list[int], shared_base:int) -> 
   if (ret:=_assemble(out)) is not None and 8 not in constants: constants.append(8)
   return ret
 
+def _scalarize_loads(ins:list[Instruction], constants:list[int], shared_base:int) -> list[Instruction]:
+  # Scalar loads can use disjoint temporaries when a contiguous register block does not fit.
+  out:list[Instruction] = []
+  remap:dict[int,int] = {}
+  for i,(op,src,imm) in enumerate(ins):
+    if op == "component": continue
+    args = tuple(remap[v] if v >= 0 else v for v in src)
+    if op in burst_width:
+      for j in range(burst_width[op]):
+        addr, = args
+        if j:
+          if 4*j not in constants: constants.append(4*j)
+          out.append(("imm", (), shared_base+constants.index(4*j)))
+          out.append(("iadd", (addr,len(out)-1), 0))
+          addr = len(out)-1
+        remap[i+j] = len(out)
+        out.append(("ld", (addr,), imm))
+    else:
+      remap[i] = len(out)
+      out.append((op,args,imm))
+  return out
+
 def assemble(ins:list[Instruction], constants:list[int]|None=None, shared_base:int=0) -> tuple[bytes, int]:
   ins = _forward_slot_reads(ins)
   if constants is not None and (ret:=_burst_dots(ins, constants, shared_base)) is not None: return ret
   if (ret:=_assemble(ins) or _assemble(_delay_loads(ins)) or _assemble(_rematerialize_inputs(ins))) is not None: return ret
   if (ret:=_assemble(_schedule_fmas(ins))) is not None: return ret
+  if constants is not None and any(op in burst_width for op,_,_ in ins):
+    return assemble(_scalarize_loads(ins, constants, shared_base), constants, shared_base)
   raise RegisterAllocationError("S30 USC needs more than 64 live temporaries")
 
 def _assemble(ins:list[Instruction]) -> tuple[bytes, int]|None:
@@ -194,11 +219,11 @@ def _assemble(ins:list[Instruction]) -> tuple[bytes, int]|None:
   pending:int|None = None
   for i,(op,src,_) in enumerate(ins):
     if pending is not None:
-      loaded = range(pending, pending+(8 if ins[pending][0] == "ldx8" else 1))
-      if any(v in loaded for v in src) or op not in ("ld", "ldx8", "component", "ld8", "ld16", "imm", "imul", "imad", "iadd", "lsr", "lsl", "asr",
-                                                     "and", "or", "xor", "group", "lane"): pending = None
-    if op in ("ld", "ldx8", "ld8", "ld16"):
-      if pending is not None and last.get(pending, pending) > i:
+      loaded = range(pending, pending+burst_width.get(ins[pending][0], 1))
+      if any(v in loaded for v in src) or op not in ("ld", "ldx4", "ldx8", "component", "ld8", "ld16", "imm", "imul", "imad", "iadd", "lsr", "lsl",
+                                                     "asr", "and", "or", "xor", "group", "lane"): pending = None
+    if op in ("ld", "ldx4", "ldx8", "ld8", "ld16"):
+      if pending is not None and all(last.get(v, -1) > i for v in loaded):
         first.add(pending)
         second.add(i)
         for v in ins[pending][1]: last[v] = max(last[v], i)
@@ -217,13 +242,15 @@ def _assemble(ins:list[Instruction]) -> tuple[bytes, int]|None:
     for v in expires[i]:
       if v not in targets: free.add(regs.pop(v))
     if op == "assign" and src[1] in targets: continue
-    if op == "ldx8":
+    if op in burst_width:
+      width = burst_width[op]
       # The burst writes an aligned register block. Each component has its own last use.
-      if (dst:=next((r for r in range(0,64,8) if all(r+j in free for j in range(8))), -1)) < 0: return None
-      for j in range(8):
-        free.remove(dst+j)
-        regs[i+j] = dst+j
-      peak = max(peak, dst+8)
+      if (dst:=next((r for r in range(0,64,width) if all(r+j in free for j in range(width))), -1)) < 0: return None
+      for j in range(width):
+        if i+j in last:
+          free.remove(dst+j)
+          regs[i+j] = dst+j
+      peak = max(peak, dst+width)
     elif i in targets: dst = regs[targets[i]]
     elif op not in ("st", "st8", "st16", "assign", "back", "cndst", "cndend", "lmst", "barrier"):
       if not free: return None
@@ -303,13 +330,13 @@ def _assemble(ins:list[Instruction]) -> tuple[bytes, int]|None:
       word |= _field(dest,(9,10,23,24,47,56,59,61)) | _field(source,(18,22,21,25,39,50,58,60)) | _field(operands[0],(27,26,28,32,34,38,40,46))
       wait, signal = (20,29), None
     elif op == "barrier": word, wait, signal = 0x8a355ce8, (9,26), None  # increment LM4, wait for all tasks, reinitialize
-    elif op in ("ld", "ldx8", "ld8", "ld16", "st", "st8", "st16"):
+    elif op in ("ld", "ldx4", "ldx8", "ld8", "ld16", "st", "st8", "st16"):
       addr = _field(imm,(45,17,22,30,36)) | _field(operands[0],(20,14,26,27,34,40))  # [shared pointer pair + byte offset in rN]
       if op.startswith("ld"): word, signal = 0xc00004000001858e | addr | _field(dst,(29,35,37,41,47,53)), None
       else: word, signal = 0xc000008000012a4e | addr | _field(operands[1],(25,23,28,32,38,44)), 15
       if i in first: word ^= 1<<42  # set dfc0 and continue
       if i in second: word ^= 1<<15 | 1<<21 | 1<<46  # set dfc1 and wait for dfc0 and dfc1
-      if op == "ldx8": word ^= (1<<16) | (1<<56)  # eight consecutive dwords
+      if op in burst_width: word ^= (1<<16) | (1<<(49 if op == "ldx4" else 56))
       if op.endswith("16"): word ^= 0x0004000000010000
       if op in ("ld8", "st8"): word ^= 0x0010000000010000
       wait = (18,19)
@@ -466,6 +493,8 @@ class MTUSCRenderer(Renderer):
       elif u.op is Ops.SPECIAL and u.arg in ("lidx1", "lidx2"):
         yz = emit("lane", imm=1)
         r = emit("and", yz, literal(0xffff)) if u.arg == "lidx1" else emit("lsr", yz, literal(16))
+      elif u.op is Ops.INDEX and u.src[0].op is Ops.LOAD and u.src[0].shape and u.src[1].vmin == u.src[1].vmax:
+        r = regs[u.src[0]]+int(u.src[1].vmin)
       elif u.op is Ops.AFTER: r = reg(u.src[0])
       elif u.op is Ops.PARAM and u.addrspace is AddrSpace.ALU: r = emit("imm", imm=ptrs[u])
       elif u.op is Ops.CONST or (u.op is Ops.CAST and u.src[0].op is Ops.CONST):
@@ -544,6 +573,14 @@ class MTUSCRenderer(Renderer):
         emit("back", counter, pred)
       elif u.op in (Ops.LOAD, Ops.STORE):
         idx = u.src[0]
+        if u.op is Ops.LOAD and idx.op is Ops.SHRINK and len(u.src) == 1:
+          buf, index, size = idx.src
+          width, ptr = int(size.vmin), ptrs[buf.without_after]
+          if width not in (4,8) or buf.dtype.itemsize != 4: raise NotImplementedError("S30 USC requires 4 or 8 dwords per burst")
+          addr = emit("imul", reg(index), literal(4))
+          regs[u] = emit(f"ldx{width}", addr, imm=ptr)
+          for i in range(1,width): emit("component", imm=i)
+          continue
         if (len(u.src) not in ((1,3) if u.op is Ops.LOAD else (2,)) or idx.op is not Ops.INDEX or len(idx.src) != 2 or
             idx._shape != () or idx.dtype != idx.src[0].dtype):
           raise NotImplementedError("S30 USC requires a scalar buffer access")
@@ -585,9 +622,10 @@ class MTUSCRenderer(Renderer):
       elif has_loop and u not in products and u.op in (Ops.SPECIAL, Ops.TRUNCDIV, Ops.TRUNCMOD, Ops.CMPLT, Ops.CMPEQ,
                                                        Ops.AND, Ops.OR, Ops.XOR, *self.code_for_op): reg(u)
       elif u.op not in (Ops.PARAM, Ops.BUFFER, Ops.CONST, Ops.CAST, Ops.INDEX, Ops.SPECIAL, Ops.CMPEQ, Ops.CMPLT, Ops.WHERE,
-                        Ops.AND, Ops.OR, Ops.XOR, Ops.BITCAST, Ops.TRUNCDIV, Ops.TRUNCMOD, *self.code_for_op, Ops.STACK, Ops.AFTER, Ops.SINK):
+                        Ops.AND, Ops.OR, Ops.XOR, Ops.BITCAST, Ops.TRUNCDIV, Ops.TRUNCMOD, Ops.STACK, Ops.SHRINK, Ops.AFTER, Ops.SINK,
+                        *self.code_for_op):
         raise NotImplementedError(f"S30 USC cannot lower {u.op}")
-    code, temps = assemble(ins, constants if has_loop else None, 2*len(params)+int(bool(split)))
+    code, temps = assemble(ins, constants, 2*len(params)+int(bool(split)))
     # Shared registers hold pointer pairs followed by the shader's literal words.
     if split: constants.insert(0, 0)
     return (struct.pack(f'<HHHBx{len(constants)}I', temps, local_words, len(constants), split, *constants) + code).hex()
