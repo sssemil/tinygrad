@@ -685,3 +685,21 @@ The threshold changed none of the launch dimensions of the 165 archived ordinary
 The bridge exposes 28 GPIO pin levels at XDATA 0xc650–0xc653. In three slot cycles, 10,507–10,904 USB reads per 450 ms stage returned the same value within each stage. With the slot off the pins read 0xe3f1f97. Raising the slot rail changed bit 13, giving 0xe3f3f97. Releasing the bridge PERST control with the lane disabled produced the same value. After normal link training the pins read 0xe3f7e97. The two further changed bits, 8 and 14, are the bridge green and blue LED lines. The rail-correlated bit supplies a candidate timing reference for a physical capture. These sampled levels do not identify downstream instruction or storage traffic. [Bridge GPIO definitions](https://github.com/tinygrad/asm2464pd-firmware/blob/ed4e39b7e0794e19ba193477067c48757a5cf9ef/handmade/src/gpio.h)
 
 The staged power tracer now prints the pin levels alongside the reset control, PCIe training state and measured power. A fourth slot cycle with a 0.5 s hold reproduced all four readings. Five isolated MNIST batches then matched the reference on the restored link.
+
+## November 20, 2026 — train MNIST from random weights in the native sandbox
+
+The training benchmark mounts the four MNIST dataset files. It takes no checkpoint. The existing four-convolution model initializes its weights on the S30 with tinygrad seed 30. A host NumPy generator with seed 30 selects the same batches of 32 for each backend. The S30 runs forward, backward, BatchNorm updates, Adam and inference. Scoring covers all 10,000 test images. A preliminary native run scored 9,476 after 100 updates and 9,687 after 200. A fresh run of the committed benchmark reproduced the 200-update score, using 102 distinct USC programs emitted during the process.
+
+| 200 Adam updates on the same S30 | Native USC | MUSA |
+| --- | ---: | ---: |
+| Correct test digits | 9,687 / 10,000 | 9,691 / 10,000 |
+| Time for 200 updates, including first-step compilation | 172.21 s | 89.17 s |
+| Median update after the first two | 845.33 ms | 276.41 ms |
+
+The update timer includes selecting and transferring the batch, running the optimizer and reading its loss. It excludes evaluation. Warm training takes 3.06× as long on the native renderer for this model and batch size. Both processes began with compiler caching disabled. As in the inference runs, the card retained its factory boot storage.
+
+From the workspace, the native command uses the installed model environment and an empty sandbox cache.
+
+```sh
+PYTHON="$PWD/.s30-tools/whisper-venv/bin/python" tinygrad/extra/usbgpu/s30/bench_isolated.sh train-mnist
+```

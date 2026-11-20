@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Offline S30 inference on a merged-/usr Linux host with open-source system libraries.
 set -eu
-if [[ ${1:-} == sram-mnist ]]; then
+if [[ ${1:-} == train-mnist ]]; then
+  if [[ $# != 1 ]]; then echo "usage: $0 train-mnist" >&2; exit 2; fi
+elif [[ ${1:-} == sram-mnist ]]; then
   if [[ $# != 2 && ( $# != 4 || $3 != --index ) ]]; then echo "usage: $0 sram-mnist WEIGHTS [--index N]" >&2; exit 2; fi
 elif [[ ${1:-} == sram-generate ]]; then
   if [[ $# != 2 && ( $# != 4 || $3 != --prompt ) ]]; then echo "usage: $0 sram-generate WEIGHTS [--prompt TEXT]" >&2; exit 2; fi
@@ -11,7 +13,6 @@ elif [[ $# != 2 && ( $# != 3 || ${3:-} != --check-reference ) ]]; then
   echo "usage: $0 {mnist|whisper|qwen} INPUT [--check-reference]" >&2; exit 2
 fi
 repo=$(cd "$(dirname "$0")/../../.." && pwd)
-input=$(realpath "$2")
 python=${PYTHON:-python}
 venv=$("$python" -c 'import sys; assert sys.prefix != sys.base_prefix, "activate the model virtualenv"; print(sys.prefix)')
 base=$("$python" -c 'import sys; print(sys.base_prefix)')
@@ -30,17 +31,18 @@ opts=(--die-with-parent --unshare-net --unshare-pid --clearenv
   --proc /proc --dev /dev --ro-bind /sys /sys --dev-bind "$node" "$node" --tmpfs /tmp --bind "$lock" "/tmp/$name"
   --ro-bind "$venv" /venv --ro-bind "$repo/tinygrad" /src/tinygrad --ro-bind "$repo/examples" /src/examples
   --ro-bind "$repo/extra/usbgpu/bench_s30.py" /src/extra/usbgpu/bench_s30.py --ro-bind "$repo/extra/usbgpu/s30/verify_native.py" /src/extra/usbgpu/s30/verify_native.py
-  --ro-bind "$input" /input
   --setenv HOME /home/bench --setenv PATH /venv/bin:/usr/bin --setenv PYTHONPATH /src
   --setenv PYTHONPYCACHEPREFIX /tmp/pycache --setenv PYTHONDONTWRITEBYTECODE 1 --setenv NUMBA_CACHE_DIR /tmp/numba --setenv CACHELEVEL 0 --setenv DEV MT:USC
   --setenv BEAM "${BEAM:-0}" --setenv PARALLEL 0 --setenv MUSA_PATH /nonexistent --setenv MT_FIRMWARE /nonexistent --chdir /src)
+args=("$@")
+if [[ $1 != train-mnist ]]; then opts+=(--ro-bind "$(realpath "$2")" /input); args[1]=/input; fi
 if [[ $base == /usr/local ]]; then
   stdlib=$("$python" -c 'import sysconfig; print(sysconfig.get_path("stdlib"))')
   opts+=(--ro-bind "$base/bin" "$base/bin" --ro-bind "$stdlib" "$stdlib")
 elif [[ $base != /usr ]]; then opts+=(--ro-bind "$base" "$base"); fi
 # tinygrad names downloads by the MD5 of the upstream URL. These are the four IDX files, tiny.en weights and GPT-2 tokenizer.
 case "$1" in
-  mnist|sram-mnist) assets=(e8e6ed0857e9bb000985bfea8283b0b3.gunzip 684fe191a76d9107981692e6f0d3842f.gunzip 40a9ec2164c7887e8a5f1225de927907.gunzip 7b1e157ab43d54d0946f76d1bb6df574.gunzip) ;;
+  mnist|sram-mnist|train-mnist) assets=(e8e6ed0857e9bb000985bfea8283b0b3.gunzip 684fe191a76d9107981692e6f0d3842f.gunzip 40a9ec2164c7887e8a5f1225de927907.gunzip 7b1e157ab43d54d0946f76d1bb6df574.gunzip) ;;
   whisper|sram-whisper|sram-transcribe) assets=(3a2cae277fcec4464349df535729caaf 5386a662f5b1245493601b29a5e61f40) ;;
   qwen|sram-qwen|sram-generate) assets=() ;;
   *) echo "unknown model $1" >&2; exit 2 ;;
@@ -53,4 +55,4 @@ if [[ $1 == sram-* ]]; then
   if [[ $1 == sram-transcribe ]]; then files+=(sram_whisper.py); fi
   for file in "${files[@]}"; do opts+=(--ro-bind "$repo/extra/usbgpu/s30/$file" "/src/extra/usbgpu/s30/$file"); done
 fi
-exec bwrap "${opts[@]}" -- /venv/bin/python -m extra.usbgpu.s30.verify_native "$1" /input "${@:3}"
+exec bwrap "${opts[@]}" -- /venv/bin/python -m extra.usbgpu.s30.verify_native "${args[@]}"
