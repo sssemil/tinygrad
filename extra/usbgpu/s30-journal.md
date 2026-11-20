@@ -627,3 +627,11 @@ Examining the measured schedule for the 20-column convolution showed that one th
 Two fresh offline processes using the default scheduler and empty caches measured 13.49 and 13.45 ms warm. A fresh MUSA run between them measured 14.04 ms. All five batches matched on each run. The table uses the second isolated native run and that MUSA run for MNIST. The isolated Whisper and Qwen results are also fresh. Their MUSA columns carry forward the previous same-card controls.
 
 All 165 archived inference graphs compiled. All 23 applicable native hardware tests passed, including exact convolution comparisons with NumPy at five output widths. A batch-16 training step agreed with the CPU on the loss and all 20 updated tensors. The separate SRAM-only MNIST runner produced class 7 in 362.98 ms from rail enable with nine freshly generated programs and both management rings unready.
+
+## November 20, 2026 — observe board startup with PCI bus mastering off
+
+At the first configuration read after the link trained, the physical S30 command register read 7, BAR0 read zero, and the two BAR2 dwords read 0x0c and zero. The low nibble describes the BAR, leaving a base address of zero. The expansion ROM register read 2, with decoding disabled. The cold SRAM runner now reads the endpoint's VRAM BAR and expansion ROM registers before it sets up BAR0.
+
+In three downstream power cycles the host cleared bus mastering around 52 ms and left it clear while checking the management headers through BAR0. Both headers became ready at 740.2–750.7 ms. Three controls with bus mastering enabled gave 736.4–741.7 ms. In six more cycles the host cleared all three PCI command enables, then left the endpoint alone until 100 or 850 ms. It enabled only memory decoding for the subsequent BAR0 observation. The three early observations at 101.1–101.2 ms found the headers unready. The three late observations at 851.2–851.3 ms found both ready. After bus mastering was enabled, three independently challenged SRAM calculations passed per cycle.
+
+This rules out a requirement for endpoint bus mastering during the measured interval to reach these mailbox headers on this card. The endpoint already had the bus master bit set when it first answered. The interval before that observation, including any factory code running from reset, remains unobserved.

@@ -111,6 +111,8 @@ class ColdSlot(USBPCIDevice):
       while bridge.read(0xb450, 1)[0] != 0x78:
         if time.monotonic()-self.start > 2: raise TimeoutError("downstream PCIe link training")
       if self.read_config(0, 4) != identity: raise RuntimeError("expected an S30 on Chestnut")
+      if self.read_config(0x18, 4) & ~0xf or self.read_config(0x1c, 4): raise RuntimeError("S30 VRAM BAR already assigned after power-on")
+      if self.read_config(0x30, 4) & 1: raise RuntimeError("S30 expansion ROM enabled after power-on")
       # Size and assign BAR0 with memory decoding disabled. No VRAM aperture is needed.
       command = self.read_config(4, 2)
       self.write_config(4, command & ~2, 2)
