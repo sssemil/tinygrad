@@ -8,11 +8,11 @@ Measured on the same Chestnut S30 with compiler caching disabled. The cold colum
 
 | Workload | Native cold | MUSA cold | Native warm | MUSA warm |
 | --- | ---: | ---: | ---: | ---: |
-| MNIST, batch of 16 | 0.870 s | 3.498 s | 24.05 ms | 13.67 ms |
-| Whisper tiny.en, test.wav | 10.323 s | 51.521 s | 4.346 s | 2.281 s |
-| Qwen2.5-0.5B Q8_0 | 18.519 s | 172.478 s | 4.725 s | 4.809 s |
+| MNIST, batch of 16 | 0.852 s | 3.490 s | 23.91 ms | 13.76 ms |
+| Whisper tiny.en, test.wav | 10.079 s | 51.250 s | 4.186 s | 2.285 s |
+| Qwen2.5-0.5B Q8_0 | 18.263 s | 172.203 s | 4.707 s | 4.813 s |
 
-The benchmark checked all five outputs against the recorded reference for each model on each backend. The native column uses the offline, isolated benchmark. It checked every loaded USC program against compiler output generated in the same process. The check covered 10 distinct binaries for MNIST, 91 for Whisper and 73 for Qwen. The benchmark also checked that compute startup received only zero-filled context memory, with META master boot disabled. It blocked vendor firmware boot and management mailbox construction. The card powered up with its factory firmware still installed. The host did not upload proprietary code during these model runs. The board-management mailbox was unused.
+The benchmark checked all five outputs against the recorded reference for each model on each backend. The native column uses the offline, isolated benchmark. It checked every loaded USC program against compiler output generated in the same process. The check covered 10 distinct binaries for MNIST, 93 for Whisper and 73 for Qwen. The benchmark also checked that compute startup received only zero-filled context memory, with META master boot disabled. It blocked vendor firmware boot and management mailbox construction. The card powered up with its factory firmware still installed. The host did not upload proprietary code during these model runs. The board-management mailbox was unused.
 
 ### Inference without card DDR
 
@@ -561,3 +561,9 @@ For aligned byte reads of at least 16 KiB, a native copy shader moves VRAM into 
 Five trials alternated the order of direct and staged reads and changed the input bytes each time. A 16 KiB read took 0.98 ms staged and 7.11 ms direct. A 256 KiB read took 1.57 ms and 113.33 ms. For 2 MiB the medians were 12.52 ms and 907.28 ms, or 168 MB/s and 2.31 MB/s. All bytes matched. These are host readback timings. The full model benchmarks return much smaller final results.
 
 The hardware suite checks direct BAR writes against staged reads at nonzero offsets, the 16 KiB threshold, multiple SRAM windows, a partial final window and a byte tail. It also reads a small buffer from another thread during a download. A cold SRAM-only Whisper frontend run checked all 1,728,000 output activations against the CPU.
+
+## November 20, 2026 — split the long Whisper attention value reduction
+
+For a long key sequence divisible by 512, native attention can compute the weighted values of each 512-key block separately and sum those partial outputs. The optimization requires matching batch and head dimensions and a value width of at most 128, which caps the intermediate at a quarter of the probability matrix. Splits of 128, 256, 384, 512 and 768 keys produced the same full transcript in each trial. The 512-key split took 4.177 s warm in the tuning process and 4.186 s in a fresh offline process.
+
+The physical S30 test compared outputs and gradients for Q, K and V to CPU using random masks, distinct query and value widths, and key lengths 192 and 1,024. All 21 native hardware tests passed with both vendor paths absent. All 31 hardware tests passed in the separate reference environment. The table at the top uses fresh native and MUSA runs on the same S30 for every model. Each of the 30 predictions matched the recorded reference.

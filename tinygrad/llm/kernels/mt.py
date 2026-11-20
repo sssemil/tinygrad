@@ -69,8 +69,13 @@ def s30_prefill_attention(q:Tensor, k:Tensor, v:Tensor, mask:Tensor|None) -> Ten
   scores = q.matmul(k.transpose(-2,-1), dtype=dtypes.float) / math.sqrt(q.shape[-1])
   if mask is not None: scores = scores + (mask.where(0, -math.inf) if mask.dtype == dtypes.bool else mask)
   flat = scores.reshape(-1, scores.shape[-1]).contiguous()
-  probs = flat.empty_like().custom_kernel(flat, fxn=_row_softmax, grad_fxn=_row_softmax_grad)[0]
-  return probs.reshape(scores.shape) @ v
+  probs = flat.empty_like().custom_kernel(flat, fxn=_row_softmax, grad_fxn=_row_softmax_grad)[0].reshape(scores.shape)
+  # Split long value reductions across workgroups. Limit the partial sums to a quarter of the probability matrix.
+  if all_int(v.shape) and v.shape[:-2] == probs.shape[:-2] and v.shape[-2] == k.shape[-2] and v.shape[-1] <= 128 and \
+     k.shape[-2] >= 1024 and k.shape[-2]%512 == 0:
+    partials = probs.unflatten(-1, (-1, 512)).transpose(-3,-2) @ v.unflatten(-2, (-1, 512))
+    return partials.contiguous().sum(-3)
+  return probs @ v
 
 def _softmax_value(out:UOp, scores:UOp, cache:UOp, pos:UOp) -> UOp:
   b, h, d = (UOp.range(n, axis) for axis,n in enumerate((out.shape[0], out.shape[1], out.shape[3])))

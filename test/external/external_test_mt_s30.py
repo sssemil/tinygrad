@@ -142,17 +142,17 @@ class TestS30USB(unittest.TestCase):
     import numpy as np
     from tinygrad.llm.kernels.mt import s30_prefill_attention
     rng = np.random.default_rng(31)
-    q,k,v = (rng.standard_normal(shape).astype(np.float32) for shape in ((1,2,1024,8), (1,2,192,8), (1,2,192,8)))
-    mask = rng.random((1024,192)) > 0.4
-    g = rng.standard_normal(q.shape).astype(np.float32)
-    def run(device):
+    def run(device, q, k, v, mask, g):
       a,b,c,m,grad = (Tensor(x, device=device).realize() for x in (q,k,v,mask,g))
       ret = s30_prefill_attention(a,b,c,m) if device == "MT" else a.scaled_dot_product_attention(b,c,m)
       self.assertIsNotNone(ret)
       return [t.numpy() for t in (ret, *ret.gradient(a,b,c,gradient=grad))]
-    with Context(DEV="MT:USC", CACHELEVEL=0):
-      for actual, expected in zip(run("MT"), run("CPU"), strict=True):
-        np.testing.assert_allclose(actual, expected, rtol=5e-4, atol=5e-5)
+    for length in (192, 1024):
+      q,k,v,g = (rng.standard_normal((1,2,n,d)).astype(np.float32) for n,d in ((1024,8), (length,8), (length,16), (1024,16)))
+      mask = rng.random((1024,length)) > 0.4
+      with self.subTest(length=length), Context(DEV="MT:USC", CACHELEVEL=0):
+        for actual, expected in zip(run("MT",q,k,v,mask,g), run("CPU",q,k,v,mask,g), strict=True):
+          np.testing.assert_allclose(actual, expected, rtol=5e-4, atol=5e-5)
 
   def test_native_vector_add(self):
     import numpy as np
