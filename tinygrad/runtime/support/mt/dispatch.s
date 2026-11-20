@@ -12,6 +12,7 @@ wait:
   MOVT A1.1,#0xb000
   ADD A1.1,A1.1,#0x7000     ! first descriptor, at context offset 0x8000
 dispatch:
+  ! Host descriptor: distance to next (+0, zero at end), CDM control base (+8), ring base (+16).
   GETL D0.0,D1.0,[A1.1+#8]
   SETL [A1.0+#0x4f8],D0.0,D1.0
   SETL [A0.1+#0x4f8],D0.0,D1.0

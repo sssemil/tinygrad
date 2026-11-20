@@ -408,7 +408,7 @@ class MTS30Program(Program['MTDevice']):
     with fw.lock: fw.mmu.map_range(USC_BASE+usc_off, self.code.meta.pa, self.code.meta.size, MT_PTE_READ_ONLY)
     if self.direct and fw.meta_enabled:
       pds = s30_pds(0, shared, usc_off, temps, bool(local_words))
-      self.packet = Buffer(dev.device, len(pds), initial_value=pds)
+      self.packet = Buffer(dev.device, len(pds), initial_value=bytes(pds))
       packet_off = self.packet.meta.va & 0xffffffff
       with fw.lock: fw.mmu.map_range(PDS_BASE+packet_off, self.packet.meta.pa, self.packet.meta.size, MT_PTE_READ_ONLY)
       self.meta_dma = pds[:16]
