@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
 # Reproduce the installed ed4e39b7 bridge application with SDCC 4.2.0.
 set -euo pipefail
-if [[ $# != 3 ]]; then echo "usage: $0 BRIDGE_GIT_DIR SDCC_RUNTIME_SOURCES OUTPUT" >&2; exit 2; fi
+if [[ $# != 3 ]]; then echo "usage: $0 BRIDGE_GIT_DIR SDCC_RUNTIME_SOURCES {OUTPUT|--verify}" >&2; exit 2; fi
 bridge=$(realpath "$1")
 runtime=$(realpath "$2")
+rev=ed4e39b7e0794e19ba193477067c48757a5cf9ef
 build=$(mktemp -d)
 trap 'rm -rf "$build"' EXIT
 (
   cd "$build"
-  git -C "$bridge" archive ed4e39b7e0794e19ba193477067c48757a5cf9ef handmade/src handmade/Makefile | tar -x --strip-components=1
+  git -C "$bridge" archive "$rev" handmade/src handmade/Makefile | tar -x --strip-components=1
   sdas8051 -los src/crt0.s
   sdcc -mmcs51 --model-small --opt-code-speed --allow-unsafe-read --std-c99 -Isrc --no-xinit-opt \
     '-DGIT_VERSION="ed4e39b7-CLEAN"' -c src/main.c -o main.rel
@@ -25,4 +26,10 @@ trap 'rm -rf "$build"' EXIT
   make BUILD_DIR=. -o firmware.ihx wrapped
   echo "9520fde0bf43d499c07abd0a09b74e94d8a7cc3d610f577b7a4e218ab8a378e9  firmware_wrapped.bin" | sha256sum -c -
 )
-cp "$build/firmware_wrapped.bin" "$3"
+if [[ $3 == --verify ]]; then
+  dir=$(cd "$(dirname "$0")" && pwd)
+  git -C "$bridge" archive "$rev" flash.py handmade/e4_flash.py pcie/pcie_probe.py | tar -x -C "$build"
+  PYTHONPATH="$dir/../../..:$build/handmade" "${PYTHON:-python3}" "$dir/verify_chestnut.py" "$build"
+else
+  cp "$build/firmware_wrapped.bin" "$3"
+fi

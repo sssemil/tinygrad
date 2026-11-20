@@ -24,7 +24,7 @@ Separate cold-slot runs place every GPU-visible page in Chestnut SRAM or the bri
 | Whisper tiny.en, test.wav | Could you please let me out of the box? | 124.180 s | 90 |
 | Qwen2.5-0.5B, 36-token France prompt | All eight CPU reference tokens, including EOS | 149.350 s | 31 |
 
-The bridge application matches a build from source, including its target runtime objects. The outstanding boot question is what the S30 board and the bridge silicon execute before the host can train the PCIe link. All measurements used the original board boot storage.
+The entire 2 MiB external bridge flash matches its reconstructed contents, including the application built from source with its target runtime objects. The outstanding boot question is what the S30 board and the bridge silicon execute before the host can train the PCIe link. All measurements used the original board boot storage.
 
 ## November 20, 2026 — proprietary reference
 
@@ -225,25 +225,10 @@ Plain `DEV=MT` on the S30 now selects USC and opens the card without management 
 
 The bridge identified itself as `custom ed4e39b7-CLEAN`. A clean checkout of the public bridge firmware at `ed4e39b7e0794e19ba193477067c48757a5cf9ef` built with Ubuntu's SDCC `4.2.0+dfsg-1` produced exactly the 9,207 bytes installed at offset 0x100 in this bridge's SPI flash. The wrapped image SHA-256 was `9520fde0bf43d499c07abd0a09b74e94d8a7cc3d610f577b7a4e218ab8a378e9`. Builds from the same source with SDCC 4.4, 4.5 and 4.6 differed. The normal SDCC link used seven objects from its packaged open-source 8051 runtime. The source-only build below replaces them all. [Bridge source and build rules at the verified commit](https://github.com/tinygrad/asm2464pd-firmware/tree/ed4e39b7e0794e19ba193477067c48757a5cf9ef/handmade)
 
-From the tinygrad checkout, use SDCC 4.2.0 with its runtime sources installed. The build script extracts the pinned bridge revision from the source repository and compiles each target object. The comparison uses the bridge's existing SPI setup and issues JEDEC identification and flash reads. It acquires tinygrad's normal S30 device lock. The comparison covers the executable image and its length, checksum and CRC wrapper.
+From the tinygrad checkout, use SDCC 4.2.0, its runtime sources and the public bridge checkout. The following command rebuilds all target objects in a temporary directory and compares the entire external flash through read-only SPI commands. To save the rebuilt application separately, pass an output path as the last argument.
 
 ```sh
-extra/usbgpu/s30/build_chestnut.sh "$BRIDGE_SRC" /usr/share/sdcc/lib/src /tmp/chestnut-from-source.bin
-DEV=MT:USC CACHELEVEL=0 PYTHONPATH=".:$BRIDGE_SRC/handmade" python - /tmp/chestnut-from-source.bin <<'PY'
-import hashlib, sys
-from pathlib import Path
-from tinygrad import Device
-from e4_flash import flash_jedec_id, flash_read
-built = Path(sys.argv[1]).read_bytes()
-handle = Device["MT"].mt.pci_dev.usb.usb.handle
-jedec = flash_jedec_id(handle)
-assert jedec == bytes.fromhex("c2 28 15"), f"unexpected SPI flash {jedec.hex()}"
-flash = flash_read(handle, 0, 1 << jedec[2])
-end = 0x100 + len(built)
-assert flash[0x100:end] == built, "bridge image differs from source build"
-assert flash[end:].count(0xff) == len(flash) - end, "found additional data after the application"
-print(len(built), hashlib.sha256(built).hexdigest())
-PY
+extra/usbgpu/s30/build_chestnut.sh "$BRIDGE_SRC" /usr/share/sdcc/lib/src --verify
 ```
 
 This verifies the installed USB bridge application. The downstream S30's expansion ROM BAR read 0x2 with its enable bit clear after attach. That register reports the host mapping state. Establishing what the GPU board controller needs for power, clocks and DDR before PCIe enumeration still requires independent evidence.
@@ -567,3 +552,9 @@ The hardware suite checks direct BAR writes against staged reads at nonzero offs
 For a long key sequence divisible by 512, native attention can compute the weighted values of each 512-key block separately and sum those partial outputs. The optimization requires matching batch and head dimensions and a value width of at most 128, which caps the intermediate at a quarter of the probability matrix. Splits of 128, 256, 384, 512 and 768 keys produced the same full transcript in each trial. The 512-key split took 4.177 s warm in the tuning process and 4.186 s in a fresh offline process.
 
 The physical S30 test compared outputs and gradients for Q, K and V to CPU using random masks, distinct query and value widths, and key lengths 192 and 1,024. All 21 native hardware tests passed with both vendor paths absent. All 31 hardware tests passed in the separate reference environment. The table at the top uses fresh native and MUSA runs on the same S30 for every model. Each of the 30 predictions matched the recorded reference.
+
+## November 20, 2026 — reproduce every byte of the external Chestnut flash
+
+The expected 2 MiB image was assembled before reading the device. It contains the two 128-byte configuration records from the pinned public bridge source, the freshly rebuilt 9,207-byte wrapped application, and erased fill. The reconstruction uses the previously identified board-specific prefixes, 00 28 15 and c2 28 15, in the two records. The verifier parses the configuration literals without executing the flasher. It acquires the device lock and issues JEDEC ID and flash reads.
+
+Both the reconstruction and the full device read had SHA-256 `a1a841b88e93cc49f38a6edce2a0e9e0de7000f0dfb6cd5121a1a23a78f5e0b3`. Every byte matched. Afterward the S30 classified MNIST image 0 as 7 using nine fresh shaders, 365.23 ms after slot rail enable and before its management rings became ready. The comparison covers the external bridge flash. The on-chip bridge boot ROM and the downstream S30 board's power-on code remain unverified.
