@@ -315,9 +315,12 @@ class USBPCIDevice(PCIDevice):
     self.lock_fd = System.flock_acquire(f"{devpref.lower()}_{pcibus.lower()}.lock")
     usb = USB3(dev)
     if DEBUG >= 1: print(f"{devpref.lower()} {self.pcibus}: product string: {usb.product!r}")
-    self.usb: CustomASM24Controller = CustomASM24Controller(usb)
-    self._bar_info = System.pci_setup_usb_bars(self.usb, gpu_bus=gpu_bus, mem_base=0x10000000, pref_mem_base=(32 << 30), vram_bars=vram_bars)
+    self._setup_pcie(usb, vram_bars)
     self.sram = BumpAllocator(size=0x80000, wrap=False) # asm24 controller sram
+
+  def _setup_pcie(self, usb:USB3, vram_bars:dict[int, int]|None):
+    self.usb = CustomASM24Controller(usb)
+    self._bar_info = System.pci_setup_usb_bars(self.usb, gpu_bus=self.gpu_bus, mem_base=0x10000000, pref_mem_base=(32 << 30), vram_bars=vram_bars)
 
   def dma_view(self, ctrl_addr, size): return USBMMIOInterface(self.usb, ctrl_addr, size, fmt='B', pcimem=False)
   def alloc_sysmem(self, size:int, vaddr:int=0, contiguous:bool=False) -> tuple[MMIOInterface, list[int]]:

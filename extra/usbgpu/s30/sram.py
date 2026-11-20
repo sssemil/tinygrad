@@ -7,9 +7,10 @@ from tinygrad.renderer import TinyELF
 from tinygrad.renderer.usc import MTUSCRenderer
 from tinygrad.runtime.support.mt.compute import FW_DEVVA
 from tinygrad.runtime.support.mt.mmu import MTMMU4, MT_PTE_READ_ONLY, MT_PTE_READ_WRITE
-from tinygrad.runtime.support.mt.mtdev import MTDev, MT_IPC_RING_SIZE, MT_S30_SRAM_OFFSET
+from tinygrad.runtime.support.mt.mtdev import MTDev, MT_DDR_BAR, MT_IPC_RING_SIZE, MT_S30_ID, MT_S30_SRAM_OFFSET, MT_SYS_BAR, MT_USB_GPU_BUS, MT_VENDOR_ID
 from tinygrad.runtime.support.mt.s30 import DIRECT_CDM, PDS_BASE, USC_BASE, MTS30Firmware, s30_cdm_stream, s30_dispatch, s30_grid, s30_pds, s30_shader
-from tinygrad.runtime.support.usb import HALF, SLOT
+from tinygrad.runtime.support.system import USBPCIDevice
+from tinygrad.runtime.support.usb import CustomASM24Controller, HALF, SLOT, USB3
 from tinygrad.uop.ops import KernelInfo
 
 # GPU virtual addresses for streamed input, resident activations, and the completion word visible at USB XDATA 0xb800.
@@ -79,37 +80,58 @@ class ChestnutBoot(MTS30Firmware):
     self.mem[0x10000:0x10000+self.mmu.next] = self.mmu.root[:self.mmu.next]
     self.dev.pci_dev.usb.scsi_write(self.mem, slot_start=HALF//SLOT)
 
-def cold_link(mt:MTDev) -> float:
-  pci, bridge = mt.pci_dev, mt.pci_dev.usb
-  bar0 = pci.bar_info(0)[0]
-  bridge.set_pcie_power(False)
-  try:
-    time.sleep(0.3)
-    if bridge.read(0xb450, 1)[0] == 0x78: raise RuntimeError("downstream link did not drop")
-    # Same lane order as ed4e39b7 pcie_power_on, without the three 100 ms stable-link delays.
-    start = time.monotonic()
-    bridge.write(0xc656, bytes([bridge.read(0xc656, 1)[0] | 0x20]))
-    for reg,val in ((0xca81,0x0e), (0xca06,0x21), (0xb431,0x0c), (0xe764,0x1c)): bridge.write(reg, bytes([val]))
-    bridge.write(0xc659, bytes([bridge.read(0xc659, 1)[0] | 1]))
-    bridge.write(0xb480, b"\x00")
-    while bridge.read(0xb450, 1)[0] != 0x78:
-      if time.monotonic() - start > 2: raise TimeoutError("downstream PCIe link training")
-    # Restore the register aperture and bus mastering. Leave GPU memory at its power-on BAR address.
-    pci.write_config(0x10, bar0, 4)
-    pci.write_config(4, pci.read_config(4, 2) | 6, 2)
-    return start
-  except BaseException:
-    bridge.set_pcie_power(True)
-    raise
+class ColdSlot(USBPCIDevice):
+  def _setup_pcie(self, usb:USB3, vram_bars:dict[int,int]|None):
+    bridge = self.usb = CustomASM24Controller(usb, train_link=False)
+    identity = MT_S30_ID<<16 | MT_VENDOR_ID
+    up = bridge.read(0xb450, 1)[0] == 0x78
+    if up and self.read_config(0, 4) != identity: raise RuntimeError("expected an S30 on Chestnut")
+    bridge.set_pcie_power(False)
+    try:
+      time.sleep(0.3)
+      if bridge.read(0xb450, 1)[0] == 0x78: raise RuntimeError("downstream link did not drop")
+      # ed4e39b7 pcie_power_on, including the bank-1 PHY routing bit. Start as soon as the link trains.
+      bridge.write(0xb403, b"\x01")
+      bridge.write(0xb430, bytes([bridge.read(0xb430, 1)[0] & ~1]))
+      route = usb.control_read(0xe4, 1, value=0x6025, index=0x100)[0]
+      usb.control_write(0xe5, value=0x6025, index=0x180 | route)
+      self.start = time.monotonic()
+      bridge.write(0xc656, bytes([bridge.read(0xc656, 1)[0] | 0x20]))
+      for reg,val in ((0xca81,0x0e), (0xca06,0x21), (0xb431,0x0c), (0xe764,0x1c)): bridge.write(reg, bytes([val]))
+      bridge.write(0xc659, bytes([bridge.read(0xc659, 1)[0] | 1]))
+      bridge.write(0xb298, bytes([bridge.read(0xb298, 1)[0] | 0x10]))
+      bridge.write(0xb480, b"\x00")
+      while bridge.read(0xb450, 1)[0] != 0x78:
+        if time.monotonic()-self.start > 2: raise TimeoutError("downstream PCIe link training")
+      if self.read_config(0, 4) != identity: raise RuntimeError("expected an S30 on Chestnut")
+      # Size and assign BAR0 with memory decoding disabled. No VRAM aperture is needed.
+      command = self.read_config(4, 2)
+      self.write_config(4, command & ~2, 2)
+      self.write_config(0x10, 0xffffffff, 4)
+      mask = self.read_config(0x10, 4)
+      if mask != 0xfe000000: raise RuntimeError(f"unexpected S30 BAR0 size mask {mask:#x}")
+      bar0 = 0x10000000
+      self.write_config(0x10, bar0, 4)
+      self.write_config(4, command | 6, 2)
+      self._bar_info = {MT_SYS_BAR:(bar0, 1<<25), MT_DDR_BAR:(0, 0)}
+    except BaseException:
+      bridge.set_pcie_power(up)
+      raise
+
+def open_cold() -> tuple[MTDev, float]:
+  (dev, bus), = USB3.list_devices(0x3801, 1)
+  slot = ColdSlot("MT", dev, bus, gpu_bus=MT_USB_GPU_BUS)
+  return MTDev(slot, manage_power=False), slot.start
 
 def mailbox(mt:MTDev) -> bool:
   header = 0x14
   return all(struct.unpack("<II", mt.regs._read(base+8, 8)) == (MT_IPC_RING_SIZE, base+header)
              for base in (MT_S30_SRAM_OFFSET, MT_S30_SRAM_OFFSET+header+MT_IPC_RING_SIZE))
 
-def run(mt:MTDev, cold:bool):
+def run(mt:MTDev, start:float|None):
   fw = ChestnutBoot(mt)
-  start = cold_link(mt) if cold else time.monotonic()
+  cold = start is not None
+  if start is None: start = time.monotonic()
   out, inp = (UOp.placeholder((1,), dtypes.uint, slot=i) for i in range(2))
   shader = out[0].store(inp[0]*3+7).sink(arg=KernelInfo(name="s30_sram", opts_to_apply=()))
   renderer = MTUSCRenderer(Target("MT","USC","mp_10"))
@@ -135,6 +157,4 @@ if __name__ == "__main__":
   parser = argparse.ArgumentParser(description=__doc__)
   parser.add_argument("--cold", action="store_true", help="cycle the S30 slot and check all three results before the SMC ring is ready")
   args = parser.parse_args()
-  mt = MTDev.open_usb(manage_power=False)
-  if not mt.s30: raise RuntimeError("requires a Chestnut S30")
-  with Context(CACHELEVEL=0): run(mt, args.cold)
+  with Context(CACHELEVEL=0): run(*(open_cold() if args.cold else (MTDev.open_usb(manage_power=False), None)))

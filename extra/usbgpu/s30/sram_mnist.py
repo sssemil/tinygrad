@@ -2,14 +2,13 @@
 import argparse, time
 from pathlib import Path
 from examples.beautiful_mnist import Model
-from extra.usbgpu.s30.sram import ACTIVATIONS, ACTIVATION_SIZE, INPUT, RESULT, ChestnutBoot, cold_link, mailbox
+from extra.usbgpu.s30.sram import ACTIVATIONS, ACTIVATION_SIZE, INPUT, RESULT, ChestnutBoot, mailbox, open_cold
 from tinygrad import Context, UOp
 from tinygrad.codegen import do_to_program
 from tinygrad.helpers import Target, prod, round_up
 from tinygrad.nn.datasets import mnist
 from tinygrad.nn.state import load_state_dict, safe_load
 from tinygrad.renderer.usc import MTUSCRenderer
-from tinygrad.runtime.support.mt.mtdev import MTDev
 from tinygrad.uop.ops import Ops
 
 def classify(weights:Path, index:int):
@@ -20,9 +19,8 @@ def classify(weights:Path, index:int):
   if not 0 <= index < images.shape[0]: raise IndexError(index)
   image, label = images[index:index+1].contiguous().realize(), labels[index].item()
   linear = model(image).argmax(-1).schedule_linear()
-  mt = MTDev.open_usb(manage_power=False)
+  mt, start = open_cold()
   fw = ChestnutBoot(mt)
-  start = cold_link(mt)
   renderer = MTUSCRenderer(Target("MT","USC","mp_10"))
   resident:dict[UOp, int] = {}
   used = 0

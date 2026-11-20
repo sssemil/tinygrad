@@ -93,8 +93,9 @@ class USB3:
       assert (sig, rtag, status) == (0x53425355, tag, 0)
 
 class CustomASM24Controller:
-  def __init__(self, usb:USB3):
+  def __init__(self, usb:USB3, *, train_link:bool=True):
     self.usb = usb
+    if not train_link: return
 
     # Custom firmware now boots with PCIe off. Power it on before probing the link.
     ltssm = self.read(0xB450, 1)[0]

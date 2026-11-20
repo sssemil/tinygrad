@@ -2,13 +2,12 @@
 import argparse, time
 import numpy as np
 from examples.whisper import init_whisper, load_file_waveform, mel_prefix_frames, prep_audio
-from extra.usbgpu.s30.sram import ChestnutBoot, cold_link, mailbox
+from extra.usbgpu.s30.sram import ChestnutBoot, mailbox, open_cold
 from tinygrad import Context, Tensor
 from tinygrad.codegen import do_to_program
 from tinygrad.helpers import Target, ceildiv, round_up
 from tinygrad.renderer.usc import MTUSCRenderer
 from tinygrad.runtime.support.mt.mmu import MT_PTE_READ_WRITE
-from tinygrad.runtime.support.mt.mtdev import MTDev
 from tinygrad.runtime.support.usb import HALF
 
 # The lower SRAM half is transient for these kernels. Keep outputs at slot zero for USB readback.
@@ -53,10 +52,9 @@ def run(audio:str):
   mel = prep_audio([load_file_waveform(audio)], 1, truncate=True)
   convs = (model.encoder.conv1, model.encoder.conv2)
   weights = [(c.weight.numpy(), c.bias.numpy()) for c in convs]
-  mt = MTDev.open_usb(manage_power=False)
+  mt, start = open_cold()
   fw = ChestnutBoot(mt)
   fw.mmu.map_range(TILE, fw.context_pa-HALF, HALF, MT_PTE_READ_WRITE)
-  start = cold_link(mt)
   actual, x = [], mel[..., :mel_prefix_frames(mel)]
   with fw.boot_direct():
     for i,((w,b),stride,frames) in enumerate(zip(weights, (1, 2), (64, 32), strict=True), 1):
