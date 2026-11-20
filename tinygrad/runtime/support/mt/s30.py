@@ -14,6 +14,8 @@ from tinygrad.runtime.support.mt.compute import MTFirmwareBoot, FW_BASE, FW_DEVV
 from tinygrad.runtime.support.mt.elf import MTKernelImage
 from tinygrad.runtime.support.mt.mmu import MT_PTE_READ_ONLY, MT_PTE_READ_WRITE
 from tinygrad.runtime.support.mt.mtdev import MT_CORE_STRIDE, MTDev
+from tinygrad.runtime.support.system import USBPCIDevice
+from tinygrad.runtime.support.usb import HALF, SLOT
 if TYPE_CHECKING: from tinygrad.runtime.ops_mt import MTDevice
 
 # mtgpu-s30 3.1.0-6, mtfw-gen1.bin. The FWIF layout and META segments belong to this image.
@@ -33,6 +35,8 @@ ITEM = round_up(WATCHDOG + 16, 0x1000)
 PACKET = ITEM + 0x1000
 CDM_CONTROL_SIZE, CDM_RING_SIZE, CDM_KICK_SIZE = 128, 0x800, 0x158
 DIRECT_CDM = 0x4000  # shared ring controls in the direct context, below the compute state at 0x6000
+S30_STAGE_VA, S30_UPLOAD_SIZE = 0x7000000000, HALF-2*SLOT
+S30_RING_OFFSET = 2*HALF-SLOT+1024  # leave room before the controls for parameters
 CDM_SUBMISSION_SIZE = 96+16+CDM_KICK_SIZE
 PDS_BASE, USC_BASE = 0xda00000000, 0xe000000000
 
@@ -86,10 +90,12 @@ def s30_boot_image(raw:bytes) -> bytearray:
 
 class MTS30Firmware(MTFirmwareBoot):
   context_pa:int = FW_BASE
-  def __init__(self, dev:MTDev, path:str|Path|None=None):
+  def __init__(self, dev:MTDev, path:str|Path|None=None, *, bridge_sram:bool=False):
     if not dev.s30: raise ValueError('Expected an MTT S30')
     self.path = None if path is None else Path(path)
     super().__init__(dev, PACKET+0x1000)
+    self.bridge = pci.usb if bridge_sram and isinstance(pci:=dev.pci_dev, USBPCIDevice) and pci.usb.usb.product.startswith("custom") else None
+    self.ring_va = S30_STAGE_VA+S30_RING_OFFSET-HALF if self.bridge is not None else FW_DEVVA+DIRECT_CDM
     self.direct = False
     self.queue:MTCCB|None = None
     self.lock, self.session = threading.RLock(), ExitStack()
@@ -145,6 +151,12 @@ class MTS30Firmware(MTFirmwareBoot):
   @contextmanager
   def boot_direct(self) -> Iterator[None]:
     # Enable both compute cores and route the workgroups across them. META stays stopped.
+    if self.bridge is not None and S30_STAGE_VA not in self.mmu.pages:
+      _, (pa,) = self.dev.pci_dev.alloc_sysmem(2*HALF)
+      # Ordinary F0 traffic uses the lower half. Reserve the final two slots for dispatch on both cores.
+      base = (1<<39) | (pa+HALF)
+      self.mmu.map_range(S30_STAGE_VA, base, S30_UPLOAD_SIZE, MT_PTE_READ_ONLY)
+      self.mmu.map_range(S30_STAGE_VA+S30_UPLOAD_SIZE, base+S30_UPLOAD_SIZE, 2*SLOT, MT_PTE_READ_WRITE)
     with self._boot(bytes(0x8000), master=False, reset_domains=False):
       route = self._read(0x24e0, 4)
       self._reset(MT_CORE_STRIDE)
@@ -160,9 +172,9 @@ class MTS30Firmware(MTFirmwareBoot):
           self._write(core+0xcd8, 1, 4)
           for reg in (0x638, 0x658, 0x6e8, 0x6f8): self._write(core+reg, PDS_BASE)
           for reg in (0x4008, 0x4010, 0xf268, 0x4028): self._write(core+reg, USC_BASE)
-          self._write(core+0x4e8, FW_DEVVA+DIRECT_CDM+2*CDM_CONTROL_SIZE)
+          self._write(core+0x4e8, self.ring_va+2*CDM_CONTROL_SIZE)
           self._write(core+0x4f0, CDM_RING_SIZE)
-          self._write(core+0x4f8, FW_DEVVA+DIRECT_CDM)
+          self._write(core+0x4f8, self.ring_va)
           self._write(core+0x598, FW_DEVVA+0x7000)  # context state
           self._write(core+0x5b8, 0, 4)
           self._write(core+0x4d0, 1, 4)
@@ -312,7 +324,7 @@ class MTS30Program(Program['MTDevice']):
     self.packet = Buffer(dev.device, packet_size, preallocate=True)
     packet_off, usc_off = self.packet.meta.va & 0xffffffff, self.code.meta.va & 0xffffffff
     pds_off = packet_off + pds_start
-    params_base = FW_DEVVA if self.direct else PDS_BASE+packet_off
+    params_base = dev.s30_fw.ring_va-DIRECT_CDM if self.direct else PDS_BASE+packet_off
     pds = s30_pds(params_base+self.param_offset, shared, usc_off, temps, bool(local_words))
     with dev.s30_fw.lock:
       dev.s30_fw.mmu.map_range(PDS_BASE+packet_off, self.packet.meta.pa, self.packet.meta.size, MT_PTE_READ_ONLY)
@@ -345,7 +357,10 @@ class MTS30Program(Program['MTDevice']):
         struct.pack_into('<5I', self.launch, self.grid_offset, *s30_grid(global_size, local_size, self.shared))
         wait_seconds = 5.0 if timeout is None else timeout/1000
         if self.direct:
-          fw.v[self.param_offset:self.param_offset+len(self.launch)] = self.launch
+          if fw.bridge is not None:
+            slot, pad = divmod(S30_RING_OFFSET+self.param_offset-DIRECT_CDM, SLOT)
+            fw.bridge.scsi_write(bytes(pad)+self.launch, slot_start=slot)
+          else: fw.v[self.param_offset:self.param_offset+len(self.launch)] = self.launch
           fw.kick_direct(wait_seconds)
         else:
           resp = fw.submit(None, mtfw.MTFW_SUBMISSION_CMD_GPU_CDM, CDM_SUBMISSION_SIZE, self.launch, wait_seconds,

@@ -8,9 +8,9 @@ Measured on the same Chestnut S30 with compiler caching disabled. The cold colum
 
 | Workload | Native cold | MUSA cold | Native warm | MUSA warm |
 | --- | ---: | ---: | ---: | ---: |
-| MNIST, batch of 16 | 0.850 s | 3.745 s | 27.44 ms | 14.02 ms |
-| Whisper tiny.en, test.wav | 10.788 s | 51.649 s | 4.858 s | 2.282 s |
-| Qwen2.5-0.5B Q8_0 | 18.651 s | 172.335 s | 4.892 s | 4.815 s |
+| MNIST, batch of 16 | 0.844 s | 3.561 s | 25.87 ms | 14.16 ms |
+| Whisper tiny.en, test.wav | 10.714 s | 51.521 s | 4.773 s | 2.281 s |
+| Qwen2.5-0.5B Q8_0 | 18.269 s | 172.478 s | 4.732 s | 4.809 s |
 
 The benchmark checked all five outputs against the recorded reference for each model on each backend. The native column uses the offline, isolated benchmark. It checked every loaded USC program against compiler output generated in the same process. The check covered 10 distinct binaries for MNIST, 92 for Whisper and 73 for Qwen. The benchmark also checked that compute startup received only zero-filled context memory, with META master boot disabled. It blocked vendor firmware boot and management mailbox construction. The card powered up with its factory firmware still installed. The host did not upload proprietary code during these model runs. The board-management mailbox was unused.
 
@@ -495,3 +495,11 @@ From the workspace with the card idle:
 ```sh
 PYTHON="$PWD/.s30-tools/whisper-venv/bin/python" tinygrad/extra/usbgpu/s30/bench_isolated.sh sram-generate .s30-tools/models/Qwen2.5-0.5B-Instruct-Q8_0.gguf
 ```
+
+## November 20, 2026 — put the ordinary native dispatch ring in bridge SRAM
+
+Both compute cores now fetch their ring controls, dispatch words and launch parameters from the final two Chestnut slots. A single USB SRAM transfer updates each launch. The preceding 224 KiB remains available for source-generated weight uploads. The driver reserves this space on first direct boot on a supported USB bridge. Reference firmware commands retain their existing placement.
+
+On the 36-token Qwen prompt followed by eight generated tokens, two isolated native processes gave warm medians of 4.743 s and 4.732 s. A fresh proprietary run gave 4.809 s. Every run returned the exact eight reference tokens on all five calls. The native column at the top is the final isolated run. Across MNIST, Whisper and Qwen the five outputs on each backend passed, 18 native hardware tests passed with vendor paths absent, and all 28 hardware tests passed in the reference environment.
+
+A fixed four-position prompt tail gave 4.856 s with the previous VRAM dispatch ring, at the cost of recapturing when tail lengths changed. The normal model keeps its symbolic tail. A separate 32×896 by 896×4864 projection sweep tested different row, column and reduction tiles. The best measured reduction unroll of two took 15.34 ms versus 15.79 ms for four. Wider tiles also exhausted the register file in one case. The measurements did not justify a new compiler-wide rule.

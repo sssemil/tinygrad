@@ -11,12 +11,12 @@ from tinygrad.helpers import round_up, diskcache_get, diskcache_put, DEV, Target
 from tinygrad.uop.ops import KernelInfo, Ops, PatternMatcher, UOp, UPat
 from tinygrad.runtime.support.memory import TLSFAllocator
 from tinygrad.runtime.support.usb import USBMMIOInterface, HALF, SLOT
-from tinygrad.runtime.support.mt.mmu import MT_PTE_READ_ONLY, MT_PTE_READ_WRITE
+from tinygrad.runtime.support.mt.mmu import MT_PTE_READ_WRITE
 from tinygrad.runtime.support.mt.mtdev import MTDev
 from tinygrad.runtime.support.mt.launch import MTLaunch, parse_mt_bundle, compress_mt_bundle, decompress_mt_bundle
 from tinygrad.runtime.support.mt.compiler import MTCompiler, MTLLVMCompiler
 from tinygrad.runtime.support.mt.elf import MTKernelImage
-from tinygrad.runtime.support.mt.s30 import DEFAULT_S30_FIRMWARE, MTS30Firmware, MTS30Program
+from tinygrad.runtime.support.mt.s30 import DEFAULT_S30_FIRMWARE, S30_STAGE_VA, S30_UPLOAD_SIZE, MTS30Firmware, MTS30Program
 
 MUSA_SOURCES:dict[str,str] = {}
 
@@ -142,8 +142,6 @@ class MTBufferMeta:
   pa: int
   size: int
 
-S30_STAGE_VA = 0x7000000000
-
 class S30VRAMView(USBMMIOInterface):
   def __init__(self, view:USBMMIOInterface, dev:MTDevice, va:int):
     super().__init__(view.usb, view.addr, view.nbytes, view.fmt)
@@ -162,8 +160,8 @@ class S30VRAMView(USBMMIOInterface):
       # The upper SRAM half survives the bridge's ordinary F0 traffic for command packets and page tables.
       with self.dev.s30_fw.lock:
         copy = self.dev.s30_upload
-        for off in range(0, n, HALF):
-          chunk = src[off:min(off+HALF, n)]
+        for off in range(0, n, S30_UPLOAD_SIZE):
+          chunk = src[off:min(off+S30_UPLOAD_SIZE, n)]
           self.usb.scsi_write(chunk, slot_start=HALF//SLOT)
           copy(self.va+offset+off, S30_STAGE_VA, global_size=(len(chunk)//128,1,1), local_size=(32,1,1))
         if n < len(src): super().__setitem__(slice(offset+n, offset+len(src)), src[n:])
@@ -265,7 +263,7 @@ class MTDevice(Compiled):
     self.views:dict[int,tuple[Any,MTBufferMeta]] = {}
     super().__init__(device, MTAllocator(self), MTS30Program if self.mt.s30 else MTProgram, arch='mp_10' if self.mt.s30 else 'mp_21')
     if self.mt.s30:
-      self.s30_fw = MTS30Firmware(self.mt, os.getenv('MT_FIRMWARE', DEFAULT_S30_FIRMWARE))
+      self.s30_fw = MTS30Firmware(self.mt, os.getenv('MT_FIRMWARE', DEFAULT_S30_FIRMWARE), bridge_sram=True)
       return
     bundle = os.environ.get('MT_LAUNCH_BUNDLE', '/tmp/mt-research/argfresh')
     packet = os.environ.get('MT_LAUNCH_PACKET', '/tmp/mt-research/real-submission-direct.bin')
@@ -283,14 +281,10 @@ class MTDevice(Compiled):
   @functools.cached_property
   def s30_upload(self) -> MTS30Program:
     from tinygrad.codegen import to_program
-    dst, src = (UOp.placeholder((HALF//4,), dtypes.uint, slot=i) for i in range(2))
-    idx = UOp.special(HALF//128, "gidx0")*32+UOp.special(32, "lidx0")
+    dst, src = (UOp.placeholder((S30_UPLOAD_SIZE//4,), dtypes.uint, slot=i) for i in range(2))
+    idx = UOp.special(S30_UPLOAD_SIZE//128, "gidx0")*32+UOp.special(32, "lidx0")
     copy = dst[idx].store(src[idx]).sink(arg=KernelInfo(name="s30_upload", optimized=True))
-    program = MTS30Program(self, TinyELF.from_program(to_program(copy, self.renderer)), {})
-    # Sudi physical address bit 39 selects outbound PCIe. Reserve the bridge SRAM and map its upper half.
-    _, (pa,) = self.mt.pci_dev.alloc_sysmem(2*HALF)
-    self.s30_fw.mmu.map_range(S30_STAGE_VA, (1<<39) | (pa+HALF), HALF, MT_PTE_READ_ONLY)
-    return program
+    return MTS30Program(self, TinyELF.from_program(to_program(copy, self.renderer)), {})
 
   def get_launch(self, obj:TinyELF, global_size:tuple[int,int,int]=(1,1,1), local_size:tuple[int,int,int]=(1,1,1)) -> MTLaunch:
     if os.environ.get('MT_GENERATE','1') == '0':
