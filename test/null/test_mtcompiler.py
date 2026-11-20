@@ -30,6 +30,13 @@ class TestMTCompiler(unittest.TestCase):
       ins = start+[snapshot]+body+[("st", (0,3), 0)]
       self.assertEqual(assemble(ins), _assemble(ins))
 
+  def test_usc_dot_schedule_preserves_memory_order(self):
+    from tinygrad.renderer.usc import _schedule_fmas, Instruction
+    # The second load can alias the first store. Both dot products must see their respective values.
+    ins:list[Instruction] = [("imm", (), 2), ("ld", (0,), 0), ("fmul", (1,1), 0), ("fma", (1,1,2), 0), ("st", (0,3), 0),
+                             ("ld", (0,), 0), ("fmul", (5,5), 0), ("fma", (5,5,6), 0), ("st", (0,7), 0)]
+    self.assertEqual([op for op,_,_ in _schedule_fmas(ins) if op in ("ld","st")], ["ld","st","ld","st"])
+
   def test_default_renderer(self):
     from tinygrad.device import select_renderer
     from tinygrad.helpers import Target

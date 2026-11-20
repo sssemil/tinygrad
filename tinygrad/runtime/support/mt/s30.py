@@ -393,9 +393,9 @@ def s30_pds(params:int, shared:int, usc:int, temps:int, local:bool=False) -> byt
   return pds
 
 class MTS30Program(Program['MTDevice']):
-  def __init__(self, dev:MTDevice, obj:TinyELF, links:dict):
+  def __init__(self, dev:MTDevice, obj:TinyELF, links:dict, *, direct:bool|None=None):
     self.dev, self.name, self.profile_key = dev, obj.name, obj.profile_key
-    self.direct = obj.target.renderer == "USC"
+    self.direct = obj.target.renderer == "USC" if direct is None else direct
     text, params, temps, attrs, local_words, self.args, self.split = s30_shader(obj)
     shared = len(params)//4
     # Rogue USC prefetches one more instruction (up to 32 bytes), even when the shader ends at a page boundary.

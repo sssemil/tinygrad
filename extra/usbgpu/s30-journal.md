@@ -2,7 +2,48 @@
 
 Hardware used for these measurements is the 4 GiB MTT S30 on Chestnut over USB. The host runs tinygrad. Model checkpoints are inputs. The shader cache starts empty for native acceptance runs.
 
-## Native USC compared with the two vendor compilers
+## Fixed-work GPU stack comparisons
+
+The four FP32 kernels below run on the same 4 GiB S30 over Chestnut USB. Each compiler receives the same ordered scalar UOps, input bytes, grid and block size. The benchmark checks the UOp and grid fingerprints across processes, switches submission paths independently of the compiler, and checks that each compiler's shader text has the same SHA-256 on both paths. All results must equal the CPU result element by element. Inputs are small integers exactly representable in FP32.
+
+Each cell is synchronized host submit-to-completion latency in milliseconds. It excludes compilation, transfers of the input and output buffers, and reference checking. Each of three fresh processes discards two launches and times eleven. The table reports the median of process medians, with pair order varied. Both paths request P0 through the board management controller for this diagnostic. Actual clock frequency was not sampled.
+
+| Compute firmware | Shader compiler | Add 32 elements | Add 262,144 elements | Matvec 2,048 × 512 | Matmul 128 × 128 × 128 |
+| --- | --- | ---: | ---: | ---: | ---: |
+| MTFW | USC | 0.5409 | 0.9145 | 2.2916 | 4.4910 |
+| MTFW | MUSA | 0.5599 | 1.2183 | 1.0004 | 3.9702 |
+| MTFW | LLVM | 0.5617 | 1.2111 | 0.9723 | 3.8831 |
+| META | USC | 0.2017 | 0.2841 | 0.7142 | 0.6144 |
+| META | MUSA | 0.2053 | 0.3657 | 0.3635 | 2.3408 |
+| META | LLVM | 0.2036 | 0.3651 | 0.3631 | 2.3445 |
+
+The stock-firmware rows isolate shader compiler choice with the same submission path. The MUSA shader on both firmware paths isolates submission of identical machine code. Open META splits eligible native USC grids between two command processors. Vendor shaders use their original group IDs and a single command stream. The reference path is tinygrad submitting through stock MTFW over Chestnut USB. The results measure wall time on this device.
+
+With stock MTFW, keeping the bound in a register for loops of at least 64 iterations and incrementing the counter in place reduced native matmul latency from 5.038 to 4.508 ms in a separate before/after test (three fresh processes per version). Matvec measured 2.302 ms on both versions. On open META, the corresponding matmul medians were 0.629 and 0.617 ms.
+
+### Common schedules on model inference
+
+All three runs disable renderer-specific model selections in the S30 LLM kernel module. The common scheduler distributes one output dimension across at most 32 lanes and honors explicit kernel options. The timings below require matching hashes of the scheduled kernel set and the ordered model launch names and dimensions. Transport helpers are counted separately and remain in the timed path. Each inference process checks five outputs against the recorded reference, and warm latency is the median of calls 3–5. This deliberately simple schedule measures the same work on each stack. The separately tuned model timings follow below.
+
+| Workload | USC + open META | MUSA + stock MTFW | LLVM + stock MTFW | Distinct scheduled kernels |
+| --- | ---: | ---: | ---: | ---: |
+| MNIST, 16 digits | 133.10 ms | 242.59 ms | 229.89 ms | 9 |
+| Qwen2.5-0.5B Q8_0, prompt plus eight tokens | 7.932 s | 11.550 s | 11.478 s | 62 |
+
+Using tinygrad's normal MUSA scheduling rules for all three compilers, the same nine MNIST inference kernels took **10.57 ms native, 13.81 ms MUSA and 14.90 ms vendor LLVM**. Native compilation still exceeds the 64-temporary limit on those schedules for Whisper and Qwen. On the simple schedule, Whisper produced the reference transcript on all paths, but native and MUSA recorded 97 and 96 distinct schedules and different launch sequences. This run supplies no fixed-work Whisper speed comparison.
+
+For MNIST training, the native shader compiler now accepts **127 of 133** distinct kernels captured with tinygrad’s normal MUSA schedule, up from 119. All six remaining failures exceed the temporary-register limit. The new instruction scheduler interleaves independent dot products to release their input registers earlier and preserves each accumulator's addition order. Each of the eight recovered kernels matched a per-output, original-instruction-order reference bit for bit for three inputs on the S30. The normal native training configuration finished 200 Adam steps from an empty shader cache, compiling 102 shaders and scoring 9,662/10,000 on the held-out set. That run took 36.68 s with a 168.44 ms warm update. Hoisting short-loop bounds as well had raised that time to 178.03 ms.
+
+Run from the tinygrad checkout with the S30 attached and the model environment active. The full reference matrix requires the vendor tools and firmware in `MUSA_PATH` and `MT_FIRMWARE`, and the GNU META tools in `META_AS` and `META_OBJCOPY`. The native-only child runs with both vendor paths disabled. The model comparison checks predictions and rejects differing schedules or launch sequences.
+
+```sh
+PYTHONPATH=. python -m extra.usbgpu.s30.bench_fixed
+PYTHONPATH=. python -m extra.usbgpu.s30.bench_fixed --musa-schedule --compare-model mnist /path/to/mnist-s30.safetensors
+```
+
+## Model performance with backend-selected schedules
+
+These figures include renderer-specific kernel selection, layout, tiling, code generation and submission. All paths ran the same Adam optimizer for training. Use the fixed-work comparisons above for attribution to the compiler or submission path.
 
 Each inference process started with compiler caching disabled, loaded the same checkpoint and checked all five outputs. Cold latency includes device setup, checkpoint loading and the first prediction. Warm latency is the median of predictions 3–5. Native and vendor LLVM each ran in one fresh process per model. The MUSA column uses the same-card reference run recorded below.
 

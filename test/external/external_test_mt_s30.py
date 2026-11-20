@@ -328,6 +328,19 @@ class TestS30USB(unittest.TestCase):
       prg(dst.meta.va, src.meta.va, wait=True)
       self.assertEqual(struct.unpack("<f", dst.as_memoryview())[0], sum(vals))
 
+  def test_native_interleaved_dots(self):
+    import numpy as np
+    from tinygrad.uop.ops import KernelInfo, UOp
+    def kernel(out, a, b):
+      lane = UOp.special(32, "lidx0")
+      stores = [out[(lane*4+r)*4+c].store(sum(a[(lane*4+r)*16+k]*b[k*4+c] for k in range(16))) for r in range(4) for c in range(4)]
+      return UOp.sink(*stores, arg=KernelInfo(name="dot_tile", optimized=True))
+    rng = np.random.default_rng(30)
+    a, b = rng.integers(-4, 5, (128,16)).astype(np.float32), rng.integers(-4, 5, (16,4)).astype(np.float32)
+    with Context(DEV="MT:USC", CACHELEVEL=0):
+      out = Tensor.empty(128*4, device="MT").custom_kernel(Tensor(a.flatten(), device="MT"), Tensor(b.flatten(), device="MT"), fxn=kernel)[0]
+      np.testing.assert_array_equal(out.numpy().reshape(128,4), a@b)
+
   def test_native_accumulator_write(self):
     from tinygrad.dtype import AddrSpace
     from tinygrad.renderer import TinyELF

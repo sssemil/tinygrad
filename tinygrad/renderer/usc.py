@@ -14,6 +14,45 @@ shared_bits:dict[str,tuple[int|None,...]] = {"iadd":(28,20), "imul":(28,None), "
 half_bits = {"fmul":(9,10), "fadd":(9,26), "fma":(9,10,26)}
 Instruction = tuple[str, tuple[int, ...], int]
 
+def _reorder(ins:list[Instruction], order:list[int]) -> list[Instruction]:
+  remap = {v:i for i,v in enumerate(order)}
+  return [(op, tuple(remap[v] if v >= 0 else v for v in src), imm) for op,src,imm in (ins[i] for i in order)]
+
+def _schedule_fmas(ins:list[Instruction]) -> list[Instruction]:
+  # Interleave independent dot products at the same reduction step so they can share and release their inputs.
+  # Each FMA keeps its original addend. Slot writes, predicates and loads following a store end the scheduling region.
+  pure = {"imm", "group", "lane", "imul", "imad", "iadd", "lsl", "lsr", "asr", "and", "or", "xor", "mov", "half_to_float",
+          "ld", "ld8", "ld16", "fadd", "fmul", "fma", "fmax"}
+  order:list[int] = []
+  emitted:set[int] = set()
+  depth:dict[int,int] = {}
+  start, stored = 0, False
+  for end in range(len(ins)+1):
+    op = ins[end][0] if end < len(ins) else "end"
+    if op in ("st", "st8", "st16"):
+      stored = True
+      continue
+    if op in pure and not (stored and op in ("ld", "ld8", "ld16")):
+      if op == "fma" and (acc:=ins[end][1][2]) >= 0 and ins[acc][0] in ("slot", "fmul", "fma", "mov", "fadd"):
+        depth[end] = depth.get(acc, 0)+1
+      continue
+    for root in sorted(depth, key=depth.__getitem__):
+      stack = [(root, False)]
+      while stack:
+        v, ready = stack.pop()
+        if v in emitted: continue
+        if ready:
+          order.append(v)
+          emitted.add(v)
+        else:
+          stack.append((v, True))
+          stack.extend((s, False) for s in reversed(ins[v][1]) if s >= start)
+    order.extend(i for i in range(start, min(end+1, len(ins))) if i not in emitted)
+    emitted.clear()
+    depth.clear()
+    start, stored = end+1, False
+  return _reorder(ins, order)
+
 def _delay_loads(ins:list[Instruction]) -> list[Instruction]:
   # Move input loads and their address calculations toward first use inside straight-line floating point arithmetic.
   boundary = len(ins)
@@ -27,19 +66,17 @@ def _delay_loads(ins:list[Instruction]) -> list[Instruction]:
       if op not in ("fadd", "fmul", "fma"): boundary = i
     for v in src:
       if v >= 0: position[v] = min(position[v], position[i])
-  order = sorted(range(len(ins)), key=position.__getitem__)
-  remap = {v:i for i,v in enumerate(order)}
-  return [(op, tuple(remap[v] if v >= 0 else v for v in src), imm) for op,src,imm in (ins[i] for i in order)]
+  return _reorder(ins, sorted(range(len(ins)), key=position.__getitem__))
 
-def _rematerialize_ids(ins:list[Instruction]) -> list[Instruction]:
-  # Group and lane IDs stay in hardware for the whole dispatch. Read them again at use instead of holding a temporary.
+def _rematerialize_inputs(ins:list[Instruction]) -> list[Instruction]:
+  # Group IDs, lane IDs and shared constants stay in hardware for the whole dispatch. Read them again at use.
   out:list[Instruction] = []
   remap:dict[int,int] = {}
   for i,(op,src,imm) in enumerate(ins):
-    if op in ("group", "lane"): continue
+    if op in ("group", "lane", "imm"): continue
     args = []
     for v in src:
-      if v >= 0 and ins[v][0] in ("group", "lane"):
+      if v >= 0 and ins[v][0] in ("group", "lane", "imm"):
         args.append(len(out))
         out.append(ins[v])
       else: args.append(remap[v] if v >= 0 else v)
@@ -70,7 +107,8 @@ def _forward_slot_reads(ins:list[Instruction]) -> list[Instruction]:
 
 def assemble(ins:list[Instruction]) -> tuple[bytes, int]:
   ins = _forward_slot_reads(ins)
-  if (ret:=_assemble(ins) or _assemble(_delay_loads(ins)) or _assemble(_rematerialize_ids(ins))) is not None: return ret
+  if (ret:=_assemble(ins) or _assemble(_delay_loads(ins)) or _assemble(_rematerialize_inputs(ins))) is not None: return ret
+  if (ret:=_assemble(_schedule_fmas(ins))) is not None: return ret
   raise NotImplementedError("S30 USC needs more than 64 live temporaries")
 
 def _assemble(ins:list[Instruction]) -> tuple[bytes, int]|None:
@@ -80,15 +118,15 @@ def _assemble(ins:list[Instruction]) -> tuple[bytes, int]|None:
   for i,(_,src,_) in enumerate(ins):
     for v in src:
       if v >= 0: last[v] = max(last.get(v, i), i, *(end for start,end in loops if v <= start <= i <= end))
-  # Write a floating-point result directly into its accumulator when the old value has had its last read.
+  # Reuse the destination of an accumulator update or loop increment after its previous value has had its last read.
   targets:dict[int,int] = {}
   used:dict[int,int] = {}
   boundary = -1
   for i,(op,src,_) in enumerate(ins):
     if op == "assign":
       slot, value = src
-      if (value > max(slot,boundary) and last.get(value) == i and used.get(slot,-1) <= value and
-          ins[value][0] in ("fma", "fmul", "fadd") and value not in used):
+      if (value > max(slot,boundary) and last.get(value) == i and used.get(slot,-1) <= value and value not in used and
+          (ins[value][0] in ("fma", "fmul", "fadd") or (ins[slot][0] == "range" and ins[value][0] == "iadd" and value+1 == i))):
         targets[value] = slot
     if op in ("range", "back", "barrier", "cndst", "cndend"): boundary = i
     for v in src: used[v] = i
@@ -404,6 +442,7 @@ class MTUSCRenderer(Renderer):
       regs[u] = r
       return r
 
+    bounds:dict[UOp,int] = {}
     gate:UOp|None = None
     for u in uops:
       if u.op is Ops.IF: gate = u.src[0]
@@ -411,13 +450,15 @@ class MTUSCRenderer(Renderer):
       elif u.op is Ops.BARRIER: emit("barrier")
       elif u.op is Ops.RANGE:
         if u.src[0].vmin < 1 or u.src[0].vmax >= 1<<31: raise NotImplementedError("S30 USC requires a positive loop bound")
+        # A bound held across a short loop costs a live temporary for little saved work.
+        if u.src[0].vmin >= 64: bounds[u] = reg(u.src[0])
         regs[u] = emit("range", literal(0))
       elif u.op is Ops.END:
         idx = u.src[1]
         counter = regs[idx]
         advance = emit("iadd", counter, literal(1))
         emit("assign", counter, advance)
-        pred = emit("ilt", counter, reg(idx.src[0]))
+        pred = emit("ilt", counter, bounds[idx] if idx in bounds else reg(idx.src[0]))
         emit("back", counter, pred)
       elif u.op in (Ops.LOAD, Ops.STORE):
         idx = u.src[0]
