@@ -248,11 +248,13 @@ def s30_grid(groups:tuple[int,int,int], local:tuple[int,int,int], shared:int) ->
   lanes = lx*ly*lz
   return (*(g-1 for g in groups), (lanes if lanes < 32 else 0)<<25 | 2<<11 | shared, (lx-1)<<20 | (ly-1)<<10 | (lz-1))
 
-def s30_cdm_stream(words:tuple[int,...]) -> bytearray:
+def s30_cdm_stream(words:tuple[int,...], *, direct:bool=False) -> bytearray:
   write_offset = (len(words)+1)*4 + 64  # include the CDM prefetch guard after STREAM_TERMINATE
   if write_offset >= CDM_RING_SIZE: raise ValueError("S30 compute stream exceeds its ring")
   stream = bytearray(2*CDM_CONTROL_SIZE+write_offset)
   for core in range(2): struct.pack_into('<Q', stream, core*CDM_CONTROL_SIZE, write_offset)
+  # Both CDMs must reach TERMINATE. Starting the secondary at the first dispatch executes in-place stores twice on the direct path.
+  if direct: struct.pack_into('<Q', stream, CDM_CONTROL_SIZE+8, len(words)*4)
   struct.pack_into(f'<{len(words)+1}I', stream, 2*CDM_CONTROL_SIZE, *words, 0x80000000)
   return stream
 
@@ -345,7 +347,7 @@ class MTS30Program(Program['MTDevice']):
     self.grid_offset = param_size+2*CDM_CONTROL_SIZE+4*len(dispatch)
     if self.direct:
       self.packet.host[:len(pds)] = pds
-      self.launch = bytearray(param_size)+s30_cdm_stream(words)
+      self.launch = bytearray(param_size)+s30_cdm_stream(words, direct=True)
     else:
       packet = s30_cdm_packet(words, max(8, temps, attrs), self.packet.meta.va, controls)
       packet[pds_start:pds_start+len(pds)] = pds

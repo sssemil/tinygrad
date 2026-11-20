@@ -47,7 +47,7 @@ class ChestnutBoot(MTS30Firmware):
     self.dirty_code = True
     shared = ceildiv(len(params), 64)
     grid = s30_grid(program.arg.global_size, program.arg.local_size, shared+ceildiv(local, 16))
-    return params, s30_cdm_stream(s30_dispatch(pds, shared, attrs)+grid)
+    return params, s30_cdm_stream(s30_dispatch(pds, shared, attrs)+grid, direct=True)
 
   def stage(self, params:bytearray, stream:bytearray):
     self.mem[PARAMS:PARAMS+len(params)] = params

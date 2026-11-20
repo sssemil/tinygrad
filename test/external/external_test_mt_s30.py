@@ -154,6 +154,18 @@ class TestS30USB(unittest.TestCase):
         for actual, expected in zip(run("MT",q,k,v,mask,g), run("CPU",q,k,v,mask,g), strict=True):
           np.testing.assert_allclose(actual, expected, rtol=5e-4, atol=5e-5)
 
+  def test_native_inplace_update(self):
+    import numpy as np
+    with Context(DEV="MT:USC", CACHELEVEL=0):
+      for size, dtype in ((1, np.int64), (65, np.float32), (1024*1024, np.int32)):
+        with self.subTest(size=size):
+          values = np.arange(size, dtype=dtype)
+          x = Tensor(values, device="MT").realize()
+          for delta in (3, 7):
+            x.assign(x+delta).realize()
+            values = values+delta
+            np.testing.assert_array_equal(x.numpy(), values)
+
   def test_native_vector_add(self):
     import numpy as np
     from unittest.mock import patch

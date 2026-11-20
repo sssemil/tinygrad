@@ -8,9 +8,9 @@ Measured on the same Chestnut S30 with compiler caching disabled. The cold colum
 
 | Workload | Native cold | MUSA cold | Native warm | MUSA warm |
 | --- | ---: | ---: | ---: | ---: |
-| MNIST, batch of 16 | 0.852 s | 3.490 s | 23.91 ms | 13.76 ms |
-| Whisper tiny.en, test.wav | 10.079 s | 51.250 s | 4.186 s | 2.285 s |
-| Qwen2.5-0.5B Q8_0 | 18.263 s | 172.203 s | 4.707 s | 4.813 s |
+| MNIST, batch of 16 | 0.850 s | 3.490 s | 24.00 ms | 13.76 ms |
+| Whisper tiny.en, test.wav | 9.981 s | 51.250 s | 4.166 s | 2.285 s |
+| Qwen2.5-0.5B Q8_0 | 17.691 s | 172.203 s | 4.603 s | 4.813 s |
 
 The benchmark checked all five outputs against the recorded reference for each model on each backend. The native column uses the offline, isolated benchmark. It checked every loaded USC program against compiler output generated in the same process. The check covered 10 distinct binaries for MNIST, 93 for Whisper and 73 for Qwen. The benchmark also checked that compute startup received only zero-filled context memory, with META master boot disabled. It blocked vendor firmware boot and management mailbox construction. The card powered up with its factory firmware still installed. The host did not upload proprietary code during these model runs. The board-management mailbox was unused.
 
@@ -20,9 +20,9 @@ Separate cold-slot runs place every GPU-visible page in Chestnut SRAM or the bri
 
 | Model | Result | Rail enable to result | Fresh shaders |
 | --- | --- | ---: | ---: |
-| MNIST, test image 0 | Class 7 | 0.340 s | 9 |
-| Whisper tiny.en, test.wav | Could you please let me out of the box? | 124.180 s | 90 |
-| Qwen2.5-0.5B, 36-token France prompt | All eight CPU reference tokens, including EOS | 149.350 s | 31 |
+| MNIST, test image 0 | Class 7 | 0.364 s | 9 |
+| Whisper tiny.en, test.wav | Could you please let me out of the box? | 121.688 s | 90 |
+| Qwen2.5-0.5B, 36-token France prompt | All eight CPU reference tokens, including EOS | 141.560 s | 31 |
 
 The entire 2 MiB external bridge flash matches its reconstructed contents, including the application built from source with its target runtime objects. The outstanding boot question is what the S30 board and the bridge silicon execute before the host can train the PCIe link. All measurements used the original board boot storage.
 
@@ -562,3 +562,13 @@ Both the reconstruction and the full device read had SHA-256 `a1a841b88e93cc49f3
 ## November 20, 2026 — compile the batch-16 MNIST backward pass
 
 A fresh one-step batch-16 training graph exposed a nested spatial reduction with 64 channels and two four-element reduction axes. The kernel exceeded the 64 temporary registers both before and after the three-position tile change. Expanding the output and reduction loops together kept too many partial results live. Fused spatial reductions now retain their parallel workgroup dimensions and leave those loops rolled. The native compiler accepted all 118 graphs from this training step and all 165 archived inference graphs. Hardware training also exposed a separate dispatch correctness issue during the comparison of updated model state.
+
+## November 20, 2026 — execute each native workgroup once
+
+An in-place increment exposed a dispatch error that class labels and transcripts missed. The two direct compute command processors started at the same instruction in the ring. Both executed the update, advancing each BatchNorm counter from 70 to 72 in one training step. Changing kick order and the broadcast mask did not correct it. Kicking only one processor timed out. The secondary now reads the stream from its terminator, so both processors report completion and only the primary submits the grid.
+
+On the physical S30, two consecutive additions matched NumPy for a scalar int64, 65 float32 elements and 1,048,576 int32 elements. A full batch-16 SGD step on the trained MNIST checkpoint advanced both counters to 71. Across separate native and CPU processes all 20 updated model tensors agreed within the 0.0002 absolute and relative tolerances. Losses were 0.004112401 and 0.004112379 respectively. The largest absolute difference was 0.00488 in running variance. The native suite passed all 22 applicable hardware tests with the vendor firmware and toolchain paths absent.
+
+The ordinary isolated benchmarks in the table at the top include this correction. A Winograd five-tap convolution experiment returned the reference digits but took about 228 ms warm on the same batch, compared with 24.00 ms on the direct convolution path.
+
+All 32 hardware tests passed with the reference stack available. Fresh SRAM-only runs classified the digit, transcribed the full clip and returned all eight Qwen tokens with 9, 90 and 31 newly generated shaders, respectively. A single-group shader tested offsets of 0, 1 and 4 using bit 28 of the second kernel header and three appended coordinate words. With the destination cleared before each launch, the shader saw group ID zero in every case. This encoding did not supply the nonzero group ID needed to divide the dispatch between two streams.
