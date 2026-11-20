@@ -533,3 +533,5 @@ tinygrad/extra/usbgpu/s30/bench_isolated.sh sram-generate .s30-tools/models/Qwen
 ```
 
 In the vendor 3.1.0 driver, the Sudi eFuse inventory helper constructs a message and calls `mtgpu_ipc_transmit_ext`. Its result therefore depends on an already-operating mailbox. This was an offline source-of-initialization check. No fuse commands were issued.
+
+A second isolated Qwen run used the 41-token input produced by the chat template for “Reply with just the number. What is two plus two?” It generated token 19 (“4”) at 95.699 s and token 151645 (EOS) at 105.580 s. Both agreed with fresh CPU generation for that input. All 31 shaders were emitted in-process. The normal hardware suite also checks the last byte of the ordinary 224 KiB staging window and an upload with a 127-byte tail beyond it. All 18 applicable native hardware tests passed with the vendor paths absent.

@@ -86,11 +86,13 @@ class TestS30USB(unittest.TestCase):
 
   def test_native_staged_upload(self):
     from tinygrad.runtime.support.usb import HALF, SLOT
+    from tinygrad.runtime.support.mt.s30 import S30_UPLOAD_SIZE
     rng = random.Random(31)
     with Context(DEV="MT:USC", CACHELEVEL=0):
       buf = Buffer("MT", HALF*2+256, initial_value=bytes(HALF*2+256))
       expected = bytearray(buf.nbytes)
-      for offset, n in ((4, SLOT-1), (128, SLOT), (128, HALF), (4, HALF+3), (4, HALF*2+127), (5, SLOT+1)):
+      for offset, n in ((4, SLOT-1), (128, SLOT), (128, S30_UPLOAD_SIZE), (4, S30_UPLOAD_SIZE+127), (128, HALF), (4, HALF+3),
+                        (4, HALF*2+127), (5, SLOT+1)):
         with self.subTest(offset=offset, n=n):
           data = rng.randbytes(n)
           buf.host.view(offset-1)[1:1+n] = data
