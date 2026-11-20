@@ -102,6 +102,21 @@ class TestS30USB(unittest.TestCase):
     resident = Tensor(original, device="CPU", dtype=dtypes.int32).to("MT").realize()
     self.assertEqual(resident.to("CPU").tolist(), original)
 
+  def test_native_rmsnorm(self):
+    import numpy as np
+    from tinygrad.llm.kernels.mt import RMSNorm
+    from tinygrad import nn
+    rng = np.random.default_rng(30)
+    for width, dtype in ((96, np.float32), (896, np.float16)):
+      x, weight, grad = (rng.standard_normal(s).astype(d) for s,d in (((2,width),np.float32), ((width,),dtype), ((2,width),np.float32)))
+      def run(device, layer):
+        a, layer.weight, g = [Tensor(v, device=device).realize() for v in (x, weight, grad)]
+        y = layer(a)
+        return [t.numpy() for t in (y, *y.gradient(a, layer.weight, gradient=g))]
+      with self.subTest(width=width), Context(DEV="MT:USC", CACHELEVEL=0):
+        for got, ref in zip(run("MT", RMSNorm(width)), run("CPU", nn.RMSNorm(width)), strict=True):
+          np.testing.assert_allclose(got, ref, rtol=1e-3, atol=1e-5)
+
   def test_native_vector_add(self):
     import numpy as np
     from unittest.mock import patch

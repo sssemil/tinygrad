@@ -10,9 +10,9 @@ Measured on the same Chestnut S30 with compiler caching disabled. The cold colum
 | --- | ---: | ---: | ---: | ---: |
 | MNIST, batch of 16 | 0.850 s | 3.745 s | 27.44 ms | 14.02 ms |
 | Whisper tiny.en, test.wav | 10.788 s | 51.649 s | 4.858 s | 2.282 s |
-| Qwen2.5-0.5B Q8_0 | 16.869 s | 172.335 s | 5.031 s | 4.815 s |
+| Qwen2.5-0.5B Q8_0 | 18.651 s | 172.335 s | 4.892 s | 4.815 s |
 
-The benchmark checked all five outputs against the recorded reference for each model on each backend. The native column uses the offline, isolated benchmark. It checked every loaded USC program against compiler output generated in the same process. The check covered 10 distinct binaries for MNIST, 92 for Whisper and 77 for Qwen. The benchmark also checked that compute startup received only zero-filled context memory, with META master boot disabled. It blocked vendor firmware boot and management mailbox construction. The card powered up with its factory firmware still installed. The host did not upload proprietary code during these model runs. The board-management mailbox was unused.
+The benchmark checked all five outputs against the recorded reference for each model on each backend. The native column uses the offline, isolated benchmark. It checked every loaded USC program against compiler output generated in the same process. The check covered 10 distinct binaries for MNIST, 92 for Whisper and 73 for Qwen. The benchmark also checked that compute startup received only zero-filled context memory, with META master boot disabled. It blocked vendor firmware boot and management mailbox construction. The card powered up with its factory firmware still installed. The host did not upload proprietary code during these model runs. The board-management mailbox was unused.
 
 ## November 20, 2026 — proprietary reference
 
@@ -471,3 +471,9 @@ In three isolated fresh processes starting with the slot already off, all 896 ou
 ```sh
 extra/usbgpu/s30/bench_isolated.sh sram-qwen ../.s30-tools/models/Qwen2.5-0.5B-Instruct-Q8_0.gguf
 ```
+
+## November 20, 2026 — one native workgroup per Qwen normalization row
+
+Each workgroup sums strided squares, shares the lane sums in local memory, then scales and weights the original row in the same launch. The kernel is built from UOps. The hardware check compares forward output and both gradients with the ordinary CPU RMSNorm for FP16 and FP32 weights at widths 896 and 96. All 18 applicable native tests passed.
+
+The five-call offline Qwen benchmark compiled 73 distinct shaders and returned the same eight tokens on each call. Warm median fell from 5.031 s to 4.892 s. Time to first output was 18.651 s. Static shapes use the workgroup path. An experiment passing symbolic rows directly to a custom kernel failed during placeholder creation. Fusing the prompt's gate and up expressions slowed the earlier baseline to 5.194 s. Folding fixed address displacements into the native emitter produced a change within timing variation.
