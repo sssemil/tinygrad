@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Offline S30 inference on a merged-/usr Linux host with open-source system libraries.
+# Offline S30 benchmarks on a merged-/usr Linux host with open-source system libraries.
 set -eu
 if [[ ${1:-} == train-mnist ]]; then
   if [[ $# != 1 ]]; then echo "usage: $0 train-mnist" >&2; exit 2; fi

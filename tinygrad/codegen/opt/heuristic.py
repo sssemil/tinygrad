@@ -104,9 +104,13 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
       elif (a:=next((i for i in reversed(k.upcastable_dims()) if k.full_shape[i]%4 == 0), None)) is not None:
         k.apply_opt(Opt(OptOps.SPLIT, a, (4, AxisType.UPCAST)))
     if local_axes is None: local_axes = [k.rngs[a] for a in reversed(k.axes_of(AxisType.GLOBAL, AxisType.WEAK, reduce=False))]
+    # Weight gradients reduce over images and positions. Distribute channels before the small filter axes.
+    filter_grad = (dot is not None and red is not None and len(k.reduceops) == 1 and len(red.src) >= 3 and
+                   not spatial and sum(1 < r.vmax+1 <= 5 for r in local_axes) >= 2)
+    if filter_grad: local_axes.sort(key=lambda r: r.vmax+1 <= 5)
     width = 128 if spatial or tiled else 64 if red is not None and len(local_axes) > 1 else 32
     # Avoid folding a small matrix into a single workgroup on the two-core S30.
-    multidim = spatial or (tiled and prod(r.vmax+1 for r in local_axes) >= 2*width)
+    multidim = spatial or filter_grad or (tiled and prod(r.vmax+1 for r in local_axes) >= 2*width)
     for r in local_axes:
       if r.src[0].op is not Ops.CONST: continue
       size = next((n for n in range(min(64, width) if spatial else width, 1, -1) if r.src[0].val%n == 0), 1)

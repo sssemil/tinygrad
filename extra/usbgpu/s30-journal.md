@@ -703,3 +703,15 @@ From the workspace, the native command uses the installed model environment and 
 ```sh
 PYTHON="$PWD/.s30-tools/whisper-venv/bin/python" tinygrad/extra/usbgpu/s30/bench_isolated.sh train-mnist
 ```
+
+## November 20, 2026 — distribute convolution weight gradients over channels
+
+One warm batch-32 Adam step spent 375 ms computing a 5×5 weight gradient in workgroups of five lanes. Three other weight gradients also favored the short filter axes. The scheduler now distributes these multi-axis reductions across the available channel dimensions first. The largest gradient took 75 ms in the next warm step. A separate experiment tiled two channels per thread and brought this kernel to 54 ms. A four-by-four tile exceeded the register limit.
+
+| Same 200-update training benchmark | Native USC | MUSA reference |
+| --- | ---: | ---: |
+| Correct test digits | 9,687 / 10,000 | 9,691 / 10,000 |
+| Time for 200 updates including first-step compilation | 75.85 s | 89.17 s |
+| Warm median per update | 364.64 ms | 276.41 ms |
+
+The native run again generated all 102 programs from UOps in the isolated process. The warm update took 57% less time than before the change. The native warm update still took 32% longer than MUSA. On a separate batch-16 SGD step the loss and all 20 updated model tensors agreed with CPU. All 32 applicable native hardware tests passed. All 118 archived training graphs compiled, and all 165 archived inference graphs produced byte-identical shader binaries before and after this change.
