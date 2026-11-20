@@ -9,10 +9,10 @@ Measured on the same Chestnut S30 with compiler caching disabled. The cold colum
 | Workload | Native cold | MUSA cold | Native warm | MUSA warm |
 | --- | ---: | ---: | ---: | ---: |
 | MNIST, batch of 16 | 0.844 s | 3.561 s | 25.87 ms | 14.16 ms |
-| Whisper tiny.en, test.wav | 10.714 s | 51.521 s | 4.773 s | 2.281 s |
+| Whisper tiny.en, test.wav | 10.352 s | 51.521 s | 4.326 s | 2.281 s |
 | Qwen2.5-0.5B Q8_0 | 18.269 s | 172.478 s | 4.732 s | 4.809 s |
 
-The benchmark checked all five outputs against the recorded reference for each model on each backend. The native column uses the offline, isolated benchmark. It checked every loaded USC program against compiler output generated in the same process. The check covered 10 distinct binaries for MNIST, 92 for Whisper and 73 for Qwen. The benchmark also checked that compute startup received only zero-filled context memory, with META master boot disabled. It blocked vendor firmware boot and management mailbox construction. The card powered up with its factory firmware still installed. The host did not upload proprietary code during these model runs. The board-management mailbox was unused.
+The benchmark checked all five outputs against the recorded reference for each model on each backend. The native column uses the offline, isolated benchmark. It checked every loaded USC program against compiler output generated in the same process. The check covered 10 distinct binaries for MNIST, 91 for Whisper and 73 for Qwen. The benchmark also checked that compute startup received only zero-filled context memory, with META master boot disabled. It blocked vendor firmware boot and management mailbox construction. The card powered up with its factory firmware still installed. The host did not upload proprietary code during these model runs. The board-management mailbox was unused.
 
 ### Inference without card DDR
 
@@ -535,3 +535,9 @@ tinygrad/extra/usbgpu/s30/bench_isolated.sh sram-generate .s30-tools/models/Qwen
 In the vendor 3.1.0 driver, the Sudi eFuse inventory helper constructs a message and calls `mtgpu_ipc_transmit_ext`. Its result therefore depends on an already-operating mailbox. This was an offline source-of-initialization check. No fuse commands were issued.
 
 A second isolated Qwen run used the 41-token input produced by the chat template for “Reply with just the number. What is two plus two?” It generated token 19 (“4”) at 95.699 s and token 151645 (EOS) at 105.580 s. Both agreed with fresh CPU generation for that input. All 31 shaders were emitted in-process. The normal hardware suite also checks the last byte of the ordinary 224 KiB staging window and an upload with a 127-byte tail beyond it. All 18 applicable native hardware tests passed with the vendor paths absent.
+
+## November 20, 2026 — normalize long audio attention rows on the GPU
+
+Materializing only the transposed key gave 4.770 s on the ordinary full Whisper benchmark, and packing only the values gave 4.904 s. Storing the probability matrix once before applying the values reduced the median to 4.418 s. The native long-row softmax now gives each row a workgroup of 64 lanes. Two local-memory reductions share the maximum and exponential sum before writing the normalized probabilities. The selection requires FP32, static shapes, at least 1,024 query positions and a whole number of lane groups along the key axis. The ordinary attention calculation handles other inputs.
+
+Two isolated fresh runs gave warm medians of 4.348 s and 4.326 s. The second took 10.352 s from process benchmark start to first transcript and checked 91 distinct source-generated shaders. All ten transcriptions matched the reference. A physical S30 test compared masked rectangular attention and gradients for query, key and value against CPU on random data. The final native hardware suite passed all 19 applicable tests. The latest MUSA reference is 2.281 s warm on the same clip.

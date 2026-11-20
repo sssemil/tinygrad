@@ -4,6 +4,7 @@ import sys, base64, multiprocessing, itertools, collections, functools, math, op
 from typing import Optional, Union, Literal, List
 
 from tinygrad import Device, Tensor, TinyJit, UOp, Variable, nn, dtypes
+from tinygrad.llm.kernels.mt import s30_prefill_attention
 from tinygrad.nn.state import torch_load, load_state_dict
 from tinygrad.dtype import least_upper_dtype, sum_acc_dtype
 from tinygrad.uop.ops import KernelInfo, Ops
@@ -102,7 +103,9 @@ class MultiHeadAttention:
     q = q.reshape(*q.shape[:2], self.n_head, head_dim).permute(0, 2, 1, 3)
     k = k.reshape(*k.shape[:2], self.n_head, head_dim).permute(0, 2, 1, 3)
     v = v.reshape(*v.shape[:2], self.n_head, head_dim).permute(0, 2, 1, 3)
-    attn = Tensor.scaled_dot_product_attention(q, k, v, mask[:n_ctx,:n_ctx] if mask is not None else None)
+    mask = mask[:n_ctx,:n_ctx] if mask is not None else None
+    if self.kv_caching is not None or (attn:=s30_prefill_attention(q, k, v, mask)) is None:
+      attn = q.scaled_dot_product_attention(k, v, mask)
     wv = attn.permute(0, 2, 1, 3).flatten(start_dim=2)
     return self.out(wv)
 

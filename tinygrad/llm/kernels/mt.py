@@ -47,6 +47,31 @@ def s30_gemv(x:Tensor, weight:Tensor) -> Tensor|None:
   partials = (weight.reshape(rows, k//32, 32) * x.reshape(k//32, 32)).sum(-1).contiguous()
   return partials.sum(-1).reshape(*x.shape[:-1], rows)
 
+def _row_softmax(out:UOp, x:UOp) -> UOp:
+  rows, width = x.shape
+  row, lane = UOp.special(rows, "gidx0"), UOp.special(64, "lidx0")
+  r, j, k, h, w = (UOp.range(n, i, AxisType.LOOP) for i,n in enumerate((width//64,64,width//64,64,width//64)))
+  peaks, sums = (UOp.placeholder((64,), dtypes.float, slot=i, addrspace=AddrSpace.LOCAL) for i in range(2))
+  ready = peaks[lane].store(x[row, r*64+lane].reduce(r, arg=Ops.MAX)).barrier()
+  peak = peaks.after(ready)[j].reduce(j, arg=Ops.MAX)
+  def exp(i:UOp): return (x[row, i*64+lane]-peak).exp()
+  total = sums[lane].store(exp(k).reduce(k, arg=Ops.ADD)).barrier()
+  inv = sums.after(total)[h].reduce(h, arg=Ops.ADD).reciprocal()
+  return out[row, w*64+lane].store(exp(w)*inv).end(w).sink(arg=KernelInfo(name="s30_softmax", optimized=True))
+
+def _row_softmax_grad(grad:UOp, call:UOp) -> tuple:
+  p, g = Tensor(call.src[2]).softmax(-1), Tensor(grad)
+  return None, (p*(g-(p*g).sum(-1, keepdim=True))).uop
+
+def s30_prefill_attention(q:Tensor, k:Tensor, v:Tensor, mask:Tensor|None) -> Tensor|None:
+  if not all_int(q.shape) or not all_int(k.shape) or q.dtype != k.dtype or q.dtype != v.dtype or q.dtype != dtypes.float or \
+     q.shape[-2] < 1024 or not k.shape[-2] or k.shape[-2]%64 or not is_s30(q.device, "USC"): return None
+  scores = q.matmul(k.transpose(-2,-1), dtype=dtypes.float) / math.sqrt(q.shape[-1])
+  if mask is not None: scores = scores + (mask.where(0, -math.inf) if mask.dtype == dtypes.bool else mask)
+  flat = scores.reshape(-1, scores.shape[-1]).contiguous()
+  probs = flat.empty_like().custom_kernel(flat, fxn=_row_softmax, grad_fxn=_row_softmax_grad)[0]
+  return probs.reshape(scores.shape) @ v
+
 def _softmax_value(out:UOp, scores:UOp, cache:UOp, pos:UOp) -> UOp:
   b, h, d = (UOp.range(n, axis) for axis,n in enumerate((out.shape[0], out.shape[1], out.shape[3])))
   m, s, k = (UOp.range(pos+1, axis) for axis in (3, 4, 5))
