@@ -5,6 +5,7 @@ from tinygrad.runtime.support.memory import MMIOInterface
 from tinygrad.runtime.support.system import PCIDevice, USBPCIDevice, System, filter_visible_devices
 from tinygrad.runtime.support.usb import USB3
 
+MT_BUFFER_VA, MT_BUFFER_PA = 0x8001000000, 0x80000000
 MT_VENDOR_ID = 0x1ed5
 MT_USB_GPU_BUS = 2
 MT_SYS_BAR, MT_DDR_BAR = 0, 2

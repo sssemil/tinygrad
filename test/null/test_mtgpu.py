@@ -3,6 +3,7 @@ from unittest.mock import Mock, patch
 from tinygrad.device import BufferSpec
 from tinygrad.runtime.ops_mt import MTAllocator
 from tinygrad.runtime.support.memory import MMIOInterface
+from tinygrad.runtime.support.mt.mmu import MTMMU4
 from tinygrad.runtime.support.mt.mtdev import MTSMC, MTDev, MT_IPC_EVENT_GET_FW_VERSION, MT_IPC_EVENT_SET_POWER_STATE, _Ring, _ipc_header
 
 
@@ -67,6 +68,16 @@ class TestMTSMC(unittest.TestCase):
 
 
 class TestMTDev(unittest.TestCase):
+  def test_reserve_shader_directories(self):
+    mmu = MTMMU4(0x30000000)
+    start = 0xe001000000
+    mmu.reserve_directories(start, 2 << 30)
+    self.assertEqual(len(mmu.pd), 3)
+    self.assertFalse(mmu.pt)
+    root = mmu.root[:4096]
+    for offset in (0, 0x3f000000, 0x5b402000, 0x7ffff000): mmu.map(start+offset, 0x80000000+offset)
+    self.assertEqual(mmu.root[:4096], root)
+
   def test_s30_direct_attach_without_smc(self):
     pci = Mock()
     pci.read_config.return_value = 0x01021ed5

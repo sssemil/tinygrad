@@ -12,7 +12,7 @@ from tinygrad.uop.ops import KernelInfo, Ops, PatternMatcher, UOp, UPat
 from tinygrad.runtime.support.memory import TLSFAllocator
 from tinygrad.runtime.support.usb import USBMMIOInterface, HALF, SLOT
 from tinygrad.runtime.support.mt.mmu import MT_PTE_READ_WRITE
-from tinygrad.runtime.support.mt.mtdev import MTDev
+from tinygrad.runtime.support.mt.mtdev import MT_BUFFER_PA, MT_BUFFER_VA, MTDev
 from tinygrad.runtime.support.mt.launch import MTLaunch, parse_mt_bundle, compress_mt_bundle, decompress_mt_bundle
 from tinygrad.runtime.support.mt.compiler import MTCompiler, MTLLVMCompiler
 from tinygrad.runtime.support.mt.elf import MTKernelImage
@@ -182,8 +182,9 @@ class S30VRAMView(USBMMIOInterface):
       n = len(src)//128*128
       # The upper SRAM half survives the bridge's ordinary F0 traffic for command packets and page tables.
       copy = self.dev.s30_copy
-      for off in range(0, n, S30_UPLOAD_SIZE):
-        chunk = src[off:min(off+S30_UPLOAD_SIZE, n)]
+      step = self.dev.s30_fw.upload_size
+      for off in range(0, n, step):
+        chunk = src[off:min(off+step, n)]
         self.usb.scsi_write(chunk, slot_start=HALF//SLOT)
         copy(self.va+offset+off, S30_STAGE_VA, global_size=(len(chunk)//128,1,1), local_size=(32,1,1), wait=self.dev.s30_fw.meta_enabled)
       if n < len(src): super().__setitem__(slice(offset+n, offset+len(src)), src[n:])
@@ -191,12 +192,12 @@ class S30VRAMView(USBMMIOInterface):
 class MTAllocator(Allocator['MTDevice']):
   def __init__(self, dev):
     super().__init__(dev)
-    self.vram = TLSFAllocator(max(0, dev.mt.vram_size - 0x80000000), base=0x80000000, block_size=0x1000)
+    self.vram = TLSFAllocator(max(0, dev.mt.vram_size - MT_BUFFER_PA), base=MT_BUFFER_PA, block_size=0x1000)
 
   def _alloc(self, size:int, options:BufferSpec) -> BufferStorage:
     size = round_up(size, 0x1000)
     pa = self.vram.alloc(size)
-    va = 0x8001000000 + (pa - self.vram.base)
+    va = MT_BUFFER_VA + (pa - self.vram.base)
     try:
       view = self.dev.mt.pci_dev.map_bar(2, off=pa, size=size, fmt='B')
       self.dev.map_buffer(va, pa, size)

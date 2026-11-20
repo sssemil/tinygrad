@@ -740,3 +740,7 @@ Latency is the median of eleven submissions to completion. Transfer counts come 
 DEV=MT:USC CACHELEVEL=0 MT_META=0 python -m extra.usbgpu.s30.bench_dispatch
 DEV=MT:USC CACHELEVEL=0 MT_META=1 python -m extra.usbgpu.s30.bench_dispatch
 ```
+
+The forced-first Qwen failure reproduced with a single descriptor, including after shortening the grid. The S30's primary MMU fault status at 0xe150 was 0x950000e05b402009. Its address field identified 0xe05b402000, the new USC shader's first instruction page. Re-uploading the tables and rewriting the root address did not clear the condition. Starting a fresh compute context did. Establishing the three USC page catalogue entries before starting META also fixed it, without restarting the device. The runtime now reserves only the directory pages for the tensor, PDS and USC ranges at boot. It installs leaf mappings as buffers are created. The forced-first test then produced all eight expected tokens, and the complete native hardware suite passed.
+
+The host stages the descriptor list once in the upper 64 KiB of Chestnut SRAM. Both GPU command processors and META see the same allocation through their mappings. The remaining 192 KiB of the upper SRAM half stages tensor uploads. This change reduced 64 dependent launches to 1.679 ms; the separate USB count was 31 transfers, including 14 bulk reads while polling. A single launch took 0.226 ms and eight took 0.432 ms.

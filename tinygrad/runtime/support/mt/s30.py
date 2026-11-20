@@ -15,9 +15,9 @@ from tinygrad.runtime.support.mt.compute import MTFirmwareBoot, FW_BASE, FW_DEVV
 from tinygrad.runtime.support.mt.elf import MTKernelImage
 from tinygrad.runtime.support.mt.meta import MetaPort, assemble
 from tinygrad.runtime.support.mt.mmu import MT_PTE_READ_ONLY, MT_PTE_READ_WRITE
-from tinygrad.runtime.support.mt.mtdev import MT_CORE_STRIDE, MTDev
+from tinygrad.runtime.support.mt.mtdev import MT_BUFFER_PA, MT_BUFFER_VA, MT_CORE_STRIDE, MTDev
 from tinygrad.runtime.support.system import USBPCIDevice
-from tinygrad.runtime.support.usb import HALF, SLOT, USBMMIOInterface
+from tinygrad.runtime.support.usb import HALF, SLOT
 if TYPE_CHECKING: from tinygrad.runtime.ops_mt import MTDevice
 
 # mtgpu-s30 3.1.0-6, mtfw-gen1.bin. The FWIF layout and META segments belong to this image.
@@ -102,7 +102,12 @@ class MTS30Firmware(MTFirmwareBoot):
     super().__init__(dev, PACKET+0x1000)
     self.bridge = pci.usb if bridge_sram and isinstance(pci:=dev.pci_dev, USBPCIDevice) and pci.usb.usb.product.startswith("custom") else None
     self.ring_va = S30_STAGE_VA+S30_RING_OFFSET-HALF if self.bridge is not None else FW_DEVVA+DIRECT_CDM
-    self.meta_enabled = bridge_sram and bool(getenv("MT_META", 0))
+    self.meta_enabled = self.bridge is not None and bool(getenv("MT_META", 0))
+    self.upload_size = HALF-META_BATCH_SIZE if self.meta_enabled else S30_UPLOAD_SIZE
+    if self.meta_enabled:
+      # The S30 can retain an absent page catalogue entry across META submissions. Install the directories before either engine runs.
+      for va in (MT_BUFFER_VA, PDS_BASE+(MT_BUFFER_VA & 0xffffffff), USC_BASE+(MT_BUFFER_VA & 0xffffffff)):
+        self.mmu.reserve_directories(va, dev.vram_size-MT_BUFFER_PA)
     self.meta_args:set[int] = set()
     self.meta_data = bytearray()
     self.meta_pending:list[tuple[int, MTS30Program]] = []
@@ -175,12 +180,11 @@ class MTS30Firmware(MTFirmwareBoot):
       base = (1<<39) | (pa+HALF)
       self.mmu.map_range(S30_READ_VA, base-HALF, HALF, MT_PTE_READ_WRITE)
       self.mmu.map(S30_COMPLETION_VA, (1<<39) | 0x822000, MT_PTE_READ_WRITE)
-      self.mmu.map_range(S30_STAGE_VA, base, S30_UPLOAD_SIZE, MT_PTE_READ_ONLY)
-      self.mmu.map_range(S30_STAGE_VA+S30_UPLOAD_SIZE, base+S30_UPLOAD_SIZE, 2*SLOT, MT_PTE_READ_WRITE)
-    size = META_BATCH+META_BATCH_SIZE if self.meta_enabled else 0x8000
-    if self.meta_enabled:
-      self.mmu.map_range(PDS_BASE+META_BATCH_PDS, self.context_pa+META_BATCH, META_BATCH_SIZE, MT_PTE_READ_WRITE)
-    with self._boot((self.meta_code if self.meta_enabled else b"").ljust(size, b"\0"), master=False, reset_domains=False):
+      self.mmu.map_range(S30_STAGE_VA, base, self.upload_size, MT_PTE_READ_ONLY)
+      self.mmu.map_range(S30_STAGE_VA+self.upload_size, base+self.upload_size, HALF-self.upload_size, MT_PTE_READ_WRITE)
+      if self.meta_enabled:
+        for va in (FW_DEVVA+META_BATCH, PDS_BASE+META_BATCH_PDS): self.mmu.map_range(va, base+self.upload_size, META_BATCH_SIZE, MT_PTE_READ_WRITE)
+    with self._boot((self.meta_code if self.meta_enabled else b"").ljust(0x8000, b"\0"), master=False, reset_domains=False):
       route = self._read(0x24e0, 4)
       self._reset(MT_CORE_STRIDE)
       self._write(MT_CORE_STRIDE+0xbf8, 0, 4)
@@ -206,7 +210,7 @@ class MTS30Firmware(MTFirmwareBoot):
           self._write(core+0x24c0, 3, 4)
         if self.meta_enabled:
           self.meta_sequence = 0
-          MetaPort(self).start(size-0x1000)
+          MetaPort(self).start(META_BATCH+META_BATCH_SIZE-0x1000)
         self.direct = True
         yield
       finally:
@@ -219,8 +223,7 @@ class MTS30Firmware(MTFirmwareBoot):
   def start_direct(self) -> None:
     if self.meta_enabled:
       self.meta_sequence = self.meta_sequence % 0xffffffff + 1
-      assert isinstance(self.v, USBMMIOInterface)
-      self.v.usb.pcie_request(0x60 if self.v.addr+0x1000 >= 1<<32 else 0x40, self.v.addr+0x1000, self.meta_sequence)
+      self.v[0x1000:0x1004] = struct.pack("<I", self.meta_sequence)
       return
     for reg,value in ((0x138, 4), (0x478, 1)):
       for core in (MT_CORE_STRIDE, 0): self._write(core+reg, value, 4)
@@ -231,7 +234,7 @@ class MTS30Firmware(MTFirmwareBoot):
       while (completed:=int.from_bytes(self.v[0x1004:0x1008], "little")) != self.meta_sequence:
         if time.monotonic() >= deadline:
           events = [self._read(core+0x130, 4) for core in (0, MT_CORE_STRIDE)]
-          faults = [hex(self._read(core+0xe160)) for core in (0, MT_CORE_STRIDE)]
+          faults = [hex(self._read(core+0xe150)) for core in (0, MT_CORE_STRIDE)]
           kernels = [(off, program.name) for off,program in self.meta_pending]
           for offset in (MT_CORE_STRIDE, 0): self._reset(offset)
           raise TimeoutError(f"S30 META sequence {self.meta_sequence}, completed {completed}, events {events}, faults {faults}, pending {kernels}")
@@ -249,7 +252,7 @@ class MTS30Firmware(MTFirmwareBoot):
       self.meta_flushing = True  # buffer finalizers may read the timeline during submission
       try:
         struct.pack_into('<I', self.meta_data, self.meta_pending[-1][0], 0)
-        self.v[META_BATCH:META_BATCH+len(self.meta_data)] = self.meta_data
+        unwrap(self.bridge).scsi_write(bytes(self.meta_data), slot_start=(HALF+self.upload_size)//SLOT)
         self.kick_direct(5.0*len(self.meta_pending) if timeout is None else timeout, readback)
       except BaseException:
         self.session.close()
