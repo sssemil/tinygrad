@@ -4,15 +4,17 @@ Hardware used for these measurements is the 4 GiB MTT S30 on Chestnut over USB. 
 
 ## Latest end-to-end cold and warm measurements
 
-Measured on the same Chestnut S30 with compiler caching disabled. The cold column starts before device and checkpoint setup and stops when the first result is available. Warm latency is the median of calls 3–5 in the same process. The MNIST row reports the median across five fresh processes per backend. The Whisper row summarizes three native and two MUSA processes, using the median of each column. Each Qwen call reprocesses the prompt and returns eight tokens. The input files and output comparisons are described below.
+Each native mode ran in five fresh, offline processes per model on the same card. The order alternated within each pair. Cold time starts before device and checkpoint setup and ends at the first checked output. Warm time is the median of calls 3–5, then the median across processes. MUSA used one fresh process per model with compiler caching disabled.
 
-| Workload | Native cold | MUSA cold | Native warm | MUSA warm |
+| Workload | Host direct cold / warm | META cold / warm | MUSA cold / warm | META warm wins vs direct |
 | --- | ---: | ---: | ---: | ---: |
-| MNIST, batch of 16 | 0.851 s | 3.503 s | 13.73 ms | 13.85 ms |
-| Whisper tiny.en, test.wav | 7.998 s | 51.893 s | 2.148 s | 2.285 s |
-| Qwen2.5-0.5B Q8_0 | 15.402 s | 172.834 s | 3.115 s | 4.832 s |
+| MNIST, 16 digits | 0.852 s / 13.64 ms | 0.864 s / 11.52 ms | 3.858 s / 14.20 ms | 5 of 5 |
+| Whisper tiny.en, test.wav | 8.081 s / 2.152 s | 7.582 s / 1.632 s | 52.666 s / 2.311 s | 5 of 5 |
+| Qwen2.5-0.5B Q8_0, prompt plus eight tokens | 15.484 s / 3.119 s | 13.919 s / 1.908 s | 173.649 s / 4.856 s | 5 of 5 |
 
-The benchmark checked all five outputs against the recorded reference for each model on each backend. The native column uses the offline, isolated benchmark. It checked every loaded USC program against compiler output generated in the same process. The check covered 10 distinct binaries for MNIST, 94 for Whisper and 73 for Qwen. The benchmark also checked that compute startup received only zero-filled context memory, with META master boot disabled. It blocked vendor firmware boot and management mailbox construction. The card powered up with its factory firmware still installed. The host did not upload proprietary code during these model runs. The board-management mailbox was unused.
+All 150 native outputs matched the references. The verifier checked 10 distinct MNIST shaders, 94 Whisper shaders and 73 Qwen shaders against UOps rendered within each process. For META it also independently assembled the scheduler, checked its boot image and read the completion sequence from the card. For direct dispatch it checked a zero-filled initial context. Both guards blocked vendor compute firmware and management mailbox use. All runs used the factory board storage at power-on.
+
+Warm latency fell by 15.5%, 24.2% and 38.8% respectively. The native S30 runtime now prefers META when the GNU META assembler and objcopy are available. `MT_META=1` requires the scheduler and `MT_META=0` selects host dispatch.
 
 ### Inference without card DDR
 
@@ -744,3 +746,5 @@ DEV=MT:USC CACHELEVEL=0 MT_META=1 python -m extra.usbgpu.s30.bench_dispatch
 The forced-first Qwen failure reproduced with a single descriptor, including after shortening the grid. The S30's primary MMU fault status at 0xe150 was 0x950000e05b402009. Its address field identified 0xe05b402000, the new USC shader's first instruction page. Re-uploading the tables and rewriting the root address did not clear the condition. Starting a fresh compute context did. Establishing the three USC page catalogue entries before starting META also fixed it, without restarting the device. The runtime now reserves only the directory pages for the tensor, PDS and USC ranges at boot. It installs leaf mappings as buffers are created. The forced-first test then produced all eight expected tokens, and the complete native hardware suite passed.
 
 The host stages the descriptor list once in the upper 64 KiB of Chestnut SRAM. Both GPU command processors and META see the same allocation through their mappings. The remaining 192 KiB of the upper SRAM half stages tensor uploads. This change reduced 64 dependent launches to 1.679 ms; the separate USB count was 31 transfers, including 14 bulk reads while polling. A single launch took 0.226 ms and eight took 0.432 ms.
+
+The final five-pair comparison is at the top of this journal. The automatically selected scheduler also passed the isolated MNIST check with the META override unset. An isolated training run from random weights generated all 102 shaders, completed 200 Adam updates in 68.92 s, and classified 9,687 of 10,000 test images correctly. Warm training took 330.48 ms per update versus the previously measured 276.41 ms on MUSA. The separate early-slot SRAM-only diagnostic classified test image zero as 7 in 390.80 ms. After the early-slot diagnostic, a normal downstream power cycle restored the factory management mailbox for the MUSA hardware suite. All 35 applicable MUSA tests passed.

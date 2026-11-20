@@ -6,14 +6,14 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 from tinygrad.device import Buffer, Program
 from tinygrad.dtype import AddrSpace, dtypes
-from tinygrad.helpers import ceildiv, getenv, round_up, unwrap
+from tinygrad.helpers import DEV, ceildiv, getenv, round_up, unwrap
 from tinygrad.renderer import TinyELF
 from tinygrad.uop.ops import UOp, KernelInfo
 from tinygrad.runtime.autogen import mtfw
 from tinygrad.runtime.support.mt.ccb import MTCCB, MTResponse
 from tinygrad.runtime.support.mt.compute import MTFirmwareBoot, FW_BASE, FW_DEVVA, META_BASE, ROOT_BASE
 from tinygrad.runtime.support.mt.elf import MTKernelImage
-from tinygrad.runtime.support.mt.meta import MetaPort, assemble
+from tinygrad.runtime.support.mt.meta import MetaPort, assemble, use_meta
 from tinygrad.runtime.support.mt.mmu import MT_PTE_READ_ONLY, MT_PTE_READ_WRITE
 from tinygrad.runtime.support.mt.mtdev import MT_BUFFER_PA, MT_BUFFER_VA, MT_CORE_STRIDE, MTDev
 from tinygrad.runtime.support.system import USBPCIDevice
@@ -102,7 +102,9 @@ class MTS30Firmware(MTFirmwareBoot):
     super().__init__(dev, PACKET+0x1000)
     self.bridge = pci.usb if bridge_sram and isinstance(pci:=dev.pci_dev, USBPCIDevice) and pci.usb.usb.product.startswith("custom") else None
     self.ring_va = S30_STAGE_VA+S30_RING_OFFSET-HALF if self.bridge is not None else FW_DEVVA+DIRECT_CDM
-    self.meta_enabled = self.bridge is not None and bool(getenv("MT_META", 0))
+    self.meta_enabled = self.bridge is not None and DEV.target("MT").renderer in ("", "USC") and use_meta()
+    if bridge_sram and getenv("MT_META") == 1 and not self.meta_enabled:
+      raise RuntimeError("MT_META=1 requires native USC and the Chestnut SRAM transport")
     self.upload_size = HALF-META_BATCH_SIZE if self.meta_enabled else S30_UPLOAD_SIZE
     if self.meta_enabled:
       # The S30 can retain an absent page catalogue entry across META submissions. Install the directories before either engine runs.

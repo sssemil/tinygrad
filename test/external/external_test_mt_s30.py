@@ -232,12 +232,13 @@ class TestS30USB(unittest.TestCase):
           for j in range(groups*32): expected[j] += 1
           self.assertEqual(list(buf.as_memoryview().cast("i")), expected)
 
-  @unittest.skipUnless(os.getenv("MT_META") == "1" and not reference, "requires native META dispatch")
   def test_meta_batch_and_restart(self):
     from unittest.mock import patch
     from extra.usbgpu.s30.bench_dispatch import increment
     dev = Device["MT"]
-    fw, prg = dev.s30_fw, increment(dev)
+    fw = dev.s30_fw
+    if not fw.meta_enabled: self.skipTest("requires native META dispatch")
+    prg = increment(dev)
     rng = random.Random(31)
     for _ in range(2):
       fw.session.close()

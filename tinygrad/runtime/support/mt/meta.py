@@ -1,5 +1,5 @@
 from __future__ import annotations
-import os, subprocess, tempfile, time
+import os, shutil, subprocess, tempfile, time
 from pathlib import Path
 from typing import TYPE_CHECKING
 from tinygrad.runtime.support.mt.compute import FW_DEVVA
@@ -37,9 +37,16 @@ class MetaPort:
     self.write(0x048000e8, 0)  # full-width instructions
     self.write(0x04800000, 1)  # enable thread 0
 
+def meta_tools() -> tuple[str,str]: return os.getenv("META_AS", "metag-elf-as"), os.getenv("META_OBJCOPY", "metag-elf-objcopy")
+
+def use_meta() -> bool:
+  if (mode:=os.getenv("MT_META")) is not None: return bool(int(mode))
+  return all(shutil.which(tool) for tool in meta_tools())
+
 def assemble(src:Path) -> bytes:
+  assembler, objcopy = meta_tools()
   with tempfile.TemporaryDirectory() as tmp:
     obj, text = Path(tmp)/'meta.o', Path(tmp)/'meta.bin'
-    subprocess.run([os.getenv("META_AS", "metag-elf-as"), "-o", obj, src], check=True)
-    subprocess.run([os.getenv("META_OBJCOPY", "metag-elf-objcopy"), "-O", "binary", "-j", ".text", obj, text], check=True)
+    subprocess.run([assembler, "-o", obj, src], check=True)
+    subprocess.run([objcopy, "-O", "binary", "-j", ".text", obj, text], check=True)
     return text.read_bytes()
