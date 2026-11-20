@@ -247,6 +247,17 @@ class TestS30USB(unittest.TestCase):
       x, w, u = (Tensor(i, device="MT") for i in (v, a, b))
       np.testing.assert_array_equal(((x*w).sum(-1) * (x*u).sum(-1)).numpy(), (a@v)*(b@v))
 
+  def test_native_conv2d(self):
+    import numpy as np
+    rng = np.random.default_rng(30)
+    with Context(DEV="MT:USC", CACHELEVEL=0):
+      weight = rng.integers(-3, 4, (8, 4, 3, 3)).astype(np.float32)
+      for width in (3, 6, 7, 12, 15):
+        x = rng.integers(-4, 5, (2, 4, 8, width+2)).astype(np.float32)
+        windows = np.lib.stride_tricks.sliding_window_view(x, (3, 3), axis=(2, 3))
+        expected = np.einsum("ncyxij,ocij->noyx", windows, weight)
+        np.testing.assert_array_equal(Tensor(x, device="MT").conv2d(Tensor(weight, device="MT")).numpy(), expected)
+
   def test_native_projection(self):
     import numpy as np
     rng = np.random.default_rng(30)

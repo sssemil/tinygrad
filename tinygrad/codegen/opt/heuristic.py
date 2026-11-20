@@ -90,9 +90,10 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
       rows, channels = [r for r in axes if r in lhs and r not in rhs], [r for r in axes if r in rhs and r not in lhs]
       if len(rows) == 1: rows, channels = channels, rows
       if len(rows) > 1 and len(channels) == 1:
-        # Reuse each input window across two output channels and each filter across four adjacent positions.
-        for r,n in ((channels[0], 2), (rows[-1], 4)):
-          if r.src[0].divides(n) is not None: k.apply_opt(Opt(OptOps.SPLIT, k.rngs.index(r), (n, AxisType.UPCAST)))
+        # Reuse each input window across channels and each filter across adjacent output positions.
+        for r,sizes in ((channels[0], (2,)), (rows[-1], (4, 3))):
+          if tile:=next((n for n in sizes if r.src[0].divides(n) is not None), 0):
+            k.apply_opt(Opt(OptOps.SPLIT, k.rngs.index(r), (tile, AxisType.UPCAST)))
       elif (a:=next((i for i in reversed(k.upcastable_dims()) if k.full_shape[i]%4 == 0), None)) is not None:
         k.apply_opt(Opt(OptOps.SPLIT, a, (4, AxisType.UPCAST)))
     globals_ = [k.rngs[a] for a in k.axes_of(AxisType.GLOBAL, AxisType.WEAK, reduce=False)]

@@ -8,9 +8,9 @@ Measured on the same Chestnut S30 with compiler caching disabled. The cold colum
 
 | Workload | Native cold | MUSA cold | Native warm | MUSA warm |
 | --- | ---: | ---: | ---: | ---: |
-| MNIST, batch of 16 | 0.844 s | 3.561 s | 25.87 ms | 14.16 ms |
-| Whisper tiny.en, test.wav | 10.352 s | 51.521 s | 4.326 s | 2.281 s |
-| Qwen2.5-0.5B Q8_0 | 18.269 s | 172.478 s | 4.732 s | 4.809 s |
+| MNIST, batch of 16 | 0.870 s | 3.498 s | 24.05 ms | 13.67 ms |
+| Whisper tiny.en, test.wav | 10.323 s | 51.521 s | 4.346 s | 2.281 s |
+| Qwen2.5-0.5B Q8_0 | 18.519 s | 172.478 s | 4.725 s | 4.809 s |
 
 The benchmark checked all five outputs against the recorded reference for each model on each backend. The native column uses the offline, isolated benchmark. It checked every loaded USC program against compiler output generated in the same process. The check covered 10 distinct binaries for MNIST, 91 for Whisper and 73 for Qwen. The benchmark also checked that compute startup received only zero-filled context memory, with META master boot disabled. It blocked vendor firmware boot and management mailbox construction. The card powered up with its factory firmware still installed. The host did not upload proprietary code during these model runs. The board-management mailbox was unused.
 
@@ -546,4 +546,10 @@ Two isolated fresh runs gave warm medians of 4.348 s and 4.326 s. The second too
 
 A read-only inspection decompressed the three PCI option-ROM images into 124,384, 150,304 and 123,240 bytes. All three are PE32+ EFI boot-service drivers and contain the UTF-16 strings `MT Gop Driver` and `V.1.5.20`. That version agrees with the board's VBIOS inventory value of 10520. The x86-64 driver contains diagnostics for setting display modes, PCI DMA and querying the management firmware's versions. Static inspection used the EFI decompressor from uefi-firmware 1.17 separately from inference. No option-ROM payload was executed or added to the source tree.
 
-On a fresh slot cycle, the first dword of each image was readable 52.8 ms after rail enable. They read 0x0072aa55, 0x0076aa55 and 0x007caa55. The diagnostic restored expansion-ROM BAR 0x2 and PCI command 0x7 before running three newly compiled arithmetic challenges from bridge SRAM. All three results were correct at 93.96–95.17 ms. The management rings first reported ready at 741.08 ms. These reads establish when PCI can expose the host display images. Identifying which boot code the board executes before that point still requires independent observation of reset and boot storage.
+On a fresh slot cycle, the first dword of each image was readable 52.8 ms after rail enable. They read 0x0072aa55, 0x0076aa55 and 0x007caa55. The diagnostic restored expansion-ROM BAR 0x2 and PCI command 0x7 before running a freshly compiled shader from bridge SRAM on three random challenges. All three results were correct at 93.96–95.17 ms. The management rings first reported ready at 741.08 ms. These reads establish when PCI can expose the host display images. Identifying which boot code the board executes before that point still requires independent observation of reset and boot storage.
+
+## November 20, 2026 — reuse filters across three output positions
+
+The last convolution in the trained MNIST model produces a six-column output. The four-position tile left this kernel computing one position per thread. The native scheduler now tries three positions when the output width cannot be split into fours. Five exact comparisons with NumPy covered output widths 3, 6, 7, 12 and 15 on the physical card. The 20 applicable hardware tests passed with the vendor paths absent.
+
+Batch-16 MNIST fell from 25.87 to 24.05 ms warm. A fresh MUSA run measured 13.67 ms. All five digit batches matched on both paths. The isolated native Whisper and Qwen checks also passed all ten predictions. All three native processes started with an empty cache. Explicitly materializing convolution windows for a single matrix multiplication increased warm MNIST to 212 ms, and unrolling both filter dimensions exhausted the 64-register file. The scheduler keeps the existing reduction order.
