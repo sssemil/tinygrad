@@ -9,6 +9,7 @@ from tinygrad.runtime.support.mt.compute import FW_DEVVA
 from tinygrad.runtime.support.mt.mmu import MTMMU4, MT_PTE_READ_ONLY, MT_PTE_READ_WRITE
 from tinygrad.runtime.support.mt.mtdev import MTDev, MT_DDR_BAR, MT_IPC_RING_SIZE, MT_S30_ID, MT_S30_SRAM_OFFSET, MT_SYS_BAR, MT_USB_GPU_BUS, MT_VENDOR_ID
 from tinygrad.runtime.support.mt.s30 import DIRECT_CDM, PDS_BASE, USC_BASE, MTS30Firmware, s30_cdm_stream, s30_dispatch, s30_grid, s30_pds, s30_shader
+from tinygrad.runtime.support.mt.s30 import s30_read_signal
 from tinygrad.runtime.support.system import USBPCIDevice
 from tinygrad.runtime.support.usb import CustomASM24Controller, HALF, SLOT, USB3
 from tinygrad.uop.ops import KernelInfo
@@ -62,21 +63,16 @@ class ChestnutBoot(MTS30Firmware):
 
   @functools.cached_property
   def read_signal(self):
-    cq = UOp.placeholder((4,), dtypes.uint, slot=0)
-    # A PCIe completion entry with the phase bit set releases the bridge's pending bulk IN.
-    shader = cq[3].store(1<<16).sink(arg=KernelInfo(name="release_sram", opts_to_apply=()))
-    return self.prepare(do_to_program(shader, MTUSCRenderer(Target("MT","USC","mp_10"))), [RESULT])
+    return self.prepare(do_to_program(s30_read_signal(), MTUSCRenderer(Target("MT","USC","mp_10"))), [RESULT])
 
   def read_output(self, size:int) -> bytes:
     if not 0 < size <= HALF: raise ValueError("readback must fit in the lower SRAM half")
     self.stage(*self.read_signal)
-    usb, wire = self.dev.pci_dev.usb.usb, round_up(size, 512)
-    usb.control_write(0xf2, value=0x8000 | wire//512, index=ceildiv(wire, SLOT)<<8)
-    self.start_direct()
+    data = bytearray(size)
+    self.dev.pci_dev.usb.scsi_read(memoryview(data), self.start_direct)
     # Drain the payload before polling core events, which also uses the bulk IN endpoint.
-    data = bytes(usb.bulk_read(wire, timeout=2000)[:size])
     self.wait_direct(0.5)
-    return data
+    return bytes(data)
 
   def result(self) -> int: return int.from_bytes(self.dev.pci_dev.usb.read(0xb800, 4), "little")
 

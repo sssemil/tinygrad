@@ -16,7 +16,8 @@ from tinygrad.runtime.support.mt.mtdev import MTDev
 from tinygrad.runtime.support.mt.launch import MTLaunch, parse_mt_bundle, compress_mt_bundle, decompress_mt_bundle
 from tinygrad.runtime.support.mt.compiler import MTCompiler, MTLLVMCompiler
 from tinygrad.runtime.support.mt.elf import MTKernelImage
-from tinygrad.runtime.support.mt.s30 import DEFAULT_S30_FIRMWARE, S30_STAGE_VA, S30_UPLOAD_SIZE, MTS30Firmware, MTS30Program
+from tinygrad.runtime.support.mt.s30 import DEFAULT_S30_FIRMWARE, S30_STAGE_VA, S30_UPLOAD_SIZE, S30_READ_VA, S30_COMPLETION_VA
+from tinygrad.runtime.support.mt.s30 import MTS30Firmware, MTS30Program, s30_read_signal
 
 MUSA_SOURCES:dict[str,str] = {}
 
@@ -150,23 +151,39 @@ class S30VRAMView(USBMMIOInterface):
   def view(self, offset:int=0, size:int|None=None, fmt=None):
     return S30VRAMView(super().view(offset, size, fmt), self.dev, self.va+offset)
 
+  def _can_stage(self, index, offset:int, size:int) -> bool:
+    return (self.fmt == 'B' and isinstance(index, slice) and index.step in (None, 1) and offset >= 0 and SLOT <= size <= self.nbytes-offset and
+            (self.va+offset)%4 == 0 and self.dev.renderer.target.renderer == "USC")
+
+  def __getitem__(self, index):
+    offset, size = self._off_from_index(index)
+    with self.dev.s30_fw.lock:
+      if not self._can_stage(index, offset, size):
+        data = super().__getitem__(index)
+        return memoryview(bytes(data)) if isinstance(data, memoryview) else data  # the next USB transfer reuses the bulk buffer
+      dest, n = memoryview(bytearray(size)), size//128*128
+      copy, signal = self.dev.s30_copy, self.dev.s30_read_signal
+      for off in range(0, n, HALF):
+        chunk = dest[off:min(off+HALF, n)]
+        copy(S30_READ_VA, self.va+offset+off, global_size=(len(chunk)//128,1,1), local_size=(32,1,1))
+        signal(S30_COMPLETION_VA, readback=chunk)
+      if n < size: dest[n:] = super().__getitem__(slice(offset+n, offset+size))
+      return dest
+
   def __setitem__(self, index, data):
     offset, _ = self._off_from_index(index)
-    if (self.fmt == 'B' and isinstance(index, slice) and isinstance(data, (bytes, bytearray, memoryview)) and
-        SLOT <= memoryview(data).nbytes <= self.nbytes-offset and offset >= 0 and
-        (self.va+offset)%4 == 0 and self.dev.renderer.target.renderer == "USC"):
-      src = bytes(data)  # a USB read can alias the buffer used by the next transfer
+    with self.dev.s30_fw.lock:
+      if not isinstance(data, (bytes, bytearray, memoryview)) or not self._can_stage(index, offset, memoryview(data).nbytes):
+        return super().__setitem__(index, data)
+      src = bytes(data)
       n = len(src)//128*128
       # The upper SRAM half survives the bridge's ordinary F0 traffic for command packets and page tables.
-      with self.dev.s30_fw.lock:
-        copy = self.dev.s30_upload
-        for off in range(0, n, S30_UPLOAD_SIZE):
-          chunk = src[off:min(off+S30_UPLOAD_SIZE, n)]
-          self.usb.scsi_write(chunk, slot_start=HALF//SLOT)
-          copy(self.va+offset+off, S30_STAGE_VA, global_size=(len(chunk)//128,1,1), local_size=(32,1,1))
-        if n < len(src): super().__setitem__(slice(offset+n, offset+len(src)), src[n:])
-      return
-    super().__setitem__(index, data)
+      copy = self.dev.s30_copy
+      for off in range(0, n, S30_UPLOAD_SIZE):
+        chunk = src[off:min(off+S30_UPLOAD_SIZE, n)]
+        self.usb.scsi_write(chunk, slot_start=HALF//SLOT)
+        copy(self.va+offset+off, S30_STAGE_VA, global_size=(len(chunk)//128,1,1), local_size=(32,1,1))
+      if n < len(src): super().__setitem__(slice(offset+n, offset+len(src)), src[n:])
 
 class MTAllocator(Allocator['MTDevice']):
   def __init__(self, dev):
@@ -180,7 +197,7 @@ class MTAllocator(Allocator['MTDevice']):
     try:
       view = self.dev.mt.pci_dev.map_bar(2, off=pa, size=size, fmt='B')
       self.dev.map_buffer(va, pa, size)
-      if self.dev.mt.s30 and size >= SLOT and isinstance(view, USBMMIOInterface) and view.usb.usb.product.startswith("custom"):
+      if self.dev.mt.s30 and isinstance(view, USBMMIOInterface) and view.usb.usb.product.startswith("custom"):
         view = S30VRAMView(view, self.dev, va)
     except Exception:
       self.vram.free(pa)
@@ -279,12 +296,17 @@ class MTDevice(Compiled):
   def has_copy_queue(self) -> bool: return False
 
   @functools.cached_property
-  def s30_upload(self) -> MTS30Program:
+  def s30_copy(self) -> MTS30Program:
     from tinygrad.codegen import to_program
     dst, src = (UOp.placeholder((S30_UPLOAD_SIZE//4,), dtypes.uint, slot=i) for i in range(2))
     idx = UOp.special(S30_UPLOAD_SIZE//128, "gidx0")*32+UOp.special(32, "lidx0")
-    copy = dst[idx].store(src[idx]).sink(arg=KernelInfo(name="s30_upload", optimized=True))
+    copy = dst[idx].store(src[idx]).sink(arg=KernelInfo(name="s30_copy", optimized=True))
     return MTS30Program(self, TinyELF.from_program(to_program(copy, self.renderer)), {})
+
+  @functools.cached_property
+  def s30_read_signal(self) -> MTS30Program:
+    from tinygrad.codegen import to_program
+    return MTS30Program(self, TinyELF.from_program(to_program(s30_read_signal(), self.renderer)), {})
 
   def get_launch(self, obj:TinyELF, global_size:tuple[int,int,int]=(1,1,1), local_size:tuple[int,int,int]=(1,1,1)) -> MTLaunch:
     if os.environ.get('MT_GENERATE','1') == '0':

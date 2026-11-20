@@ -104,6 +104,25 @@ class TestS30USB(unittest.TestCase):
     resident = Tensor(original, device="CPU", dtype=dtypes.int32).to("MT").realize()
     self.assertEqual(resident.to("CPU").tolist(), original)
 
+  def test_native_staged_read(self):
+    from concurrent.futures import ThreadPoolExecutor
+    from tinygrad.runtime.support.usb import HALF, SLOT, USBMMIOInterface
+    rng = random.Random(32)
+    with Context(DEV="MT:USC", CACHELEVEL=0):
+      buf = Buffer("MT", 2*HALF+512, preallocate=True)
+      for _ in range(2):
+        expected = rng.randbytes(buf.nbytes)
+        USBMMIOInterface.__setitem__(buf.host, slice(0, buf.nbytes), expected)
+        for offset, size in ((4, SLOT-1), (4, SLOT), (4, HALF), (4, HALF+127), (5, SLOT+1), (128, 2*HALF+129)):
+          with self.subTest(offset=offset, size=size):
+            self.assertEqual(buf.host.view(offset-1)[1:size+1], expected[offset:offset+size])
+      small = Buffer("MT", 32, initial_value=expected[:32])
+      with ThreadPoolExecutor(2) as pool:
+        larger = pool.submit(lambda: bytes(buf.host[:HALF*2]))
+        reads = [bytes(small.host[:32]) for _ in range(16)]
+        self.assertEqual(larger.result(), expected[:HALF*2])
+        self.assertEqual(reads, [expected[:32]]*16)
+
   def test_native_rmsnorm(self):
     import numpy as np
     from tinygrad.llm.kernels.mt import RMSNorm

@@ -8,6 +8,7 @@ from tinygrad.device import Buffer, Program
 from tinygrad.dtype import AddrSpace, dtypes
 from tinygrad.helpers import ceildiv, round_up, unwrap
 from tinygrad.renderer import TinyELF
+from tinygrad.uop.ops import UOp, KernelInfo
 from tinygrad.runtime.autogen import mtfw
 from tinygrad.runtime.support.mt.ccb import MTCCB, MTResponse
 from tinygrad.runtime.support.mt.compute import MTFirmwareBoot, FW_BASE, FW_DEVVA, META_BASE, ROOT_BASE
@@ -36,6 +37,7 @@ PACKET = ITEM + 0x1000
 CDM_CONTROL_SIZE, CDM_RING_SIZE, CDM_KICK_SIZE = 128, 0x800, 0x158
 DIRECT_CDM = 0x4000  # shared ring controls in the direct context, below the compute state at 0x6000
 S30_STAGE_VA, S30_UPLOAD_SIZE = 0x7000000000, HALF-2*SLOT
+S30_READ_VA, S30_COMPLETION_VA = S30_STAGE_VA-HALF, S30_STAGE_VA+HALF
 S30_RING_OFFSET = 2*HALF-SLOT+1024  # leave room before the controls for parameters
 CDM_SUBMISSION_SIZE = 96+16+CDM_KICK_SIZE
 PDS_BASE, USC_BASE = 0xda00000000, 0xe000000000
@@ -153,8 +155,10 @@ class MTS30Firmware(MTFirmwareBoot):
     # Enable both compute cores and route the workgroups across them. META stays stopped.
     if self.bridge is not None and S30_STAGE_VA not in self.mmu.pages:
       _, (pa,) = self.dev.pci_dev.alloc_sysmem(2*HALF)
-      # Ordinary F0 traffic uses the lower half. Reserve the final two slots for dispatch on both cores.
+      # The lower half is shared with F0 traffic. The final two slots hold dispatch for both cores.
       base = (1<<39) | (pa+HALF)
+      self.mmu.map_range(S30_READ_VA, base-HALF, HALF, MT_PTE_READ_WRITE)
+      self.mmu.map(S30_COMPLETION_VA, (1<<39) | 0x822000, MT_PTE_READ_WRITE)
       self.mmu.map_range(S30_STAGE_VA, base, S30_UPLOAD_SIZE, MT_PTE_READ_ONLY)
       self.mmu.map_range(S30_STAGE_VA+S30_UPLOAD_SIZE, base+S30_UPLOAD_SIZE, 2*SLOT, MT_PTE_READ_WRITE)
     with self._boot(bytes(0x8000), master=False, reset_domains=False):
@@ -200,8 +204,9 @@ class MTS30Firmware(MTFirmwareBoot):
           for offset in (MT_CORE_STRIDE, 0): self._reset(offset)
           raise TimeoutError(f"S30 compute timed out on core {core//MT_CORE_STRIDE}, MMU fault {fault:#x}")
 
-  def kick_direct(self, timeout:float) -> None:
-    self.start_direct()
+  def kick_direct(self, timeout:float, readback:memoryview|None=None) -> None:
+    if readback is None: self.start_direct()
+    else: unwrap(self.bridge).scsi_read(readback, self.start_direct)
     self.wait_direct(timeout)
 
   def submit(self, token:int|None, command:int, size:int, data:bytearray, timeout:float, signal:tuple[int,int]|None=None,
@@ -233,6 +238,10 @@ def s30_submission(command:int, region:int, region_size:int) -> bytearray:
 
 def s30_dispatch(pds_off:int, shared:int, attrs:int) -> tuple[int, ...]:
   return (2, pds_off | 2, pds_off+16, 0, 0, 0, 0x02000000 | shared, 0, 0x100085 | attrs<<12, pds_off+32, pds_off+64)
+
+def s30_read_signal() -> UOp:
+  cq = UOp.placeholder((4,), dtypes.uint, slot=0)
+  return cq[3].store(1<<16).sink(arg=KernelInfo(name="release_sram", opts_to_apply=()))
 
 def s30_grid(groups:tuple[int,int,int], local:tuple[int,int,int], shared:int) -> tuple[int,...]:
   lx,ly,lz = local
@@ -344,7 +353,8 @@ class MTS30Program(Program['MTDevice']):
       self.launch = packet[self.param_offset:self.param_offset+self.grid_offset+20]
     self.launch[:len(params)] = params
 
-  def __call__(self, *args, global_size:tuple[int,int,int]=(1,1,1), local_size:tuple[int,int,int]=(1,1,1), wait:bool=False, timeout:int|None=None):
+  def __call__(self, *args, global_size:tuple[int,int,int]=(1,1,1), local_size:tuple[int,int,int]=(1,1,1), wait:bool=False, timeout:int|None=None,
+               readback:memoryview|None=None):
     fw = self.dev.s30_fw
     with fw.lock:
       for value,(off,fmt) in zip(args, self.args, strict=True): struct.pack_into(fmt, self.launch, off, value)
@@ -361,7 +371,7 @@ class MTS30Program(Program['MTDevice']):
             slot, pad = divmod(S30_RING_OFFSET+self.param_offset-DIRECT_CDM, SLOT)
             fw.bridge.scsi_write(bytes(pad)+self.launch, slot_start=slot)
           else: fw.v[self.param_offset:self.param_offset+len(self.launch)] = self.launch
-          fw.kick_direct(wait_seconds)
+          fw.kick_direct(wait_seconds, readback)
         else:
           resp = fw.submit(None, mtfw.MTFW_SUBMISSION_CMD_GPU_CDM, CDM_SUBMISSION_SIZE, self.launch, wait_seconds,
                            resident=self.packet, offset=self.param_offset)

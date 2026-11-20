@@ -553,3 +553,11 @@ On a fresh slot cycle, the first dword of each image was readable 52.8 ms after 
 The last convolution in the trained MNIST model produces a six-column output. The four-position tile left this kernel computing one position per thread. The native scheduler now tries three positions when the output width cannot be split into fours. Five exact comparisons with NumPy covered output widths 3, 6, 7, 12 and 15 on the physical card. The 20 applicable hardware tests passed with the vendor paths absent.
 
 Batch-16 MNIST fell from 25.87 to 24.05 ms warm. A fresh MUSA run measured 13.67 ms. All five digit batches matched on both paths. The isolated native Whisper and Qwen checks also passed all ten predictions. All three native processes started with an empty cache. Explicitly materializing convolution windows for a single matrix multiplication increased warm MNIST to 212 ms, and unrolling both filter dimensions exhausted the 64-register file. The scheduler keeps the existing reduction order.
+
+## November 20, 2026 — return ordinary S30 tensor data through bridge SRAM
+
+For aligned byte reads of at least 16 KiB, a native copy shader moves VRAM into the lower 256 KiB of Chestnut SRAM. A second tinygrad-generated shader sets the phase bit of the bridge completion entry. The host drains the USB bulk payload before reading core events, since both use the same endpoint. The copy shader also serves the existing upload path. The device lock covers the full download and small buffer accesses that share the bridge. SRAM-only model runs use the same transfer handshake.
+
+Five trials alternated the order of direct and staged reads and changed the input bytes each time. A 16 KiB read took 0.98 ms staged and 7.11 ms direct. A 256 KiB read took 1.57 ms and 113.33 ms. For 2 MiB the medians were 12.52 ms and 907.28 ms, or 168 MB/s and 2.31 MB/s. All bytes matched. These are host readback timings. The full model benchmarks return much smaller final results.
+
+The hardware suite checks direct BAR writes against staged reads at nonzero offsets, the 16 KiB threshold, multiple SRAM windows, a partial final window and a byte tail. It also reads a small buffer from another thread during a download. A cold SRAM-only Whisper frontend run checked all 1,728,000 output activations against the CPU.
