@@ -1,5 +1,5 @@
 """Run the S30 model benchmark and check the origin of each USC program loaded in this process."""
-import runpy, sys
+import os, runpy, sys
 from pathlib import Path
 from unittest.mock import patch
 from tinygrad.renderer.usc import MTUSCRenderer
@@ -37,6 +37,12 @@ if __name__ == "__main__":
       from extra.usbgpu.s30 import sram
       module = sys.argv.pop(1).replace("-", "_")
       map_bar, f0_out, shader = USBPCIDevice.map_bar, CustomASM24Controller._f0_out, sram.s30_shader
+      open_cold = sram.open_cold
+      def fresh_sram():
+        mt, start = open_cold()
+        # The downstream power cycle leaves the bridge powered. Overwrite any programs from an earlier process.
+        for slot in (0, sram.HALF//sram.SLOT): mt.pci_dev.usb.scsi_write(os.urandom(sram.HALF), slot_start=slot)
+        return mt, start
 
       def register_bar(self, bar, *args, **kwargs):
         if bar != 0: raise RuntimeError(f"unexpected mapping of BAR{bar}")
@@ -66,7 +72,8 @@ if __name__ == "__main__":
         check_shader(obj)
         return shader(obj)
 
-      with patch.object(USBPCIDevice, "map_bar", register_bar), patch.object(CustomASM24Controller, "_f0_out", register_request), \
+      with patch.object(sram, "open_cold", fresh_sram), patch.object(USBPCIDevice, "map_bar", register_bar), \
+           patch.object(CustomASM24Controller, "_f0_out", register_request), \
            patch.object(sram.ChestnutBoot, "upload_mmu", bridge_tables), patch.object(CustomASM24Controller, "set_pcie_power", slot_power), \
            patch.object(System, "pci_setup_usb_bars", side_effect=RuntimeError("generic PCI enumeration")), patch.object(sram, "s30_shader", sram_shader):
         runpy.run_module(f"extra.usbgpu.s30.{module}", run_name="__main__")

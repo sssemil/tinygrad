@@ -16,13 +16,13 @@ The benchmark checked all five outputs against the recorded reference for each m
 
 ### Inference without card DDR
 
-Separate cold-slot runs place every GPU-visible page in Chestnut SRAM or the bridge completion queue. The host streams checkpoint and activation tiles. The S30 executes the trained model. These runs start the timer at slot rail enable, after host checkpoint preparation.
+Separate cold-slot runs place every GPU-visible page in Chestnut SRAM or the bridge completion queue. The verifier overwrites both halves of the bridge SRAM with fresh random bytes after each downstream power cycle. The host streams checkpoint and activation tiles. The S30 executes the trained model. These runs start the timer at slot rail enable, after host checkpoint preparation.
 
 | Model | Result | Rail enable to result | Fresh shaders |
 | --- | --- | ---: | ---: |
 | MNIST, test image 0 | Class 7 | 0.370 s | 9 |
-| Whisper tiny.en, test.wav | Could you please let me out of the box? | 122.170 s | 93 |
-| Qwen2.5-0.5B, 36-token France prompt | All eight CPU reference tokens, including EOS | 141.250 s | 32 |
+| Whisper tiny.en, test.wav | Could you please let me out of the box? | 122.593 s | 93 |
+| Qwen2.5-0.5B, 36-token France prompt | All eight CPU reference tokens, including EOS | 141.507 s | 32 |
 
 The entire 2 MiB external bridge flash matches its reconstructed contents, including the application built from source with its target runtime objects. The outstanding boot question is what the S30 board and the bridge silicon execute before the host can train the PCIe link. All measurements used the original board boot storage.
 
@@ -635,3 +635,11 @@ At the first configuration read after the link trained, the physical S30 command
 In three downstream power cycles the host cleared bus mastering around 52 ms and left it clear while checking the management headers through BAR0. Both headers became ready at 740.2–750.7 ms. Three controls with bus mastering enabled gave 736.4–741.7 ms. In six more cycles the host cleared all three PCI command enables, then left the endpoint alone until 100 or 850 ms. It enabled only memory decoding for the subsequent BAR0 observation. The three early observations at 101.1–101.2 ms found the headers unready. The three late observations at 851.2–851.3 ms found both ready. After bus mastering was enabled, three independently challenged SRAM calculations passed per cycle.
 
 This rules out a requirement for endpoint bus mastering during the measured interval to reach these mailbox headers on this card. The endpoint already had the bus master bit set when it first answered. The interval before that observation, including any factory code running from reset, remains unobserved.
+
+## November 20, 2026 — discard retained bridge SRAM before cold model verification
+
+Cycling the downstream slot keeps Chestnut powered. The isolated SRAM verifier now sends 256 KiB of fresh random data to slots 0–15 and another 256 KiB to slots 16–31 before the model creates its GPU context. This removes residual programs, tables and activations in that transfer window from prior runs. It leaves the external flash, the on-chip ROM and the downstream board firmware intact. The guard still restricts host register accesses, GPU page mappings and the origins of loaded shaders.
+
+With this preparation MNIST image 0 returned 7 in 370.36 ms and image 1 returned 2 in 368.06 ms. Both finished before management mailbox readiness and used nine freshly generated shaders each. Whisper returned the reference transcript in 122.593 s with 93 fresh shaders. Qwen returned the first token at 76.297 s and all eight in 141.507 s with 32 fresh shaders. The complete sequence matched independent CPU generation.
+
+Two other read-only checks narrowed the boot investigation. The public bridge emulator maps XDATA addresses to code at an offset of 0xddfc. On this Chestnut, 16-byte USB reads at 0xe423, 0xe437 and 0xe600 each returned zeros. The corresponding positions in the freshly rebuilt 8051 application all have nonzero instruction bytes. This mapping did not disclose application code through these reads with the installed firmware. Separately, the vendor driver's generic management register read and write helpers both call `mtgpu_ipc_transmit_ext`. Those helpers require management IPC before they can inspect or change controller registers. Neither check identifies what executes in the first 52 ms. [Emulator read callback](https://github.com/tinygrad/asm2464pd-firmware/blob/ed4e39b7e0794e19ba193477067c48757a5cf9ef/emulate/hardware.py#L1679)
