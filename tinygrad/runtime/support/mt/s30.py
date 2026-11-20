@@ -6,17 +6,18 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 from tinygrad.device import Buffer, Program
 from tinygrad.dtype import AddrSpace, dtypes
-from tinygrad.helpers import ceildiv, round_up, unwrap
+from tinygrad.helpers import ceildiv, getenv, round_up, unwrap
 from tinygrad.renderer import TinyELF
 from tinygrad.uop.ops import UOp, KernelInfo
 from tinygrad.runtime.autogen import mtfw
 from tinygrad.runtime.support.mt.ccb import MTCCB, MTResponse
 from tinygrad.runtime.support.mt.compute import MTFirmwareBoot, FW_BASE, FW_DEVVA, META_BASE, ROOT_BASE
 from tinygrad.runtime.support.mt.elf import MTKernelImage
+from tinygrad.runtime.support.mt.meta import MetaPort, assemble
 from tinygrad.runtime.support.mt.mmu import MT_PTE_READ_ONLY, MT_PTE_READ_WRITE
 from tinygrad.runtime.support.mt.mtdev import MT_CORE_STRIDE, MTDev
 from tinygrad.runtime.support.system import USBPCIDevice
-from tinygrad.runtime.support.usb import HALF, SLOT
+from tinygrad.runtime.support.usb import HALF, SLOT, USBMMIOInterface
 if TYPE_CHECKING: from tinygrad.runtime.ops_mt import MTDevice
 
 # mtgpu-s30 3.1.0-6, mtfw-gen1.bin. The FWIF layout and META segments belong to this image.
@@ -98,6 +99,8 @@ class MTS30Firmware(MTFirmwareBoot):
     super().__init__(dev, PACKET+0x1000)
     self.bridge = pci.usb if bridge_sram and isinstance(pci:=dev.pci_dev, USBPCIDevice) and pci.usb.usb.product.startswith("custom") else None
     self.ring_va = S30_STAGE_VA+S30_RING_OFFSET-HALF if self.bridge is not None else FW_DEVVA+DIRECT_CDM
+    self.meta_enabled = bridge_sram and bool(getenv("MT_META", 0))
+    self.meta_sequence = 0
     self.direct = False
     self.queue:MTCCB|None = None
     self.lock, self.session = threading.RLock(), ExitStack()
@@ -150,6 +153,12 @@ class MTS30Firmware(MTFirmwareBoot):
           queue, self.queue = self.queue, None
           if queue is not None and queue.wr_idx != queue.response_rd: self._reset_domains()
 
+  @functools.cached_property
+  def meta_code(self) -> bytes:
+    code = assemble(Path(__file__).with_name("dispatch.s"))
+    if not 0 < len(code) <= 0x1000: raise ValueError("S30 META scheduler exceeds its code page")
+    return code
+
   @contextmanager
   def boot_direct(self) -> Iterator[None]:
     # Enable both compute cores and route the workgroups across them. META stays stopped.
@@ -161,7 +170,7 @@ class MTS30Firmware(MTFirmwareBoot):
       self.mmu.map(S30_COMPLETION_VA, (1<<39) | 0x822000, MT_PTE_READ_WRITE)
       self.mmu.map_range(S30_STAGE_VA, base, S30_UPLOAD_SIZE, MT_PTE_READ_ONLY)
       self.mmu.map_range(S30_STAGE_VA+S30_UPLOAD_SIZE, base+S30_UPLOAD_SIZE, 2*SLOT, MT_PTE_READ_WRITE)
-    with self._boot(bytes(0x8000), master=False, reset_domains=False):
+    with self._boot((self.meta_code if self.meta_enabled else b"").ljust(0x8000, b"\0"), master=False, reset_domains=False):
       route = self._read(0x24e0, 4)
       self._reset(MT_CORE_STRIDE)
       self._write(MT_CORE_STRIDE+0xbf8, 0, 4)
@@ -185,6 +194,9 @@ class MTS30Firmware(MTFirmwareBoot):
           self._write(core+0x498, FW_DEVVA+0x6000)  # compute state
           self._write(core+0x68, 3)
           self._write(core+0x24c0, 3, 4)
+        if self.meta_enabled:
+          self.meta_sequence = 0
+          MetaPort(self).start()
         self.direct = True
         yield
       finally:
@@ -192,11 +204,24 @@ class MTS30Firmware(MTFirmwareBoot):
         self._write(0x24e0, route, 4)
 
   def start_direct(self) -> None:
+    if self.meta_enabled:
+      self.meta_sequence = self.meta_sequence % 0xffffffff + 1
+      assert isinstance(self.v, USBMMIOInterface)
+      self.v.usb.pcie_request(0x60 if self.v.addr+0x1000 >= 1<<32 else 0x40, self.v.addr+0x1000, self.meta_sequence)
+      return
     for reg,value in ((0x138, 4), (0x478, 1)):
       for core in (MT_CORE_STRIDE, 0): self._write(core+reg, value, 4)
 
   def wait_direct(self, timeout:float) -> None:
     deadline = time.monotonic()+timeout
+    if self.meta_enabled:
+      while int.from_bytes(self.v[0x1004:0x1008], "little") != self.meta_sequence:
+        if time.monotonic() >= deadline:
+          events = [self._read(core+0x130, 4) for core in (0, MT_CORE_STRIDE)]
+          fault = self._read(0xe160)
+          for offset in (MT_CORE_STRIDE, 0): self._reset(offset)
+          raise TimeoutError(f"S30 META sequence {self.meta_sequence}, events {events}, MMU fault {fault:#x}")
+      return
     for core in (0, MT_CORE_STRIDE):
       while not self._read(core+0x130, 4) & 4:
         if time.monotonic() >= deadline:

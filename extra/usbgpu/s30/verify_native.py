@@ -26,8 +26,16 @@ if __name__ == "__main__":
     check_shader(obj)
     load(self, dev, obj, links)
 
+  meta = os.getenv("MT_META") == "1"
+  if meta:
+    from tinygrad.runtime.support.mt.meta import assemble
+    from tinygrad.runtime.support.mt import s30 as runtime
+    expected_meta = assemble(Path(runtime.__file__).with_name("dispatch.s"))
+    if not 0 < len(expected_meta) <= 0x1000: raise RuntimeError("invalid META source build")
+
   def direct_boot(self, image, *, master=True, reset_domains=True):
-    if master or reset_domains or any(image): raise RuntimeError("expected zeroed GPU context with META master boot disabled")
+    if master or reset_domains or (image != expected_meta.ljust(len(image), b"\0") if meta else any(image)):
+      raise RuntimeError("unexpected initial S30 compute context")
     return boot(self, image, master=master, reset_domains=reset_domains)
 
   with patch.object(MTUSCRenderer, "render", render_shader), patch.object(MTS30Program, "__init__", load_shader), \

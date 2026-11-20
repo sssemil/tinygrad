@@ -50,7 +50,7 @@ packages = [
 [tool.setuptools.package-data]
 tinygrad = ["py.typed"]
 "tinygrad.llm" = ["chat.html"]
-"tinygrad.runtime.support.mt" = ["mtum.c", "version_data.h", "include/*.h"]
+"tinygrad.runtime.support.mt" = ["dispatch.s", "mtum.c", "version_data.h", "include/*.h"]
 "tinygrad.viz" = ["index.html", "assets/**/*", "js/*"]
 
 

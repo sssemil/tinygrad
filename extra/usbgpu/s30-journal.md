@@ -715,3 +715,7 @@ One warm batch-32 Adam step spent 375 ms computing a 5×5 weight gradient in wor
 | Warm median per update | 364.64 ms | 276.41 ms |
 
 The native run again generated all 102 programs from UOps in the isolated process. The warm update took 57% less time than before the change. The native warm update still took 32% longer than MUSA. On a separate batch-16 SGD step the loss and all 20 updated model tensors agreed with CPU. All 32 applicable native hardware tests passed. All 118 archived training graphs compiled, and all 165 archived inference graphs produced byte-identical shader binaries before and after this change.
+
+## Source-built META dispatch on both S30 cores
+
+With MT_META=1 the host starts a newly assembled scheduler on thread zero. META clears both completion events, kicks both CDMs and publishes the sequence only after observing both events. Across two fresh firmware boots, the S30 computed 3*x+7 exactly on random integers of lengths 1, 257, 1024 and 257. The isolated MNIST benchmark checked the uploaded firmware against an independent build from dispatch.s. All five batches matched and all ten shader programs came from the native renderer. This first implementation still submitted one kernel at a time.

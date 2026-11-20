@@ -1,7 +1,7 @@
 """Submit STREAM_TERMINATE to one S30 core using source-built META firmware."""
 import struct, time
 from pathlib import Path
-from extra.usbgpu.s30.boot import MetaPort, assemble
+from tinygrad.runtime.support.mt.meta import MetaPort, assemble
 from tinygrad import Device
 from tinygrad.runtime.support.mt.compute import FW_BASE, FW_DEVVA, ROOT_BASE
 from tinygrad.runtime.support.mt.mmu import MTMMU4, MT_PTE_READ_WRITE

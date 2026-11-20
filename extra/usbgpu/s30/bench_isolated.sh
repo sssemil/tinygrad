@@ -34,6 +34,11 @@ opts=(--die-with-parent --unshare-net --unshare-pid --clearenv
   --setenv HOME /home/bench --setenv PATH /venv/bin:/usr/bin --setenv PYTHONPATH /src
   --setenv PYTHONPYCACHEPREFIX /tmp/pycache --setenv PYTHONDONTWRITEBYTECODE 1 --setenv NUMBA_CACHE_DIR /tmp/numba --setenv CACHELEVEL 0 --setenv DEV MT:USC
   --setenv BEAM "${BEAM:-0}" --setenv PARALLEL 0 --setenv MUSA_PATH /nonexistent --setenv MT_FIRMWARE /nonexistent --chdir /src)
+if [[ ${MT_META:-0} == 1 ]]; then
+  [[ $1 != sram-* ]] || { echo "META dispatch requires the normal S30 memory path" >&2; exit 2; }
+  opts+=(--ro-bind "$(command -v "${META_AS:-metag-elf-as}")" /tools/as --ro-bind "$(command -v "${META_OBJCOPY:-metag-elf-objcopy}")" /tools/objcopy
+    --setenv MT_META 1 --setenv META_AS /tools/as --setenv META_OBJCOPY /tools/objcopy)
+fi
 args=("$@")
 if [[ $1 != train-mnist ]]; then opts+=(--ro-bind "$(realpath "$2")" /input); args[1]=/input; fi
 if [[ $base == /usr/local ]]; then
