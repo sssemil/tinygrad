@@ -111,7 +111,7 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
       if size > 1:
         k.apply_opt(Opt(OptOps.SPLIT, k.rngs.index(r), (size, AxisType.LOCAL)))
         width //= size
-        if not spatial or width == 1 or len(k.axes_of(AxisType.LOCAL)) == 3: break
+        if not (spatial or tiled) or width == 1 or len(k.axes_of(AxisType.LOCAL)) == 3: break
     if not spatial and not tiled and dot is not None:
       lhs, rhs = (x.ranges for x in dot.src)
       if (a:=next((i for i in k.upcastable_dims() if k.full_shape[i]%2 == 0 and (k.rngs[i] in lhs) != (k.rngs[i] in rhs)), None)) is not None:
