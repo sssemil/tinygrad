@@ -103,9 +103,11 @@ class MTS30Firmware(MTFirmwareBoot):
     self.bridge = pci.usb if bridge_sram and isinstance(pci:=dev.pci_dev, USBPCIDevice) and pci.usb.usb.product.startswith("custom") else None
     self.ring_va = S30_STAGE_VA+S30_RING_OFFSET-HALF if self.bridge is not None else FW_DEVVA+DIRECT_CDM
     self.meta_enabled = bridge_sram and bool(getenv("MT_META", 0))
+    self.meta_args:set[int] = set()
     self.meta_data = bytearray()
     self.meta_pending:list[tuple[int, MTS30Program]] = []
     self.meta_sequence = 0
+    self.meta_flushing = False
     self.direct = False
     self.queue:MTCCB|None = None
     self.lock, self.session = threading.RLock(), ExitStack()
@@ -208,6 +210,7 @@ class MTS30Firmware(MTFirmwareBoot):
         self.direct = True
         yield
       finally:
+        self.meta_args.clear()
         self.meta_pending.clear()
         self.meta_data.clear()
         self.direct = False
@@ -229,8 +232,9 @@ class MTS30Firmware(MTFirmwareBoot):
         if time.monotonic() >= deadline:
           events = [self._read(core+0x130, 4) for core in (0, MT_CORE_STRIDE)]
           faults = [hex(self._read(core+0xe160)) for core in (0, MT_CORE_STRIDE)]
+          kernels = [(off, program.name) for off,program in self.meta_pending]
           for offset in (MT_CORE_STRIDE, 0): self._reset(offset)
-          raise TimeoutError(f"S30 META sequence {self.meta_sequence}, completed {completed}, events {events}, MMU faults {faults}")
+          raise TimeoutError(f"S30 META sequence {self.meta_sequence}, completed {completed}, events {events}, faults {faults}, pending {kernels}")
       return
     for core in (0, MT_CORE_STRIDE):
       while not self._read(core+0x130, 4) & 4:
@@ -241,17 +245,20 @@ class MTS30Firmware(MTFirmwareBoot):
 
   def flush_meta(self, timeout:float|None=None, readback:memoryview|None=None):
     with self.lock:
-      if not self.meta_pending: return
-      struct.pack_into('<I', self.meta_data, self.meta_pending[-1][0], 0)
+      if self.meta_flushing or not self.meta_pending: return
+      self.meta_flushing = True  # buffer finalizers may read the timeline during submission
       try:
+        struct.pack_into('<I', self.meta_data, self.meta_pending[-1][0], 0)
         self.v[META_BATCH:META_BATCH+len(self.meta_data)] = self.meta_data
         self.kick_direct(5.0*len(self.meta_pending) if timeout is None else timeout, readback)
       except BaseException:
         self.session.close()
         raise
       finally:
+        self.meta_args.clear()
         self.meta_data.clear()
         self.meta_pending.clear()
+        self.meta_flushing = False
 
   def kick_direct(self, timeout:float, readback:memoryview|None=None) -> None:
     if readback is None: self.start_direct()
@@ -400,10 +407,13 @@ class MTS30Program(Program['MTDevice']):
     fw = dev.s30_fw
     with fw.lock: fw.mmu.map_range(USC_BASE+usc_off, self.code.meta.pa, self.code.meta.size, MT_PTE_READ_ONLY)
     if self.direct and fw.meta_enabled:
-      self.meta_pds = s30_pds(0, shared, usc_off, temps, bool(local_words))
-      self.meta_attrs = attrs
-      self.meta_shared = ceildiv(shared, 16)
-      self.shared = self.meta_shared+ceildiv(local_words, 16)
+      pds = s30_pds(0, shared, usc_off, temps, bool(local_words))
+      self.packet = Buffer(dev.device, len(pds), initial_value=pds)
+      packet_off = self.packet.meta.va & 0xffffffff
+      with fw.lock: fw.mmu.map_range(PDS_BASE+packet_off, self.packet.meta.pa, self.packet.meta.size, MT_PTE_READ_ONLY)
+      self.meta_dma = pds[:16]
+      self.meta_dispatch = s30_dispatch(packet_off, ceildiv(shared, 16), attrs)
+      self.shared = ceildiv(shared, 16)+ceildiv(local_words, 16)
       self.launch = params.ljust(stride, b'\0')
       return
     packet_size = 96*(1+bool(self.split)) if self.direct else controls + 2*CDM_CONTROL_SIZE + CDM_RING_SIZE
@@ -433,13 +443,13 @@ class MTS30Program(Program['MTDevice']):
 
   def enqueue_meta(self, fw:MTS30Firmware, groups:tuple[int,int,int], local:tuple[int,int,int]) -> None:
     nprog = 1+bool(self.split)
-    param_offset = 32+96*nprog
+    param_offset = 32+16*nprog
     controls = round_up(param_offset+len(self.launch)*nprog, 256)
     if len(fw.meta_pending) == 64: fw.flush_meta()
     off = len(fw.meta_data)
     base = FW_DEVVA+META_BATCH+off
     pds = META_BATCH_PDS+off+32
-    dispatches = tuple(s30_dispatch(pds+96*i, self.meta_shared, self.meta_attrs) for i in range(nprog))
+    dispatches = tuple((2, (pds+16*i)|2, *self.meta_dispatch[2:]) for i in range(nprog))
     params, stream = s30_direct_stream(dispatches, groups, local, self.shared, self.split, self.launch, 8*len(self.args))
     size = round_up(controls+len(stream), 256)
     if size > META_BATCH_SIZE: raise ValueError("S30 META dispatch exceeds batch storage")
@@ -449,11 +459,13 @@ class MTS30Program(Program['MTDevice']):
     entry = bytearray(size)
     struct.pack_into('<I4xQQ', entry, 0, size, base+controls, base+controls+2*CDM_CONTROL_SIZE)
     for i in range(nprog):
-      entry[32+i*96:32+(i+1)*96] = self.meta_pds
-      struct.pack_into('<Q', entry, 32+i*96, base+param_offset+i*len(self.launch))
+      entry[32+i*16:32+(i+1)*16] = self.meta_dma
+      struct.pack_into('<Q', entry, 32+i*16, base+param_offset+i*len(self.launch))
     entry[param_offset:param_offset+len(params)] = params
     entry[controls:controls+len(stream)] = stream
-    fw.meta_pending.append((off, self))  # keep USC code resident until both CDMs finish
+    resident = (off, self)  # keep USC code resident until both CDMs finish
+    if off != len(fw.meta_data): return self.enqueue_meta(fw, groups, local)  # a buffer finalizer drained the batch
+    fw.meta_pending.append(resident)
     fw.meta_data.extend(entry)
 
   def __call__(self, *args, global_size:tuple[int,int,int]=(1,1,1), local_size:tuple[int,int,int]=(1,1,1), wait:bool=False, timeout:int|None=None,
@@ -472,6 +484,7 @@ class MTS30Program(Program['MTDevice']):
         wait_seconds = 5.0 if timeout is None else timeout/1000
         if self.direct and fw.meta_enabled:
           self.enqueue_meta(fw, global_size, local_size)
+          fw.meta_args.update(args)
           if wait or readback is not None or timeout is not None: fw.flush_meta(wait_seconds, readback)
         elif self.direct:
           params, stream = s30_direct_stream(self.dispatches, global_size, local_size, self.shared, self.split, self.launch, 8*len(self.args))

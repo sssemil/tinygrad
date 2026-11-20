@@ -723,3 +723,20 @@ With MT_META=1 the host starts a newly assembled scheduler on thread zero. META 
 The scheduler now walks a bounded list of up to 64 descriptors in a 64 KiB allocation. Each descriptor owns the PDS parameters and CDM streams for its launch. The host seals the last descriptor, uploads the list, and rings the mailbox once. META waits for both cores before advancing to the next descriptor. A host read, write, synchronization or allocation release drains outstanding work. The hardware requires 256-byte alignment for the control base. Aligning to 32 bytes truncated the pointer on register readback and caused a timeout.
 
 Hotz's [clean HCQ2 commit](https://github.com/tinygrad/tinygrad/commit/f9457417075eb0d2303ef02ae69469216e9ba3b6) builds the S80 host-side firmware interface and CCB records directly. Its MTFirmware still opens the vendor image and its MTCompiler targets mp_21 using mcc. The S30 backend can share the USB changes independently. Unaligned writes now preserve just the partial edge dwords, and reads are capped at 4 MiB per bridge transaction, as in [the USB transfer fix](https://github.com/tinygrad/tinygrad/commit/1eac8903043d0f1e9781c511db3f4782369d732e). The S30 selects the PCIe address format for each chunk.
+
+The firmware now reuses each program's PDS code. A descriptor carries 16 bytes per core for the DMA parameters. Writes into an allocation referenced by a pending shader drain the batch, including writes through subviews. Independent shader uploads can proceed. In a diagnostic variant that drained on every fresh shader upload, the same Qwen embedding kernel repeatedly timed out as the first entry. The kernel completed as entry 33 with identical arguments. Comparing every byte of the uploaded descriptor and disabling Python cyclic GC separately did not resolve that diagnostic failure. The intermediate variant required a slot power cycle after its hang.
+
+The META hardware suite passed 33 tests, including the dependent 64-entry batch, overflow to a second batch, two scheduler restarts, a host overwrite, and recovery after an intentionally missed doorbell. The direct path passed all 32 applicable tests.
+
+| Dependent in-place increments | Direct latency | META latency | Direct USB transfers | META USB transfers |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 0.430 ms | 0.418 ms | 10 | 5 |
+| 8 | 3.408 ms | 1.927 ms | 80 | 7 |
+| 64 | 27.103 ms | 13.895 ms | 640 | 13 |
+
+Latency is the median of eleven submissions to completion. Transfer counts come from a separate submission and include polling, which can vary by run. Each result was read back and checked outside the measurement. Run from the checkout with the source-built GNU META tools on PATH.
+
+```sh
+DEV=MT:USC CACHELEVEL=0 MT_META=0 python -m extra.usbgpu.s30.bench_dispatch
+DEV=MT:USC CACHELEVEL=0 MT_META=1 python -m extra.usbgpu.s30.bench_dispatch
+```

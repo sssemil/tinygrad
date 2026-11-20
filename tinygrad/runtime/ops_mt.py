@@ -144,12 +144,13 @@ class MTBufferMeta:
   size: int
 
 class S30VRAMView(USBMMIOInterface):
-  def __init__(self, view:USBMMIOInterface, dev:MTDevice, va:int):
+  def __init__(self, view:USBMMIOInterface, dev:MTDevice, va:int, bounds:tuple[int,int]|None=None):
     super().__init__(view.usb, view.addr, view.nbytes, view.fmt)
     self.dev, self.va = dev, va
+    self.bounds = bounds or (va, va+view.nbytes)
 
   def view(self, offset:int=0, size:int|None=None, fmt=None):
-    return S30VRAMView(super().view(offset, size, fmt), self.dev, self.va+offset)
+    return S30VRAMView(super().view(offset, size, fmt), self.dev, self.va+offset, self.bounds)
 
   def _can_stage(self, index, offset:int, size:int) -> bool:
     return (self.fmt == 'B' and isinstance(index, slice) and index.step in (None, 1) and offset >= 0 and SLOT <= size <= self.nbytes-offset and
@@ -174,7 +175,7 @@ class S30VRAMView(USBMMIOInterface):
   def __setitem__(self, index, data):
     offset, _ = self._off_from_index(index)
     with self.dev.s30_fw.lock:
-      self.dev.s30_fw.flush_meta()
+      if any(self.bounds[0] <= addr < self.bounds[1] for addr in self.dev.s30_fw.meta_args): self.dev.s30_fw.flush_meta()
       if not isinstance(data, (bytes, bytearray, memoryview)) or not self._can_stage(index, offset, memoryview(data).nbytes):
         return super().__setitem__(index, data)
       src = bytes(data)

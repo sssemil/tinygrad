@@ -255,7 +255,8 @@ class TestS30USB(unittest.TestCase):
       buf.host[:4] = struct.pack("<i", 7)
       self.assertEqual(list(buf.as_memoryview().cast("i")), [7]+[v+1 for v in values[1:]])
       prg(buf.meta.va, global_size=(9,1,1), local_size=(32,1,1))
-      with patch.object(fw, "start_direct", lambda: setattr(fw, "meta_sequence", fw.meta_sequence+1)), self.assertRaisesRegex(TimeoutError, "completed"):
+      def missed_doorbell(): fw.meta_sequence += 1
+      with patch.object(fw, "start_direct", missed_doorbell), self.assertRaisesRegex(TimeoutError, "completed"):
         fw.flush_meta(0.01)
       self.assertFalse(fw.direct)
       self.assertFalse(fw.meta_pending)
