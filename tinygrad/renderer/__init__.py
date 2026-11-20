@@ -8,6 +8,7 @@ from tinygrad.dtype import AddrSpace, DType, dtypes
 from tinygrad.renderer.tc import TensorCore
 
 class CompileError(Exception): pass
+class RegisterAllocationError(CompileError): pass
 
 class Compiler:
   def __init__(self, cachekey:str|None=None): self.cachekey = cachekey if CCACHE else None

@@ -1,22 +1,26 @@
 from __future__ import annotations
-import ctypes, dataclasses, os, struct, time
+import functools, ctypes, dataclasses, os, struct, time
 from typing import Any, cast
 from tinygrad.device import Compiled, Allocator, BufferStorage, BufferSpec, Buffer
 from tinygrad.renderer import Compiler, TinyELF
 from tinygrad.renderer.cstyle import CUDARenderer, CStyleLanguage
+from tinygrad.renderer.usc import MTUSCRenderer
 from tinygrad.dtype import dtypes
 from tinygrad.helpers import round_up
 from tinygrad.uop.ops import UOp, Ops, UPat, PatternMatcher, KernelInfo
 from tinygrad.runtime.support.hcq2 import HWQueue, patch, get_time_ms, to_name, ccall
+from tinygrad.runtime.support.usb import USBMMIOInterface, HALF
 from tinygrad.runtime.support.usb import USB3, usb_link, usb_stream, usb_ctrl, usb_bulk, usb_stack, usb_fail, usb_poke, HOST_SIZE
 from tinygrad.engine.realize import get_call_kernel_args
 from tinygrad.runtime.autogen import mtfw, libc
-from tinygrad.runtime.support.mt.mtdev import MTDev
+from tinygrad.runtime.support.mt.mtdev import MTDev, MT_BUFFER_PA, MT_BUFFER_VA
+from tinygrad.runtime.support.mt.mmu import MT_PAGE_SIZE, MT_PTE_READ_WRITE
+from tinygrad.runtime.support.mt.s30 import MTS30Program, MTS30Firmware, S30VRAMView, s30_read_signal
 from tinygrad.runtime.support.mt.compute import ROOT_BASE, META_BASE
 from tinygrad.runtime.support.mt.ccb import MT_TOKEN_BASE, MT_HOST_PRIVATE
 from tinygrad.runtime.support.mt.submission import SUBMISSION_VA, ARGS_VA, GRID_VA
 from tinygrad.runtime.support.system import USBPCIDevice
-from tinygrad.runtime.support.memory import MMIOInterface
+from tinygrad.runtime.support.memory import MMIOInterface, TLSFAllocator
 from tinygrad.runtime.support.mt.launch import MTLaunch
 from tinygrad.runtime.support.mt.generated import MTGeneratedLaunch
 from tinygrad.runtime.support.mt.compiler import MTCompiler
@@ -36,6 +40,7 @@ class MUSACompiler(Compiler):
 class MUSARenderer(CUDARenderer):
   kernel_typedef = 'extern "C" __global__ void'
   def __init__(self, target):
+    if target.arch == "mp_10": raise RuntimeError("S30 requires the USC renderer")
     CStyleLanguage.__init__(self, target)
     self.compiler, self.tensor_cores = MUSACompiler(), []
   def render_kernel(self, function_name, kernel, bufs, uops, prefix=None):
@@ -51,7 +56,8 @@ class MTBufferMeta:
 class MTAllocator(Allocator['MTDevice']):
   def __init__(self, dev):
     super().__init__(dev)
-    self.next_va, self.next_pa = 0x8001000000, 0x80000000
+    self.next_va, self.next_pa = MT_BUFFER_VA, MT_BUFFER_PA
+    self.vram = TLSFAllocator(dev.mt.vram_size-MT_BUFFER_PA, base=MT_BUFFER_PA, block_size=MT_PAGE_SIZE) if dev.mt.s30 else None
     self.dev.views = {}
     self.host_buffers:dict[int,Any] = {}
     self.free_blocks:list[tuple[int,int,int]] = []
@@ -66,15 +72,23 @@ class MTAllocator(Allocator['MTDevice']):
       self.host_buffers[va] = host
       self.dev.views[va] = (view,meta)
       return BufferStorage(va,meta,view)
-    if self.free_blocks and self.free_blocks[-1][2] == size:
+    if self.vram is not None:
+      pa = self.vram.alloc(size)
+      va = MT_BUFFER_VA+pa-MT_BUFFER_PA
+    elif self.free_blocks and self.free_blocks[-1][2] == size:
       va, pa, size = self.free_blocks.pop()
     else:
       va, pa = self.next_va, self.next_pa
       self.next_va += size
       self.next_pa += size
-    view = self.dev.mt.pci_dev.map_bar(2, off=pa, size=size, fmt='B')
+    try:
+      view = self.dev.mt.pci_dev.map_bar(2, off=pa, size=size, fmt='B')
+      if self.vram is not None and self.dev.s30_fw.bridge is not None and isinstance(view, USBMMIOInterface): view = S30VRAMView(view, self.dev, va)
+      self.dev.map_buffer(va, pa, size)
+    except Exception:
+      if self.vram is not None: self.vram.free(pa)
+      raise
     meta = MTBufferMeta(va, pa, size)
-    self.dev.map_buffer(va, pa, size)
     self.dev.views[va] = (view, meta)
     return BufferStorage(va, meta, view)
 
@@ -85,6 +99,7 @@ class MTAllocator(Allocator['MTDevice']):
     self.dev.buffer_maps.pop(meta.va, None)
     if meta.va in self.host_buffers:
       self.host_buffers.pop(meta.va)
+    elif self.vram is not None: self.vram.free(meta.pa)
     else: self.free_blocks.append((meta.va, meta.pa, meta.size))
 
   def _copyin(self, dest:int, src:memoryview):
@@ -308,7 +323,7 @@ Compiled.pm_encode += PatternMatcher([
 ])
 
 class MTDevice(Compiled):
-  renderers = [MUSARenderer]
+  renderers = [MTUSCRenderer, MUSARenderer]
   timestamp_divider = 25
   serialize_hcq = True
   custom_hcq_runtime_key = True
@@ -327,6 +342,11 @@ class MTDevice(Compiled):
     self.started = False
     self.response_checked = 0
     self.views:dict[int,tuple[Any,MTBufferMeta]] = {}
+    if self.mt.s30:
+      self.enqueue_programs = self.custom_hcq_runtime_key = False
+      self.s30_fw = MTS30Firmware(self.mt)
+      super().__init__(device, MTAllocator(self), MTS30Program, arch='mp_10')
+      return
     super().__init__(device, MTAllocator(self), None, arch='mp_21')
     usb_dev = cast(USBPCIDevice,self.mt.pci_dev).usb
     words = [ctypes.addressof(x.contents) for x in (usb_dev.usb.handle,USB3.ctx())] + [0,0,0]
@@ -335,6 +355,19 @@ class MTDevice(Compiled):
 
   @property
   def has_copy_queue(self) -> bool: return False
+
+  @functools.cached_property
+  def s30_copy(self) -> MTS30Program:
+    from tinygrad.codegen import to_program
+    dst, src = (UOp.placeholder((HALF//4,), dtypes.uint, slot=i) for i in range(2))
+    idx = UOp.special(HALF//128, "gidx0")*32+UOp.special(32, "lidx0")
+    copy = dst[idx].store(src[idx]).sink(arg=KernelInfo(name="s30_copy", optimized=True))
+    return MTS30Program(self, TinyELF.from_program(to_program(copy, self.renderer)), {})
+
+  @functools.cached_property
+  def s30_read_signal(self) -> MTS30Program:
+    from tinygrad.codegen import to_program
+    return MTS30Program(self, TinyELF.from_program(to_program(s30_read_signal(), self.renderer)), {})
 
   def get_launch(self, obj:TinyELF, global_size:tuple[int,int,int]=(1,1,1), local_size:tuple[int,int,int]=(1,1,1)) -> MTGeneratedLaunch:
     key = (obj.lib, global_size, local_size)
@@ -353,6 +386,9 @@ class MTDevice(Compiled):
     return self.launch_cache[key]
 
   def map_buffer(self, va:int, pa:int, size:int):
+    if self.mt.s30:
+      with self.s30_fw.lock: self.s30_fw.mmu.map_range(va, pa, size, MT_PTE_READ_WRITE)
+      return
     self.buffer_maps[va] = (pa,size)
     if self.current_launch is not None: self.current_launch.map_buffer(va,pa,size)
     if self.started and self.current_launch is not None: self.current_launch.upload_mmu()
@@ -363,6 +399,9 @@ class MTDevice(Compiled):
     return (launch._read(0xe150),launch._read(0xe158),launch._read(0x130,4),launch._read(0x4a0))
 
   def synchronize(self, timeout:int|None=None):
+    if self.mt.s30:
+      self.s30_fw.flush_meta(None if timeout is None else timeout/1000)
+      return
     super().synchronize(timeout)
     host_buf = Compiled.link_bufs[to_name(self.device,'usb_host')]
     assert isinstance(host_buf,Buffer)
@@ -390,7 +429,8 @@ class MTDevice(Compiled):
 
   def hcq_runtime_key(self, input_uops:list[UOp]): return tuple((u.arg.buffer,u.arg.buffer._buf) for u in input_uops)
 
-  def post_run(self) -> None: self.synchronize()
+  def post_run(self) -> None:
+    if not self.mt.s30: self.synchronize()
 
   def post_link(self, input_uops:list[UOp]) -> None:
     for launch in self.launch_order:
@@ -456,5 +496,7 @@ class MTDevice(Compiled):
     raise RuntimeError(f'Unknown MT buffer address {va:#x}')
 
   def finalize(self):
-    super().finalize()
-    self.mt.close()
+    try: super().finalize()
+    finally:
+      if self.mt.s30: self.s30_fw.session.close()
+      self.mt.close()

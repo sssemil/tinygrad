@@ -34,7 +34,7 @@ def get_enqueue_devs(call:UOp) -> tuple[str, ...]:
   runs_on = call.device if call.body.op is Ops.STORE and all_devices_in(call.device, HCQ_DEVS - UVM_DEVS) else get_call_arg_uops(call)[0].device
   devs = tuple(Device.canonicalize(d) for d in to_tuple(runs_on))
   if not all_devices_in(devs, HCQ_DEVS) or (call.body.op is Ops.STORE and all_devices_in(devs, UVM_DEVS)): return ()
-  if call.body.op is Ops.STORE and any(not Device[d].enqueue_copies for d in devs): return ()
+  if any(not (Device[d].enqueue_copies if call.body.op is Ops.STORE else Device[d].enqueue_programs) for d in devs): return ()
   return devs
 
 def unwrap_view(v:UOp) -> tuple[UOp, int]: # look through views to (base, byte offset)

@@ -359,6 +359,7 @@ class Compiled:
   serialize_hcq = False
   # Set when the HCQ cache needs device-specific buffer identity in its key.
   custom_hcq_runtime_key = False
+  enqueue_programs = True
   enqueue_copies = True
 
   @property

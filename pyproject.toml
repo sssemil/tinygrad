@@ -42,12 +42,14 @@ packages = [
   'tinygrad.runtime.support.am',
   'tinygrad.runtime.support.rdma',
   'tinygrad.runtime.support.nv',
+  'tinygrad.runtime.support.mt',
   'tinygrad.uop',
   'tinygrad.viz',
 ]
 
 [tool.setuptools.package-data]
 tinygrad = ["py.typed"]
+"tinygrad.runtime.support.mt" = ["dispatch.s", "include/*.h"]
 "tinygrad.llm" = ["chat.html"]
 "tinygrad.viz" = ["index.html", "assets/**/*", "js/*"]
 
