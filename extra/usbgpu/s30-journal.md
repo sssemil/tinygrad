@@ -655,3 +655,13 @@ The first isolated run with the change reduced Whisper from 2.526 s to 2.156 s w
 Across three isolated processes, the native warm medians on the same Whisper clip were 2.156, 2.148 and 2.145 s. Two interleaved MUSA controls gave 2.289 and 2.280 s. All 25 transcripts matched. On the eight-token Qwen workload a fresh MUSA control took 4.832 s warm. Another isolated MNIST run gave 13.79 ms versus 14.01 ms on MUSA. The five-pair MNIST comparison remains in the table since the compiler changed none of its ten archived launch shapes. Of the other 155 archived graphs, one Whisper and four Qwen launch shapes changed.
 
 Five independent FP32 matrix products on the card matched NumPy element for element, including rectangular, batched and odd-sized products. The first used 16×8 lanes and the second used 24×4. The batch-16 SGD step again agreed with CPU on its loss and all 20 updated model tensors.
+
+## November 20, 2026 — look for retained startup messages in the management rings
+
+In three fresh slot cycles the host read the two complete 532-byte management rings starting at BAR0 + 0x6f000. Each read included the 20-byte header and 512-byte payload of each ring. The host sent no management requests. Sampling began 52–55 ms after rail enable and continued through 1.1 s, with 300, 301 and 300 snapshots respectively.
+
+Each cycle showed two states. Initially the header fields failed the operating size and pointer checks. Each payload contained 496–499 nonzero bytes. The first snapshots from different cycles differed at 250–298 of 8,512 bit positions. When the valid headers first appeared, both payloads were zero, and both read and write cursors were zero. The three first initialized snapshots finished at 750.2, 737.3 and 736.8 ms. These complete sampled ring images contained no queued startup message. Reads cannot exclude activity between samples or in other memory.
+
+The 3.1.0 driver's separate 4 KiB management event log is allocated on the host. In the event-log initialization path, a zeroed 0x1010-byte allocation holds four header words and 0x1000 bytes for events. The driver registers an IPC report handler to receive events. Reading that host log requires the driver to have initialized it. It cannot independently trace the board before the first PCIe configuration read.
+
+The physical USB inventory for this run contained the Chestnut and no external logic analyzer or debug serial adapter. Board startup before link-up and the bridge on-chip ROM remain unverified.
