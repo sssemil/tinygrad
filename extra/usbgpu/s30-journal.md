@@ -613,3 +613,9 @@ The management rings were unready at submission in every trial. At one second th
 Two fresh markers sent to the base SRAM slot were visible to a native shader at bridge PCI address 0x200000. The shader read zero at displacements 0x80000, 0x100000, 0x180000 and 0x200000. Directing a one-sector USB DMA write to slot 32 put its marker in slot 0 in both trials. An independent GPU write test gave each candidate address a distinct random word, restarted the compute context, and read the words back. The in-range control at displacement 0x10000 matched. All four candidate locations again returned zero. These specific address tests support keeping the 512 KiB transfer window. They do not exhaust all bridge address mappings.
 
 After the probes, ordinary isolated native MNIST correctly classified all 16 digits on five calls and verified 10 newly generated USC binaries. No flash was changed.
+
+## November 20, 2026 — finish native schedule search from an empty cache
+
+One MaxPool candidate exceeded the device timeout that beam search had requested for it. The S30 recovered both command processors, but the timeout ended the whole search. Timed candidates that exceed that explicit limit now get an infinite timing. A timeout during an unbounded measurement still propagates. The search regression tests exercise both cases.
+
+With `BEAM=1`, the offline MNIST runner generated and loaded 830 distinct USC programs in one process, including tuning candidates. All 16 labels matched on each of five calls. Time to first output was 123.359 s and warm median was 14.69 ms. A separate run outside the sandbox measured 126.653 s and 13.89 ms. The default native path gave 0.869 s and 15.41 ms in a fresh isolated run. The prior default MUSA measurement was 3.533 s and 14.39 ms. The optional native search trades over two minutes of startup for a small warm reduction on this batch.

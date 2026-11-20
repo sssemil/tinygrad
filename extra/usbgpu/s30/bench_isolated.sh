@@ -33,7 +33,7 @@ opts=(--die-with-parent --unshare-net --unshare-pid --clearenv
   --ro-bind "$input" /input
   --setenv HOME /home/bench --setenv PATH /venv/bin:/usr/bin --setenv PYTHONPATH /src
   --setenv PYTHONPYCACHEPREFIX /tmp/pycache --setenv PYTHONDONTWRITEBYTECODE 1 --setenv NUMBA_CACHE_DIR /tmp/numba --setenv CACHELEVEL 0 --setenv DEV MT:USC
-  --setenv PARALLEL 0 --setenv MUSA_PATH /nonexistent --setenv MT_FIRMWARE /nonexistent --chdir /src)
+  --setenv BEAM "${BEAM:-0}" --setenv PARALLEL 0 --setenv MUSA_PATH /nonexistent --setenv MT_FIRMWARE /nonexistent --chdir /src)
 if [[ $base == /usr/local ]]; then
   stdlib=$("$python" -c 'import sysconfig; print(sysconfig.get_path("stdlib"))')
   opts+=(--ro-bind "$base/bin" "$base/bin" --ro-bind "$stdlib" "$stdlib")
